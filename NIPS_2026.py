@@ -422,14 +422,14 @@ criterion = ArcFaceLoss(
 
 optimizer = optim.AdamW(
     list(model.parameters()) + list(criterion.parameters()),
-    lr=1e-3,
-    weight_decay=1e-3
+    lr=1e-4,
+    weight_decay=1e-4
 )
 
 # ================================
 # 6. Training + Evaluation Loop
 # ================================
-epochs = 50
+epochs = 30
 for epoch in range(epochs):
     # -------- Training --------
     model.train()
