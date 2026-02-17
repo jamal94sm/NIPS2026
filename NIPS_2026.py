@@ -15,7 +15,7 @@ from pytorch_metric_learning.losses import ArcFaceLoss
 batch_size = 64
 margin=0.3
 scale=16
-lr=1e-3,
+lr=1e-3
 weight_decay=1e-4
 epochs = 50
 
