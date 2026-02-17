@@ -12,6 +12,12 @@ from PIL import Image
 import cv2
 from pytorch_metric_learning.losses import ArcFaceLoss
 
+batch_size = 64
+margin=0.3
+scale=16
+lr=1e-3,
+weight_decay=1e-4
+epochs = 50
 
 # ----------------------------
 # Device
@@ -268,7 +274,7 @@ print("Test samples:", len(test_dataset))
 # ================================
 train_loader = DataLoader(
     train_dataset,
-    batch_size=32,
+    batch_size=batch_size,
     shuffle=True,
     num_workers=2,
     pin_memory=True
@@ -276,7 +282,7 @@ train_loader = DataLoader(
 
 test_loader = DataLoader(
     test_dataset,
-    batch_size=32,
+    batch_size=batch_size,
     shuffle=False,
     num_workers=2,
     pin_memory=True
@@ -416,20 +422,19 @@ num_classes = 200
 criterion = ArcFaceLoss(
     num_classes=num_classes,
     embedding_size=embedding_dim,
-    margin=0.3,
-    scale=15
+    margin=margin,
+    scale=scale
 ).to(device)
 
 optimizer = optim.AdamW(
     list(model.parameters()) + list(criterion.parameters()),
-    lr=1e-3,
-    weight_decay=1e-4
+    lr=lr,
+    weight_decay=weight_decay
 )
 
 # ================================
 # 6. Training + Evaluation Loop
 # ================================
-epochs = 50
 for epoch in range(epochs):
     # -------- Training --------
     model.train()
