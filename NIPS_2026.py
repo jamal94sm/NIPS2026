@@ -222,7 +222,7 @@ class CASIA_MS_Dataset(Dataset):
 # ================================
 # Dataset
 # ================================
-data_path = "CASIA-MS-ROI"
+data_path = "/Jamal/CASIA-MS-ROI"
 dataset = CASIA_MS_Dataset(data_path)
 
 num_classes = len(dataset.hand_id_map)
