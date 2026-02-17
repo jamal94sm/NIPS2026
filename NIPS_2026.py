@@ -376,7 +376,7 @@ class CustomCNN160(nn.Module):
 
 '''
 backbone = timm.create_model(
-    "deit_tiny_patch16_224",
+    "deit_small_patch16_224",
     pretrained=True,
     num_classes=0
 )
@@ -397,10 +397,25 @@ for i, block in enumerate(backbone.blocks):
 embedding_dim = 512
 model = ViTEmbeddingModel(backbone, embed_dim=embedding_dim).to(device)
 
+##################################################################################
 
+# Loading dinov2_vits14 (Small version, patch size 14)
+model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14').to(device)
+
+# Freeze most layers, unfreeze last (two) blocks
+# In DINOv2 hub models, blocks are accessed via .blocks
+for name, p in model.named_parameters():
+    p.requires_grad = False
+    # Unfreezing the last two blocks (block 10 and 11 for ViT-S)
+    if "blocks.11" in name:
+        p.requires_grad = True
+
+
+####################################################################################
 
 print("Loading ConvNeXt V2-Tiny...")
 model = timm.create_model('convnextv2_tiny', pretrained=True, num_classes=0).to(device)
+embedding_dim = model.num_features 
 
 # Freeze logic (Applied to base_encoder before passing to MoCo wrapper)
 for p in model.parameters():
@@ -414,22 +429,35 @@ if hasattr(model, 'norm'):
          p.requires_grad = True
 '''
 
-# Loading dinov2_vits14 (Small version, patch size 14)
-model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14').to(device)
+# 1. Load DeiT Small (Data-efficient Image Transformer)
+model = timm.create_model(
+    "deit_small_patch16_224",
+    pretrained=True,
+    num_classes=0  # Remove the original classifier head
+)
 
-# Freeze most layers, unfreeze last (two) blocks
-# In DINOv2 hub models, blocks are accessed via .blocks
-for name, p in model.named_parameters():
-    p.requires_grad = False
-    # Unfreezing the last two blocks (block 10 and 11 for ViT-S)
-    if "blocks.11" in name:
-        p.requires_grad = True
+# 2. Freeze ALL parameters first
+for param in model.parameters():
+    param.requires_grad = False
+
+# 3. Unfreeze the last two Transformer blocks
+# DeiT stores layers in a list called 'blocks' (usually 12 blocks for Small)
+for block in model.blocks[-2:]:
+    for param in model.parameters():
+        param.requires_grad = True
+
+# 4. Unfreeze the final LayerNorm
+# This is CRITICAL for Transformers. The norm layer sits between the 
+# last block and the classifier. If you freeze it, training often fails.
+for param in model.norm.parameters():
+    param.requires_grad = True
+
+embedding_dim = model.num_features
+
         
 # ================================
 # 5. ArcFace Loss & Optimizer
 # ================================
-#embedding_dim = model.num_features # ConvNeXt
-embedding_dim = 384
 num_classes = 200
 criterion = ArcFaceLoss(
     num_classes=num_classes,
