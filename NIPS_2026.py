@@ -396,7 +396,7 @@ for i, block in enumerate(backbone.blocks):
     )
 embedding_dim = 512
 model = ViTEmbeddingModel(backbone, embed_dim=embedding_dim).to(device)
-'''
+
 
 
 print("Loading ConvNeXt V2-Tiny...")
@@ -412,12 +412,24 @@ for p in model.stages[3].parameters():
 if hasattr(model, 'norm'):
      for p in model.norm.parameters():
          p.requires_grad = True
+'''
 
+# Loading dinov2_vits14 (Small version, patch size 14)
+model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14').to(device)
 
+# Freeze most layers, unfreeze last (two) blocks
+# In DINOv2 hub models, blocks are accessed via .blocks
+for name, p in model.named_parameters():
+    p.requires_grad = False
+    # Unfreezing the last two blocks (block 10 and 11 for ViT-S)
+    if "blocks.10" in name or "blocks.11" in name:
+        p.requires_grad = True
+        
 # ================================
 # 5. ArcFace Loss & Optimizer
 # ================================
-embedding_dim = model.num_features
+#embedding_dim = model.num_features # ConvNeXt
+embedding_dim = 384
 num_classes = 200
 criterion = ArcFaceLoss(
     num_classes=num_classes,
