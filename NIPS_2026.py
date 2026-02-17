@@ -222,7 +222,7 @@ class CASIA_MS_Dataset(Dataset):
 # ================================
 # Dataset
 # ================================
-data_path = "/Jamal/CASIA-MS-ROI"
+data_path = "/home/pai-ng/Jamal/CASIA-MS-ROI"
 dataset = CASIA_MS_Dataset(data_path)
 
 num_classes = len(dataset.hand_id_map)
@@ -465,7 +465,7 @@ def save_model_to_drive(model, save_path, filename="model.pth"):
     print(f"✅ Model weights successfully saved to: {full_path}")
 
 # Usage:
-DRIVE_PATH = "/Jamal"
+DRIVE_PATH = "/home/pai-ng/Jamal/"
 save_model_to_drive(model, DRIVE_PATH)
 
 
