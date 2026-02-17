@@ -199,13 +199,6 @@ class CASIA_MS_Dataset(Dataset):
                      self.domain_map[spectrum])   # y_d (domain)
                 )
 
-        # MediaPipe initialized ONCE
-        self.mp_hands = mp.solutions.hands.Hands(
-            static_image_mode=True,
-            max_num_hands=1,
-            min_detection_confidence=0.5
-        )
-
     def __len__(self):
         return len(self.samples)
 
