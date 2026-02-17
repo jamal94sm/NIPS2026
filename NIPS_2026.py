@@ -19,6 +19,11 @@ lr=1e-3
 weight_decay=1e-4
 epochs = 50
 
+# Choose domains by NAME: 460, 630, 700, WHT, 850, 940
+train_domains = ["WHT", "460"]   # training spectra
+test_domains  = ["630"]          # unseen test spectrum
+
+
 # ----------------------------
 # Device
 # ----------------------------
@@ -241,10 +246,6 @@ print("Domains:", dataset.domain_map)
 # ================================
 # Cross-Domain Split Configuration
 # ================================
-
-# Choose domains by NAME: 460, 630, 700, WHT, 850, 940
-train_domains = ["WHT", "460"]   # training spectra
-test_domains  = ["700"]          # unseen test spectrum
 
 # Reverse domain map: id → name
 inv_domain_map = {v: k for k, v in dataset.domain_map.items()}
