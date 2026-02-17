@@ -1,12 +1,17 @@
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import timm
 from torchvision import transforms
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset, DataLoader, Subset
 from tqdm import tqdm
+import os
+import numpy as np
+from PIL import Image
+import cv2
+from pytorch_metric_learning.losses import ArcFaceLoss
+
 
 # ----------------------------
 # Device
@@ -15,11 +20,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 
-############################################ MOE
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+################################################## Mixure of Experts
 from typing import Tuple, List
 
 # ----------------------------
@@ -157,18 +159,9 @@ class ViTEmbeddingModel(nn.Module):
 
 
 
-########################################### DATA
-import os
-import numpy as np
-from PIL import Image
-import cv2
-
-import torch
-from torch.utils.data import Dataset, DataLoader, Subset
-
-import mediapipe as mp
 
 
+######################################################### DATA
 class CASIA_MS_Dataset(Dataset):
     def __init__(self, data_path):
         self.samples = []
@@ -318,12 +311,7 @@ print("Domains seen in test batch:", test_domains_seen)
 
 
 
-################################################ MODELS
-
-import torch
-import timm
-from fvcore.nn import FlopCountAnalysis, parameter_count_table
-
+################################################################# MODELS
 class CustomCNN160(nn.Module):
     def __init__(self, input_channels=3):
         super(CustomCNN160, self).__init__()
@@ -370,135 +358,13 @@ class CustomCNN160(nn.Module):
 
 
 
-# --------------------------------------------------
-# 1. Standard Attention Class
-# --------------------------------------------------
-class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=True):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.proj = nn.Linear(dim, dim)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        return x
-
-# --------------------------------------------------
-# 2. Normal ViT Block (Standard)
-# --------------------------------------------------
-class TimmStyleBlock(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=3.0):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = Attention(dim, num_heads=num_heads)
-        self.norm2 = nn.LayerNorm(dim)
-
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, mlp_hidden_dim),
-            nn.GELU(),
-            nn.Linear(mlp_hidden_dim, dim)
-        )
-
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-class CustomViTBackbone(nn.Module):
-    def __init__(self, img_size=160, patch_size=16, in_chans=3,
-                 embed_dim=64, depth=6, num_heads=8, mlp_ratio=3.0):
-        super().__init__()
-
-        # ADD THIS LINE:
-        self.embed_dim = embed_dim
-
-        self.patch_embed = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-        num_patches = (img_size // patch_size) ** 2
-
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
-
-        self.blocks = nn.ModuleList([
-            TimmStyleBlock(embed_dim, num_heads, mlp_ratio)
-            for _ in range(depth)
-        ])
-
-        self.norm = nn.LayerNorm(embed_dim)
-
-    def forward(self, x):
-        x = self.patch_embed(x).flatten(2).transpose(1, 2)
-        cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-        x = x + self.pos_embed
-        for block in self.blocks:
-            x = block(x)
-        x = self.norm(x)
-        return x[:, 0]
-
-
-class ViTEmbeddingModel(nn.Module):
-    def __init__(self, backbone, embed_dim=512):
-        super().__init__()
-        self.backbone = backbone
-        # We use the embed_dim (64) we defined in our CustomViTBackbone
-        # No need for reset_classifier because we built it without a head
-        self.embedding = nn.Linear(backbone.embed_dim, embed_dim)
-
-    def forward(self, x):
-        # Backbone returns the [B, 64] CLS token embedding
-        x = self.backbone(x)
-        # Project it to [B, 512] for ArcFace
-        x = self.embedding(x)
-        return x
-
-
-
-# --- Analysis Cell ---
-model = CustomViTBackbone()
-model.eval()
-
-dummy_input = torch.randn(1, 3, 160, 160)
-flops = FlopCountAnalysis(model, dummy_input)
-param_table = parameter_count_table(model, max_depth=2)
-
-print(f"--- Standard ViT Backbone Analysis (160x160) ---")
-print(f"Total Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.4f} Million")
-print(f"Inference Cost:   {flops.total() / 1e9:.4f} GFLOPs")
-#print(f"Output Shape:     {model(dummy_input).shape}") # Should be [1, 64]
-#print("\nDetailed Breakdown:")
-#print(param_table)
-
-"""# **Main**"""
-
-pip install pytorch_metric_learning
+############################################################ MAIN
 
 # ----------------------------
 # Main Script for Custom ViT + MoE-LoRA + ArcFace
 # ----------------------------
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import timm
-from tqdm import tqdm
-import torch.nn.functional as F
-from pytorch_metric_learning.losses import ArcFaceLoss
-
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ================================
 # Backbone: DeiT + MoE-LoRA
@@ -592,93 +458,9 @@ for epoch in range(epochs):
 
     print(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {train_loss/len(train_loader):.4f} Acc: {train_correct/total_train:.4f} | Test Acc: {test_correct/total_test:.4f}")
 
-# ----------------------------
-# Main Script for Custom ViT + MoE-LoRA + ArcFace
-# ----------------------------
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import timm
-from tqdm import tqdm
-import torch.nn.functional as F
-from pytorch_metric_learning.losses import ArcFaceLoss
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Model Setup (Ensure these classes are defined above)
-backbone = CustomViTBackbone(embed_dim=64)
-for i, block in enumerate(backbone.blocks):
-    backbone.blocks[i] = ViTBlockWithMoELoRA(block, num_experts=4, top_k=2)
-
-model = ViTEmbeddingModel(backbone, embed_dim=512).to(device)
-
-# Enable gradients for everything
-for p in model.parameters():
-    p.requires_grad = True
-
-
-
-# ================================
-# 5. ArcFace Loss & Optimizer
-# ================================
-num_classes = 200
-criterion = ArcFaceLoss(
-    num_classes=num_classes,
-    embedding_size=embedding_dim,
-    margin=0.3,
-    scale=16
-).to(device)
-
-optimizer = optim.AdamW(
-    list(model.parameters()) + list(criterion.parameters()),
-    lr=50e-3,
-    weight_decay=1e-3
-)
-
-# ================================
-# 6. Training + Evaluation Loop
-# ================================
-epochs = 50
-for epoch in range(epochs):
-    # -------- Training --------
-    model.train()
-    train_loss, train_correct, total_train = 0.0, 0, 0
-
-    # FIXED: Added the third value '_' for unpacking
-    for images, y_i, _ in tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]"):
-        images, y_i = images.to(device), y_i.to(device)
-
-        optimizer.zero_grad()
-        embeddings = model(images)
-        loss = criterion(embeddings, y_i)
-        loss.backward()
-        optimizer.step()
-
-        train_loss += loss.item()
-        preds = criterion.get_logits(embeddings).argmax(dim=1)
-        train_correct += (preds == y_i).sum().item()
-        total_train += y_i.size(0)
-
-    # -------- Evaluation --------
-    model.eval()
-    test_loss, test_correct, total_test = 0.0, 0, 0
-    with torch.no_grad():
-        for images, y_i, _ in tqdm(test_loader, desc=f"Epoch {epoch+1} [Test]"):
-            images, y_i = images.to(device), y_i.to(device)
-            embeddings = model(images)
-            loss = criterion(embeddings, y_i)
-            test_loss += loss.item()
-            preds = criterion.get_logits(embeddings).argmax(dim=1)
-            test_correct += (preds == y_i).sum().item()
-            total_test += y_i.size(0)
-
-    print(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {train_loss/len(train_loader):.4f} Acc: {train_correct/total_train:.4f} | Test Acc: {test_correct/total_test:.4f}")
-
-import os
-
-def save_model_to_drive(model, save_path, filename="palmprint_moe_vit_roi_42.pth"):
+def save_model_to_drive(model, save_path, filename="model.pth"):
     if not os.path.exists(save_path):
         os.makedirs(save_path)
 
@@ -690,9 +472,11 @@ def save_model_to_drive(model, save_path, filename="palmprint_moe_vit_roi_42.pth
     print(f"✅ Model weights successfully saved to: {full_path}")
 
 # Usage:
-DRIVE_PATH = '/content/drive/MyDrive/SIT_Palmprint_Project'
+DRIVE_PATH = "/Jamal"
 save_model_to_drive(model, DRIVE_PATH)
 
+
+'''
 def load_moe_vit_model(checkpoint_path, device, num_experts=4, top_k=2):
     # 1. Rebuild the exact same architecture
     backbone = timm.create_model(
@@ -724,9 +508,17 @@ def load_moe_vit_model(checkpoint_path, device, num_experts=4, top_k=2):
     return model
 
 # Usage for TTA:
-CHECKPOINT = os.path.join(DRIVE_PATH, 'palmprint_moe_vit_roi_42.pth')
+CHECKPOINT = os.path.join(DRIVE_PATH, 'model.pth')
 model = load_moe_vit_model(CHECKPOINT, device, num_experts=4, top_k=2)
 
+'''
+
+
+
+
+
+
+#################################################################### Test Time Adaptation
 # --------------------------------------------------------------------------------
 # Test-Time Adaptation (Episodic Entropy Minimization)
 # --------------------------------------------------------------------------------
@@ -799,7 +591,3 @@ print(f"Average TTA Acc:      {final_tta:.4f}")
 print(f"Absolute Improvement: {final_tta - final_baseline:.4f}")
 print("="*40)
 
-
-# if steps = 20, for BS=32 (4-5%), BS = 16 (3-4%), BS = 8 (2-3%), BS = 4 (1.5-2), BS = 1 (0)
-
-# if BS=32, for steps = 1 (1% improvement), 3 (1.5%), 5 (2%), 10 (3.5-4%), 20 (4-5%), 30 (4-5%)
