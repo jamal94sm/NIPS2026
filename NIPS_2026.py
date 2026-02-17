@@ -394,7 +394,7 @@ model = ViTEmbeddingModel(backbone, embed_dim=embedding_dim).to(device)
 
 
 print("Loading ConvNeXt V2-Tiny...")
-model = timm.create_model('convnextv2_tiny', pretrained=True, num_classes=0)
+model = timm.create_model('convnextv2_tiny', pretrained=True, num_classes=0).to(device)
 
 # Freeze logic (Applied to base_encoder before passing to MoCo wrapper)
 for p in model.parameters():
