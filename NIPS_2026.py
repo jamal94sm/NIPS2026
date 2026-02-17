@@ -403,10 +403,11 @@ for p in model.parameters():
 print("Unfreezing the last stage (stage 3) of ConvNeXt...")
 for p in model.stages[3].parameters():
     p.requires_grad = True
+'''    
 if hasattr(model, 'norm'):
      for p in model.norm.parameters():
          p.requires_grad = True
-
+'''
 
 # ================================
 # 5. ArcFace Loss & Optimizer
