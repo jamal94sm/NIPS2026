@@ -416,8 +416,8 @@ num_classes = 200
 criterion = ArcFaceLoss(
     num_classes=num_classes,
     embedding_size=embedding_dim,
-    margin=0.4,
-    scale=16
+    margin=0.3,
+    scale=25
 ).to(device)
 
 optimizer = optim.AdamW(
