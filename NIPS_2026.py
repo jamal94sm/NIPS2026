@@ -429,7 +429,7 @@ optimizer = optim.AdamW(
 # ================================
 # 6. Training + Evaluation Loop
 # ================================
-epochs = 30
+epochs = 50
 for epoch in range(epochs):
     # -------- Training --------
     model.train()
@@ -479,7 +479,7 @@ def save_model_to_drive(model, save_path, filename="model.pth"):
     print(f"✅ Model weights successfully saved to: {full_path}")
 
 # Usage:
-DRIVE_PATH = "/home/pai-ng/Jamal/"
+DRIVE_PATH = "/home/pai-ng/Jamal/CovNeXt.pth"
 save_model_to_drive(model, DRIVE_PATH)
 
 
