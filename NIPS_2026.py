@@ -400,17 +400,13 @@ model = timm.create_model('convnextv2_tiny', pretrained=True, num_classes=0).to(
 for p in model.parameters():
     p.requires_grad = False
 
-print("Unfreezing the last stage (stage 3) of ConvNeXt...")
+print("Unfreezing the last stage (stage 3) and norm layers of ConvNeXt...")
 for p in model.stages[3].parameters():
     p.requires_grad = True
-
-for p in model.stages[2].parameters():
-    p.requires_grad = True
-'''    
 if hasattr(model, 'norm'):
      for p in model.norm.parameters():
          p.requires_grad = True
-'''
+
 
 # ================================
 # 5. ArcFace Loss & Optimizer
@@ -420,7 +416,7 @@ num_classes = 200
 criterion = ArcFaceLoss(
     num_classes=num_classes,
     embedding_size=embedding_dim,
-    margin=0.3,
+    margin=0.5,
     scale=16
 ).to(device)
 
