@@ -368,6 +368,7 @@ class CustomCNN160(nn.Module):
 # inference cost 0.0885 GFLOPs ---> test_vit2.r160_in1k
 # 0.4M params, inference cost 0.03 GFLOPs (less than baseline's CNN model) ---> test_vit.r160_in1k
 
+'''
 backbone = timm.create_model(
     "deit_tiny_patch16_224",
     pretrained=True,
@@ -387,17 +388,30 @@ for i, block in enumerate(backbone.blocks):
         num_experts=4,
         top_k=2
     )
-
-# ================================
-# Embedding Model
-# ================================
 embedding_dim = 512
 model = ViTEmbeddingModel(backbone, embed_dim=embedding_dim).to(device)
+'''
+
+
+print("Loading ConvNeXt V2-Tiny...")
+model = timm.create_model('convnextv2_tiny', pretrained=True, num_classes=0)
+
+# Freeze logic (Applied to base_encoder before passing to MoCo wrapper)
+for p in model.parameters():
+    p.requires_grad = False
+
+print("Unfreezing the last stage (stage 3) of ConvNeXt...")
+for p in model.stages[3].parameters():
+    p.requires_grad = True
+if hasattr(model, 'norm'):
+     for p in model.norm.parameters():
+         p.requires_grad = True
 
 
 # ================================
 # 5. ArcFace Loss & Optimizer
 # ================================
+embedding_dim = model.num_features
 num_classes = 200
 criterion = ArcFaceLoss(
     num_classes=num_classes,
@@ -521,6 +535,7 @@ print("\nStarting Global TTA Evaluation...")
 # Since 'model' is already loaded via load_moe_vit_model, we clone its current state.
 cpu_reset_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
+'''
 # 2. Freeze all parameters except MoE Experts/Routers
 for p in model.parameters():
     p.requires_grad = False
@@ -528,6 +543,8 @@ for p in model.parameters():
 for name, p in model.named_parameters():
     if any(k in name.lower() for k in ["lora", "expert", "gate", "router"]):
         p.requires_grad = True
+'''
+
 
 total_baseline_acc = 0.0
 total_tta_acc = 0.0
