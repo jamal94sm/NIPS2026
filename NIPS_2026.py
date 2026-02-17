@@ -12,7 +12,7 @@ from PIL import Image
 import cv2
 from pytorch_metric_learning.losses import ArcFaceLoss
 
-batch_size = 64
+batch_size = 16
 margin=0.3
 scale=16
 lr=1e-3
