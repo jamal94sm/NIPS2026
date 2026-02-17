@@ -422,8 +422,8 @@ criterion = ArcFaceLoss(
 
 optimizer = optim.AdamW(
     list(model.parameters()) + list(criterion.parameters()),
-    lr=1e-3,
-    weight_decay=1e-5
+    lr=5e-3,
+    weight_decay=1e-4
 )
 
 # ================================
