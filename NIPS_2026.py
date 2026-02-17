@@ -422,7 +422,7 @@ model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14').to(device)
 for name, p in model.named_parameters():
     p.requires_grad = False
     # Unfreezing the last two blocks (block 10 and 11 for ViT-S)
-    if "blocks.10" in name or "blocks.11" in name:
+    if "blocks.11" in name:
         p.requires_grad = True
         
 # ================================
