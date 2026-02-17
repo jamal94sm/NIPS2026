@@ -434,7 +434,7 @@ model = timm.create_model(
     "deit_small_patch16_224",
     pretrained=True,
     num_classes=0  # Remove the original classifier head
-)
+).to(device)
 
 # 2. Freeze ALL parameters first
 for param in model.parameters():
