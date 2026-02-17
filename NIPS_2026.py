@@ -416,7 +416,7 @@ num_classes = 200
 criterion = ArcFaceLoss(
     num_classes=num_classes,
     embedding_size=embedding_dim,
-    margin=0.35,
+    margin=0.3,
     scale=16
 ).to(device)
 
