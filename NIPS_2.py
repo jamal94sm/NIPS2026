@@ -113,7 +113,7 @@ class CASIA_MS_Dataset(Dataset):
         #self.normalize = transforms.Normalize(
            # mean=[0.485, 0.456, 0.406], 
             #std=[0.229, 0.224, 0.225]
-        )
+        #)
 
     def __len__(self):
         return len(self.samples)
