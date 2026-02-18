@@ -22,7 +22,7 @@ epochs = 20
 
 # Domain Selection
 train_domains = ["WHT", "460"]   # training spectra
-test_domains  = ["700"]          # unseen test spectrum
+test_domains  = ["630"]          # unseen test spectrum
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
