@@ -21,8 +21,8 @@ weight_decay=1e-4
 epochs = 50
 
 # Choose domains by NAME: 460, 630, 700, WHT, 850, 940
-train_domains = ["WHT", "460"]   # training spectra
-test_domains  = ["700"]          # unseen test spectrum
+train_domains = ["WHT", "460", "700"]   # training spectra
+test_domains  = ["850"]          # unseen test spectrum
 
 
 # ----------------------------
