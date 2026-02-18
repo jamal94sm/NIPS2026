@@ -18,7 +18,7 @@ from collections import defaultdict
 # Configuration
 # ----------------------------
 batch_size = 32   # Must be divisible by m (samples_per_class)
-m_per_class = 4   # 8 classes * 4 samples = 32 batch size
+m_per_class = 8   # 8 classes * 4 samples = 32 batch size
 margin = 0.3
 scale = 16
 lr = 1e-3         # Lowered slightly for stability
