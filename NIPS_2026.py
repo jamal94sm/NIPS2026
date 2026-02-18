@@ -297,9 +297,7 @@ def save_model_to_drive(model, save_path, filename="model.pth"):
     torch.save(model.state_dict(), full_path)
     print(f"✅ Model weights successfully saved to: {full_path}")
 
-# Usage:
-DRIVE_PATH = "/home/pai-ng/Jamal/CovNeXt.pth"
-save_model_to_drive(model, DRIVE_PATH)
+
 
 '''
 backbone = timm.create_model(
