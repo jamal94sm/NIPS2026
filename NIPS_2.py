@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 import timm
 from torch.utils.data import Dataset, DataLoader, Subset
 from tqdm import tqdm
@@ -12,20 +11,19 @@ import cv2
 from pytorch_metric_learning.losses import ArcFaceLoss
 
 # ----------------------------
-# Hyperparameters
+# Configuration
 # ----------------------------
 batch_size = 32
 margin = 0.3
 scale = 16
-lr = 1e-4          # Lowered slightly for fine-tuning
+lr = 1e-4             # Reduced slightly for fine-tuning
 weight_decay = 1e-4
 epochs = 50
 
-# Choose domains by NAME
+# Domain Selection
 train_domains = ["WHT", "460"]   # training spectra
 test_domains  = ["630"]          # unseen test spectrum
 
-# Device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ----------------------------
@@ -78,25 +76,21 @@ class CASIA_MS_Dataset(Dataset):
         img = Image.open(img_path).convert("RGB")
         img_np = np.array(img)
 
-        # Resize
+        # Resize (Standard for ConvNeXt is 224x224)
         img_np = cv2.resize(img_np, (224, 224), interpolation=cv2.INTER_LINEAR)
         
-        # To Tensor + Normalize (0-1)
+        # Convert to Tensor (Normalize 0-1)
         img = torch.tensor(img_np, dtype=torch.float32).permute(2, 0, 1) / 255.0
-        
-        # Optional: Add ImageNet normalization if using pretrained models
-        # normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        # img = normalize(img)
 
         return img, y_i, y_d
 
 # ----------------------------
-# 2. Setup Data
+# 2. Data Setup
 # ----------------------------
 data_path = "/home/pai-ng/Jamal/CASIA-MS-ROI"
 dataset = CASIA_MS_Dataset(data_path)
 
-# Domain Split
+# Split by Domain
 inv_domain_map = {v: k for k, v in dataset.domain_map.items()}
 train_indices = []
 test_indices = []
@@ -108,38 +102,37 @@ for idx, (_, _, y_d) in enumerate(dataset.samples):
     elif domain_name in test_domains:
         test_indices.append(idx)
 
+# Create Subsets & Loaders
 train_loader = DataLoader(Subset(dataset, train_indices), batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
 test_loader  = DataLoader(Subset(dataset, test_indices), batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-print(f"Train samples: {len(train_indices)} | Test samples: {len(test_indices)}")
+print(f"Total: {len(dataset)} | Train: {len(train_indices)} | Test: {len(test_indices)}")
+print(f"Classes: {len(dataset.hand_id_map)}")
 
 # ----------------------------
-# 3. Model: ConvNeXt Tiny
+# 3. Model Setup (ConvNeXt-Tiny)
 # ----------------------------
 print("Loading ConvNeXt Tiny...")
-# We use num_classes=0 to get the pooling layer output directly (embedding)
+# num_classes=0 removes the head, giving us the raw embedding
 model = timm.create_model('convnext_tiny', pretrained=True, num_classes=0).to(device)
 
-# 3.1 Freeze ALL parameters first
-for param in model.parameters():
-    param.requires_grad = False
+# --- Freezing Logic ---
+# 1. Freeze EVERYTHING
+for p in model.parameters():
+    p.requires_grad = False
 
-# 3.2 Unfreeze the last TWO stages (Stage 2 and Stage 3)
-# ConvNeXt stages are typically indexed 0, 1, 2, 3
-for param in model.stages[2].parameters():
-    param.requires_grad = True
-    
-for param in model.stages[3].parameters():
-    param.requires_grad = True
+# 2. Unfreeze the last TWO stages (ConvNeXt has stages 0, 1, 2, 3)
+for p in model.stages[2].parameters():
+    p.requires_grad = True
+for p in model.stages[3].parameters():
+    p.requires_grad = True
 
-# 3.3 Unfreeze the final Norm layer
-# Important: The final norm processes features before they exit the backbone
+# 3. Unfreeze the final Norm (Important for feature statistics)
 if hasattr(model, 'norm'):
-    for param in model.norm.parameters():
-        param.requires_grad = True
+    for p in model.norm.parameters():
+        p.requires_grad = True
 
-# Get embedding dimension
-embedding_dim = model.num_features 
+embedding_dim = model.num_features
 print(f"Model Ready. Embedding Dim: {embedding_dim}")
 
 # ----------------------------
@@ -147,7 +140,6 @@ print(f"Model Ready. Embedding Dim: {embedding_dim}")
 # ----------------------------
 num_classes = len(dataset.hand_id_map)
 
-# Note: pytorch_metric_learning's ArcFaceLoss creates its own learnable weights 'W'
 criterion = ArcFaceLoss(
     num_classes=num_classes,
     embedding_size=embedding_dim,
@@ -155,6 +147,7 @@ criterion = ArcFaceLoss(
     scale=scale
 ).to(device)
 
+# Optimize BOTH the model and the ArcFace centers (criterion parameters)
 optimizer = optim.AdamW(
     list(model.parameters()) + list(criterion.parameters()),
     lr=lr,
@@ -164,24 +157,10 @@ optimizer = optim.AdamW(
 # ----------------------------
 # 5. Training Loop
 # ----------------------------
-def get_arcface_preds(embeddings, criterion_layer):
-    """
-    Helper to calculate accuracy from ArcFaceLoss.
-    Computes Cosine Similarity between embeddings and class centers (W).
-    """
-    # Normalize features and weights
-    features_norm = F.normalize(embeddings, p=2, dim=1)
-    weights_norm = F.normalize(criterion_layer.W, p=2, dim=1)
-    
-    # Cosine similarity [Batch, Num_Classes]
-    cosine_sim = torch.mm(features_norm, weights_norm.t())
-    return cosine_sim.argmax(dim=1)
-
 for epoch in range(epochs):
     # -------- Training --------
     model.train()
-    # ArcFace loss layer also needs to be in train mode (for updating W)
-    criterion.train() 
+    criterion.train() # Essential for ArcFace to update centers
     
     train_loss, train_correct, total_train = 0.0, 0, 0
 
@@ -190,18 +169,19 @@ for epoch in range(epochs):
 
         optimizer.zero_grad()
         
-        # Forward pass
+        # Forward pass: Get Embeddings
         embeddings = model(images)
         
-        # Loss calculation
+        # ArcFace Loss
         loss = criterion(embeddings, y_i)
         loss.backward()
         optimizer.step()
 
         train_loss += loss.item()
         
-        # Calculate Accuracy
-        preds = get_arcface_preds(embeddings, criterion)
+        # Calculate Accuracy using built-in get_logits
+        # get_logits returns cosine similarity scores (without margin)
+        preds = criterion.get_logits(embeddings).argmax(dim=1)
         train_correct += (preds == y_i).sum().item()
         total_train += y_i.size(0)
 
@@ -216,13 +196,11 @@ for epoch in range(epochs):
             images, y_i = images.to(device), y_i.to(device)
             
             embeddings = model(images)
-            
-            # Loss
             loss = criterion(embeddings, y_i)
+            
             test_loss += loss.item()
             
-            # Accuracy
-            preds = get_arcface_preds(embeddings, criterion)
+            preds = criterion.get_logits(embeddings).argmax(dim=1)
             test_correct += (preds == y_i).sum().item()
             total_test += y_i.size(0)
 
