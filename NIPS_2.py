@@ -24,6 +24,7 @@ scale = 16
 lr = 1e-4         # Lowered slightly for stability
 weight_decay = 1e-4
 epochs = 20
+lamb = 0
 
 # Choose domains by NAME
 train_domains = ["WHT", "460", "700"]   
@@ -109,9 +110,9 @@ class CASIA_MS_Dataset(Dataset):
                 )
         
         # Standard ImageNet normalization (Required for Pretrained Models)
-        self.normalize = transforms.Normalize(
-            mean=[0.485, 0.456, 0.406], 
-            std=[0.229, 0.224, 0.225]
+        #self.normalize = transforms.Normalize(
+           # mean=[0.485, 0.456, 0.406], 
+            #std=[0.229, 0.224, 0.225]
         )
 
     def __len__(self):
@@ -265,7 +266,7 @@ for epoch in range(epochs):
         loss_con = criterion_supcon(projections, y_i)
         
         # Combined Loss (Lambda usually 0.1 - 1.0)
-        loss = loss_arc + 0.1 * loss_con
+        loss = loss_arc + lamb * loss_con
 
         loss.backward()
         optimizer.step()
