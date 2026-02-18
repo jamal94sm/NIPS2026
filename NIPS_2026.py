@@ -11,6 +11,7 @@ import numpy as np
 from PIL import Image
 import cv2
 from pytorch_metric_learning.losses import ArcFaceLoss
+from typing import Tuple, List
 
 batch_size = 32
 margin=0.3
@@ -32,9 +33,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 
-################################################## Mixure of Experts
-from typing import Tuple, List
 
+####################################################################
+################################ Mixure of Experts for ViT-based FMs
+####################################################################
 # ----------------------------
 # LoRA Expert
 # ----------------------------
@@ -172,7 +174,10 @@ class ViTEmbeddingModel(nn.Module):
 
 
 
-######################################################### DATA
+
+##################################################################
+##################################################### Data Process
+##################################################################
 class CASIA_MS_Dataset(Dataset):
     def __init__(self, data_path):
         self.samples = []
@@ -230,88 +235,13 @@ class CASIA_MS_Dataset(Dataset):
         return img, y_i, y_d
 
 
-# ================================
-# Dataset
-# ================================
-data_path = "/home/pai-ng/Jamal/CASIA-MS-ROI"
-dataset = CASIA_MS_Dataset(data_path)
-
-num_classes = len(dataset.hand_id_map)
-num_domains = len(dataset.domain_map)
-
-print("Total samples:", len(dataset))
-print("Hand ID classes:", num_classes)
-print("Domains:", dataset.domain_map)
-
-# ================================
-# Cross-Domain Split Configuration
-# ================================
-
-# Reverse domain map: id → name
-inv_domain_map = {v: k for k, v in dataset.domain_map.items()}
-
-train_indices = []
-test_indices = []
-
-for idx, (_, _, y_d) in enumerate(dataset.samples):
-    domain_name = inv_domain_map[y_d]
-
-    if domain_name in train_domains:
-        train_indices.append(idx)
-    elif domain_name in test_domains:
-        test_indices.append(idx)
-
-# ================================
-# Subsets
-# ================================
-train_dataset = Subset(dataset, train_indices)
-test_dataset  = Subset(dataset, test_indices)
-
-print("Train samples:", len(train_dataset))
-print("Test samples:", len(test_dataset))
-
-# ================================
-# DataLoaders
-# ================================
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=batch_size,
-    shuffle=True,
-    num_workers=2,
-    pin_memory=True
-)
-
-test_loader = DataLoader(
-    test_dataset,
-    batch_size=batch_size,
-    shuffle=False,
-    num_workers=2,
-    pin_memory=True
-)
-
-# ================================
-# Sanity Check
-# ================================
-images, y_i, y_d = next(iter(train_loader))
-
-# Verify domain separation
-train_domains_seen = set(inv_domain_map[d.item()] for d in y_d)
-print("Domains seen in train batch:", train_domains_seen)
-
-
-images, y_i, y_d = next(iter(test_loader))
-
-# Verify domain separation
-test_domains_seen = set(inv_domain_map[d.item()] for d in y_d)
-print("Domains seen in test batch:", test_domains_seen)
 
 
 
 
-
-
-
+########################################################################
 ################################################################# MODELS
+########################################################################
 class CustomCNN160(nn.Module):
     def __init__(self, input_channels=3):
         super(CustomCNN160, self).__init__()
@@ -356,24 +286,20 @@ class CustomCNN160(nn.Module):
         return x
 
 
+def save_model_to_drive(model, save_path, filename="model.pth"):
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
 
+    full_path = os.path.join(save_path, filename)
 
+    # Save the weights (state_dict)
+    # Moving to CPU before saving is a best practice for compatibility
+    torch.save(model.state_dict(), full_path)
+    print(f"✅ Model weights successfully saved to: {full_path}")
 
-############################################################ MAIN
-
-# ----------------------------
-# Main Script for Custom ViT + MoE-LoRA + ArcFace
-# ----------------------------
-
-
-# ================================
-# Backbone: DeiT + MoE-LoRA
-# ================================
-# 21M params, inference cost ? GFLOPs ---> deit_small_patch16_224
-# 5M params, inference cost ? GFLOPs ---> deit_tiny_patch16_224
-# 0.9M params, inference cost ? GFLOPs ---> test_vit3.r160_in1k
-# inference cost 0.0885 GFLOPs ---> test_vit2.r160_in1k
-# 0.4M params, inference cost 0.03 GFLOPs (less than baseline's CNN model) ---> test_vit.r160_in1k
+# Usage:
+DRIVE_PATH = "/home/pai-ng/Jamal/CovNeXt.pth"
+save_model_to_drive(model, DRIVE_PATH)
 
 '''
 backbone = timm.create_model(
@@ -457,6 +383,97 @@ embedding_dim = model.num_features
 '''
 
 
+
+####################################################################
+###################################################### The MAIN LOOP
+####################################################################
+
+# ================================
+# Dataset
+# ================================
+data_path = "/home/pai-ng/Jamal/CASIA-MS-ROI"
+dataset = CASIA_MS_Dataset(data_path)
+
+num_classes = len(dataset.hand_id_map)
+num_domains = len(dataset.domain_map)
+
+print("Total samples:", len(dataset))
+print("Hand ID classes:", num_classes)
+print("Domains:", dataset.domain_map)
+
+# ================================
+# Cross-Domain Split Configuration
+# ================================
+
+# Reverse domain map: id → name
+inv_domain_map = {v: k for k, v in dataset.domain_map.items()}
+
+train_indices = []
+test_indices = []
+
+for idx, (_, _, y_d) in enumerate(dataset.samples):
+    domain_name = inv_domain_map[y_d]
+
+    if domain_name in train_domains:
+        train_indices.append(idx)
+    elif domain_name in test_domains:
+        test_indices.append(idx)
+
+# ================================
+# Subsets
+# ================================
+train_dataset = Subset(dataset, train_indices)
+test_dataset  = Subset(dataset, test_indices)
+
+print("Train samples:", len(train_dataset))
+print("Test samples:", len(test_dataset))
+
+# ================================
+# DataLoaders
+# ================================
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=batch_size,
+    shuffle=True,
+    num_workers=2,
+    pin_memory=True
+)
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=batch_size,
+    shuffle=False,
+    num_workers=2,
+    pin_memory=True
+)
+
+# ================================
+# Sanity Check
+# ================================
+images, y_i, y_d = next(iter(train_loader))
+
+# Verify domain separation
+train_domains_seen = set(inv_domain_map[d.item()] for d in y_d)
+print("Domains seen in train batch:", train_domains_seen)
+
+
+images, y_i, y_d = next(iter(test_loader))
+
+# Verify domain separation
+test_domains_seen = set(inv_domain_map[d.item()] for d in y_d)
+print("Domains seen in test batch:", test_domains_seen)
+
+
+
+# ================================
+# Backbone
+# ================================
+# 21M params, inference cost ? GFLOPs ---> deit_small_patch16_224
+# 5M params, inference cost ? GFLOPs ---> deit_tiny_patch16_224
+# 0.9M params, inference cost ? GFLOPs ---> test_vit3.r160_in1k
+# inference cost 0.0885 GFLOPs ---> test_vit2.r160_in1k
+# 0.4M params, inference cost 0.03 GFLOPs (less than baseline's CNN model) ---> test_vit.r160_in1k
+
 print("Loading ConvNeXt V2-Tiny...")
 model = timm.create_model('convnextv2_tiny', pretrained=True, num_classes=0).to(device)
 embedding_dim = model.num_features 
@@ -528,20 +545,7 @@ for epoch in range(epochs):
 
 
 
-def save_model_to_drive(model, save_path, filename="model.pth"):
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
 
-    full_path = os.path.join(save_path, filename)
-
-    # Save the weights (state_dict)
-    # Moving to CPU before saving is a best practice for compatibility
-    torch.save(model.state_dict(), full_path)
-    print(f"✅ Model weights successfully saved to: {full_path}")
-
-# Usage:
-DRIVE_PATH = "/home/pai-ng/Jamal/CovNeXt.pth"
-save_model_to_drive(model, DRIVE_PATH)
 
 
 '''
@@ -584,7 +588,7 @@ model = load_moe_vit_model(CHECKPOINT, device, num_experts=4, top_k=2)
 
 
 
-
+'''
 
 #################################################################### Test Time Adaptation
 # --------------------------------------------------------------------------------
@@ -596,7 +600,7 @@ print("\nStarting Global TTA Evaluation...")
 # Since 'model' is already loaded via load_moe_vit_model, we clone its current state.
 cpu_reset_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
-'''
+
 # 2. Freeze all parameters except MoE Experts/Routers
 for p in model.parameters():
     p.requires_grad = False
@@ -604,7 +608,7 @@ for p in model.parameters():
 for name, p in model.named_parameters():
     if any(k in name.lower() for k in ["lora", "expert", "gate", "router"]):
         p.requires_grad = True
-'''
+
 
 
 total_baseline_acc = 0.0
@@ -661,4 +665,4 @@ print(f"Average Baseline Acc: {final_baseline:.4f}")
 print(f"Average TTA Acc:      {final_tta:.4f}")
 print(f"Absolute Improvement: {final_tta - final_baseline:.4f}")
 print("="*40)
-
+'''
