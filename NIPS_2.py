@@ -27,8 +27,8 @@ epochs = 20
 lamb = 0.1
 
 # Choose domains by NAME
-train_domains = ["WHT", "460", "700"]   
-test_domains  = ["850"]          
+train_domains = ["WHT", "460"]   
+test_domains  = ["700"]          
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
