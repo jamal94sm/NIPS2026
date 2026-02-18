@@ -126,7 +126,7 @@ class CASIA_MS_Dataset(Dataset):
         img_np = cv2.resize(img_np, (224, 224), interpolation=cv2.INTER_LINEAR)
         
         img = torch.tensor(img_np, dtype=torch.float32).permute(2, 0, 1) / 255.0
-        img = self.normalize(img)
+        #img = self.normalize(img)
 
         return img, y_i, y_d
 
