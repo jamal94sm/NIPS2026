@@ -22,7 +22,7 @@ epochs = 50
 
 # Choose domains by NAME: 460, 630, 700, WHT, 850, 940
 train_domains = ["WHT", "460"]   # training spectra
-test_domains  = ["630"]          # unseen test spectrum
+test_domains  = ["700"]          # unseen test spectrum
 
 
 # ----------------------------
