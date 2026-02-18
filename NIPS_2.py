@@ -21,10 +21,10 @@ batch_size = 32   # Must be divisible by m (samples_per_class)
 m_per_class = 4   # 8 classes * 4 samples = 32 batch size
 margin = 0.3
 scale = 16
-lr = 1e-4         # Lowered slightly for stability
+lr = 1e-3         # Lowered slightly for stability
 weight_decay = 1e-4
 epochs = 20
-lamb = 0
+lamb = 0.1
 
 # Choose domains by NAME
 train_domains = ["WHT", "460", "700"]   
