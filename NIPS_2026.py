@@ -93,6 +93,14 @@ class CASIA_MS_Dataset(Dataset):
             img_np, dtype=torch.float32
         ).permute(2, 0, 1) / 255.0
 
+        # 2. Normalize (ImageNet Standards)
+        # (This was missing in your original code)
+        normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], 
+            std=[0.229, 0.224, 0.225]
+        )
+        img = normalize(img)
+        
         return img, y_i, y_d
 
 
