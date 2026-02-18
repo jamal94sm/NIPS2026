@@ -24,7 +24,7 @@ scale = 16
 lr = 1e-3         # Lowered slightly for stability
 weight_decay = 1e-4
 epochs = 20
-lamb = 0.1
+lamb = 0.0
 
 # Choose domains by NAME
 train_domains = ["WHT", "460"]   
