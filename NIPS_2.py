@@ -149,8 +149,7 @@ for p in model.parameters():
     p.requires_grad = False
 
 # 2. Unfreeze the last TWO stages (ConvNeXt has stages 0, 1, 2, 3)
-for p in model.stages[2].parameters():
-    p.requires_grad = True
+
 for p in model.stages[3].parameters():
     p.requires_grad = True
 
