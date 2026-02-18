@@ -16,13 +16,13 @@ from pytorch_metric_learning.losses import ArcFaceLoss
 batch_size = 32
 margin = 0.3
 scale = 16
-lr = 1e-4             # Reduced slightly for fine-tuning
+lr = 1e-4             
 weight_decay = 1e-4
-epochs = 50
+epochs = 20
 
 # Domain Selection
 train_domains = ["WHT", "460"]   # training spectra
-test_domains  = ["630"]          # unseen test spectrum
+test_domains  = ["700"]          # unseen test spectrum
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -110,6 +110,33 @@ print(f"Total: {len(dataset)} | Train: {len(train_indices)} | Test: {len(test_in
 print(f"Classes: {len(dataset.hand_id_map)}")
 
 # ----------------------------
+# 2.1 Domain Sanity Check (ADDED)
+# ----------------------------
+print("\n--- Verifying Domain Split ---")
+
+# Check Train Batch
+try:
+    _, _, y_d_train = next(iter(train_loader))
+    train_domains_seen = set(inv_domain_map[d.item()] for d in y_d_train)
+    print(f"Training batch contains domains: {train_domains_seen}")
+    if not train_domains_seen.issubset(set(train_domains)):
+        print(f"WARNING: Found unexpected domains in Training set!")
+except StopIteration:
+    print("Training loader is empty!")
+
+# Check Test Batch
+try:
+    _, _, y_d_test = next(iter(test_loader))
+    test_domains_seen = set(inv_domain_map[d.item()] for d in y_d_test)
+    print(f"Testing batch contains domains:  {test_domains_seen}")
+    if not test_domains_seen.issubset(set(test_domains)):
+        print(f"WARNING: Found unexpected domains in Test set!")
+except StopIteration:
+    print("Test loader is empty!")
+
+print("------------------------------\n")
+
+# ----------------------------
 # 3. Model Setup (ConvNeXt-Tiny)
 # ----------------------------
 print("Loading ConvNeXt Tiny...")
@@ -147,7 +174,6 @@ criterion = ArcFaceLoss(
     scale=scale
 ).to(device)
 
-# Optimize BOTH the model and the ArcFace centers (criterion parameters)
 optimizer = optim.AdamW(
     list(model.parameters()) + list(criterion.parameters()),
     lr=lr,
@@ -160,7 +186,7 @@ optimizer = optim.AdamW(
 for epoch in range(epochs):
     # -------- Training --------
     model.train()
-    criterion.train() # Essential for ArcFace to update centers
+    criterion.train() 
     
     train_loss, train_correct, total_train = 0.0, 0, 0
 
@@ -169,18 +195,17 @@ for epoch in range(epochs):
 
         optimizer.zero_grad()
         
-        # Forward pass: Get Embeddings
+        # Forward pass
         embeddings = model(images)
         
-        # ArcFace Loss
+        # Loss
         loss = criterion(embeddings, y_i)
         loss.backward()
         optimizer.step()
 
         train_loss += loss.item()
         
-        # Calculate Accuracy using built-in get_logits
-        # get_logits returns cosine similarity scores (without margin)
+        # Accuracy
         preds = criterion.get_logits(embeddings).argmax(dim=1)
         train_correct += (preds == y_i).sum().item()
         total_train += y_i.size(0)
@@ -197,7 +222,6 @@ for epoch in range(epochs):
             
             embeddings = model(images)
             loss = criterion(embeddings, y_i)
-            
             test_loss += loss.item()
             
             preds = criterion.get_logits(embeddings).argmax(dim=1)
