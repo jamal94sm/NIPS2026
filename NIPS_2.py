@@ -5,20 +5,17 @@ import torch.nn.functional as F
 import timm
 from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.sampler import Sampler
 from tqdm import tqdm
 import os
 import numpy as np
 from PIL import Image
 import cv2
 from pytorch_metric_learning import losses
-from collections import defaultdict
 
 # ----------------------------
 # Configuration
 # ----------------------------
 batch_size = 32   
-m_per_class = 4   # 8 classes * 4 samples = 32
 margin = 0.3
 scale = 16
 lr = 1e-3
@@ -33,71 +30,43 @@ test_domains  = ["700"]
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ----------------------------
-# 1. Augmentations (Standard/Strong for SupCon)
+# 1. Transforms (Separated)
 # ----------------------------
-# Strong Augmentation for Training
-train_transform = transforms.Compose([
+# Transform 1: CLEAN (Original)
+# Used for ArcFace classification and as the 'Anchor' for SupCon
+orig_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    # transforms.Normalize(...) # Add if needed
+])
+
+# Transform 2: AUGMENTED
+# Used only for the Contrastive 'Positive' view
+aug_transform = transforms.Compose([
     transforms.RandomResizedCrop(size=224, scale=(0.6, 1.0)),
     transforms.RandomRotation(degrees=10),
-    transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1), # Critical for spectra
+    transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
     transforms.RandomGrayscale(p=0.2),
     transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.2),
     transforms.ToTensor(),
-    #transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-
-# Clean Transform for Testing
-val_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    #transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    # transforms.Normalize(...) # Add if needed
 ])
 
 # ----------------------------
-# 2. Custom Sampler
-# ----------------------------
-class MPerClassSampler(Sampler):
-    def __init__(self, labels, m, batch_size=None, length_before_new_iter=100000):
-        self.m = m
-        self.batch_size = batch_size
-        self.labels = np.array(labels)
-        self.unique_labels = list(set(self.labels))
-        self.length_before_new_iter = length_before_new_iter
-
-        self.label_to_indices = defaultdict(list)
-        for idx, label in enumerate(self.labels):
-            self.label_to_indices[label].append(idx)
-
-        self.classes_per_batch = self.batch_size // self.m
-
-    def __len__(self):
-        return self.length_before_new_iter
-
-    def __iter__(self):
-        num_batches = self.length_before_new_iter // self.batch_size
-        for _ in range(num_batches):
-            batch = []
-            selected_classes = np.random.choice(self.unique_labels, self.classes_per_batch, replace=False)
-            for cls in selected_classes:
-                indices = self.label_to_indices[cls]
-                selected_indices = np.random.choice(indices, self.m, replace=True) 
-                batch.extend(selected_indices)
-            yield batch
-
-# ----------------------------
-# 3. Dataset Class
+# 2. Dataset Class (Updated)
 # ----------------------------
 class CASIA_MS_Dataset(Dataset):
-    def __init__(self, data_path, target_domains, transform=None):
+    def __init__(self, data_path, target_domains, orig_transform=None, aug_transform=None, is_train=True):
         self.samples = []
         self.hand_id_map = {}
-        self.transform = transform
+        self.orig_transform = orig_transform
+        self.aug_transform = aug_transform
+        self.is_train = is_train
         
         hand_id_counter = 0
 
-        # Note: We assume IDs are consistent across domains
         for root, _, files in os.walk(data_path):
-            files.sort() # Ensure deterministic order
+            files.sort()
             for fname in files:
                 if not fname.lower().endswith(".jpg"):
                     continue
@@ -108,7 +77,6 @@ class CASIA_MS_Dataset(Dataset):
 
                 subject_id, hand, spectrum, iteration = parts
                 
-                # Internal Filtering
                 if spectrum not in target_domains:
                     continue
 
@@ -129,36 +97,53 @@ class CASIA_MS_Dataset(Dataset):
         
         img = Image.open(img_path).convert("RGB")
         
-        if self.transform:
-            img = self.transform(img)
+        # Apply Original Transform (Always)
+        if self.orig_transform:
+            img_orig = self.orig_transform(img)
         else:
-            img = transforms.Resize((224, 224))(img)
-            img = transforms.ToTensor()(img)
+            img_orig = transforms.Resize((224, 224))(img)
+            img_orig = transforms.ToTensor()(img_orig)
 
-        return img, y_i
+        # If training, ALSO return the Augmented version
+        if self.is_train and self.aug_transform:
+            img_aug = self.aug_transform(img)
+            return img_orig, img_aug, y_i
+        
+        # If testing, just return original
+        return img_orig, y_i
 
 # ----------------------------
-# 4. Data Loading
+# 3. Data Loading
 # ----------------------------
 data_path = "/home/pai-ng/Jamal/CASIA-MS-ROI"
 
 print("Creating Training Dataset...")
-train_dataset = CASIA_MS_Dataset(data_path, target_domains=train_domains, transform=train_transform)
+# Pass BOTH transforms here
+train_dataset = CASIA_MS_Dataset(
+    data_path, 
+    target_domains=train_domains, 
+    orig_transform=orig_transform, 
+    aug_transform=aug_transform,
+    is_train=True
+)
 
 print("Creating Test Dataset...")
-test_dataset  = CASIA_MS_Dataset(data_path, target_domains=test_domains, transform=val_transform)
+# Pass only orig_transform, is_train=False
+test_dataset  = CASIA_MS_Dataset(
+    data_path, 
+    target_domains=test_domains, 
+    orig_transform=orig_transform,
+    is_train=False
+)
 
-# Sampler Setup
-train_labels = [s[1] for s in train_dataset.samples]
-sampler = MPerClassSampler(train_labels, m=m_per_class, batch_size=batch_size, length_before_new_iter=len(train_dataset))
-
-train_loader = DataLoader(train_dataset, batch_sampler=sampler, num_workers=2, pin_memory=True)
+# Standard Shuffle=True DataLoader
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
 test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
 print(f"Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
 
 # ----------------------------
-# 5. Model Setup
+# 4. Model Setup
 # ----------------------------
 print("Loading ConvNeXt V2-Tiny...")
 model = timm.create_model('convnextv2_tiny', pretrained=True, num_classes=0).to(device)
@@ -188,7 +173,7 @@ class ProjectionHead(nn.Module):
 proj_head = ProjectionHead(embedding_dim).to(device)
 
 # ----------------------------
-# 6. Losses & Optimizer
+# 5. Losses & Optimizer
 # ----------------------------
 num_classes = len(train_dataset.hand_id_map)
 
@@ -201,30 +186,59 @@ optimizer = optim.AdamW(
 )
 
 # ----------------------------
-# 7. Training Loop
+# 6. Training Loop
 # ----------------------------
 for epoch in range(epochs):
     # -------- Training --------
     model.train(); proj_head.train(); criterion_arc.train()
     train_loss, train_correct, total_train = 0.0, 0, 0
 
-    for images, y_i in tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]"):
-        images, y_i = images.to(device), y_i.to(device)
+    # Note: Unpacking 3 items now: orig, aug, label
+    for img_orig, img_aug, y_i in tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]"):
+        img_orig = img_orig.to(device)
+        img_aug  = img_aug.to(device)
+        y_i      = y_i.to(device)
 
         optimizer.zero_grad()
         
-        # Forward
+        # Concatenate for efficient forward pass (Batch size becomes 2*B = 64)
+        images = torch.cat([img_orig, img_aug], dim=0)
+        
+        # 1. Forward Pass
         embeddings = model(images)           
-        projections = proj_head(embeddings)  
+        
+        # Split embeddings back into Original and Augmented
+        # First half is Original, Second half is Augmented
+        bs = img_orig.size(0)
+        emb_orig = embeddings[:bs]
+        emb_aug  = embeddings[bs:]
+        
+        # 2. Losses
+        
+        # A) ArcFace: Apply ONLY to the Original (Clean) images
+        # This keeps the class centers stable and noise-free
+        loss_arc = criterion_arc(emb_orig, y_i)
+        
+        # B) SupCon: Apply to BOTH (Original + Augmented)
+        # We project them first
+        proj_orig = proj_head(emb_orig)
+        proj_aug  = proj_head(emb_aug)
+        
+        # SupCon expects stacked features [Batch, n_views, dim]
+        # We create a stack of 2 views per image
+        features_stacked = torch.stack([proj_orig, proj_aug], dim=1)
+        loss_con = criterion_supcon(features_stacked, y_i)
         
         # Combined Loss
-        loss = criterion_arc(embeddings, y_i) + lamb * criterion_supcon(projections, y_i)
+        loss = loss_arc + lamb * loss_con
         
         loss.backward()
         optimizer.step()
 
         train_loss += loss.item()
-        preds = criterion_arc.get_logits(embeddings).argmax(dim=1)
+        
+        # Accuracy: Based on the Clean images
+        preds = criterion_arc.get_logits(emb_orig).argmax(dim=1)
         train_correct += (preds == y_i).sum().item()
         total_train += y_i.size(0)
 
@@ -233,11 +247,12 @@ for epoch in range(epochs):
     test_loss, test_correct, total_test = 0.0, 0, 0
     
     with torch.no_grad():
-        for images, y_i in tqdm(test_loader, desc=f"Epoch {epoch+1} [Test]"):
-            images, y_i = images.to(device), y_i.to(device)
-            embeddings = model(images)
+        # Test loader only returns img_orig and label
+        for img_orig, y_i in tqdm(test_loader, desc=f"Epoch {epoch+1} [Test]"):
+            img_orig, y_i = img_orig.to(device), y_i.to(device)
             
-            # Test Loss & Accuracy (ArcFace only)
+            embeddings = model(img_orig)
+            
             test_loss += criterion_arc(embeddings, y_i).item()
             preds = criterion_arc.get_logits(embeddings).argmax(dim=1)
             test_correct += (preds == y_i).sum().item()
