@@ -186,14 +186,17 @@ optimizer = optim.AdamW(
 )
 
 # ----------------------------
-# 6. Training Loop
+# 6. Training Loop (Fixed)
 # ----------------------------
 for epoch in range(epochs):
     # -------- Training --------
     model.train(); proj_head.train(); criterion_arc.train()
-    train_loss, train_correct, total_train = 0.0, 0, 0
+    
+    train_loss = 0.0
+    train_correct = 0
+    total_train = 0
 
-    # Note: Unpacking 3 items now: orig, aug, label
+    # Unpack 3 items: orig, aug, label
     for img_orig, img_aug, y_i in tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]"):
         img_orig = img_orig.to(device)
         img_aug  = img_aug.to(device)
@@ -201,33 +204,36 @@ for epoch in range(epochs):
 
         optimizer.zero_grad()
         
-        # Concatenate for efficient forward pass (Batch size becomes 2*B = 64)
-        images = torch.cat([img_orig, img_aug], dim=0)
-        
         # 1. Forward Pass
-        embeddings = model(images)           
+        # Process both original and augmented images
+        # We concatenate them to send through the model in one go for efficiency
+        # Input Shape: [2*Batch_Size, 3, 224, 224]
+        images_all = torch.cat([img_orig, img_aug], dim=0)
         
-        # Split embeddings back into Original and Augmented
-        # First half is Original, Second half is Augmented
-        bs = img_orig.size(0)
-        emb_orig = embeddings[:bs]
-        emb_aug  = embeddings[bs:]
+        # Get Embeddings: [2*Batch_Size, 768]
+        embeddings_all = model(images_all)
         
-        # 2. Losses
+        # Get Projections for SupCon: [2*Batch_Size, 128]
+        projections_all = proj_head(embeddings_all)
+
+        # 2. Split Embeddings for ArcFace
+        # We only want to use the CLEAN (Original) images for ArcFace classification
+        # The first half of the batch is Original, second half is Augmented
+        batch_size_curr = img_orig.size(0)
+        emb_orig = embeddings_all[:batch_size_curr]
+
+        # 3. Calculate Losses
         
-        # A) ArcFace: Apply ONLY to the Original (Clean) images
-        # This keeps the class centers stable and noise-free
+        # A) ArcFace Loss (Classification on Clean Images)
         loss_arc = criterion_arc(emb_orig, y_i)
         
-        # B) SupCon: Apply to BOTH (Original + Augmented)
-        # We project them first
-        proj_orig = proj_head(emb_orig)
-        proj_aug  = proj_head(emb_aug)
+        # B) SupCon Loss (Contrastive on ALL Images)
+        # We need labels for the full batch (Original + Augmented)
+        # So we repeat the labels: [y_i, y_i] -> [2*Batch_Size]
+        labels_all = torch.cat([y_i, y_i], dim=0)
         
-        # SupCon expects stacked features [Batch, n_views, dim]
-        # We create a stack of 2 views per image
-        features_stacked = torch.stack([proj_orig, proj_aug], dim=1)
-        loss_con = criterion_supcon(features_stacked, y_i)
+        # SupCon now receives 2D tensors: [2B, Dim] and [2B]
+        loss_con = criterion_supcon(projections_all, labels_all)
         
         # Combined Loss
         loss = loss_arc + lamb * loss_con
@@ -237,25 +243,32 @@ for epoch in range(epochs):
 
         train_loss += loss.item()
         
-        # Accuracy: Based on the Clean images
+        # Accuracy: Based on the Clean images only
         preds = criterion_arc.get_logits(emb_orig).argmax(dim=1)
         train_correct += (preds == y_i).sum().item()
-        total_train += y_i.size(0)
+        total_train += batch_size_curr
 
-    # -------- Evaluation --------
+    # -------- Evaluation (Same as before) --------
     model.eval(); criterion_arc.eval()
-    test_loss, test_correct, total_test = 0.0, 0, 0
+    test_loss = 0.0
+    test_correct = 0
+    total_test = 0
     
     with torch.no_grad():
-        # Test loader only returns img_orig and label
         for img_orig, y_i in tqdm(test_loader, desc=f"Epoch {epoch+1} [Test]"):
             img_orig, y_i = img_orig.to(device), y_i.to(device)
             
             embeddings = model(img_orig)
             
-            test_loss += criterion_arc(embeddings, y_i).item()
+            # For testing, we use ArcFace loss/metric
+            loss = criterion_arc(embeddings, y_i)
+            test_loss += loss.item()
+            
             preds = criterion_arc.get_logits(embeddings).argmax(dim=1)
             test_correct += (preds == y_i).sum().item()
             total_test += y_i.size(0)
 
-    print(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {train_loss/len(train_loader):.4f} Acc: {train_correct/total_train:.4f} | Test Acc: {test_correct/total_test:.4f}")
+    print(f"Epoch [{epoch+1}/{epochs}] | "
+          f"Train Loss: {train_loss/len(train_loader):.4f} "
+          f"Train Acc: {train_correct/total_train:.4f} | "
+          f"Test Acc: {test_correct/total_test:.4f}")
