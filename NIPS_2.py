@@ -40,17 +40,25 @@ orig_transform = transforms.Compose([
     # transforms.Normalize(...) # Add if needed
 ])
 
-# Transform 2: AUGMENTED
-# Used only for the Contrastive 'Positive' view
 aug_transform = transforms.Compose([
-    # FIX 1: Restricted crop scale from 0.6 to 0.85 to preserve palm lines
-    transforms.RandomResizedCrop(size=224, scale=(0.9, 1.0)),
-    transforms.RandomRotation(degrees=10),
-    transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
-    transforms.RandomGrayscale(p=0.2),
+    # 1. Spatial Shift (Mimics peg-free hand placement)
+    # Ratio ensures the palm doesn't get stretched into weird rectangles
+    transforms.RandomResizedCrop(size=224, scale=(0.9, 1.0), ratio=(0.95, 1.05)),
+    # Affine adds translation (shifting) alongside rotation
+    transforms.RandomAffine(degrees=10, translate=(0.05, 0.05)),
+    # 2. Spectral Illumination (The most critical part for Cross-Domain)
+    # Hue and saturation MUST be 0 for grayscale/spectral data
+    transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0, hue=0),
+    # 3. Wavelength Focal Simulation
+    # Simulates the soft, washed-out look of Infrared (850nm)
     transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.2),
+    # Simulates the crisp, high-contrast surface lines of Blue (460nm)
+    transforms.RandomApply([transforms.RandomAdjustSharpness(sharpness_factor=2.0)], p=0.2),
+    # Mimics the histogram differences between spectrums
+    transforms.RandomApply([transforms.RandomAutocontrast()], p=0.2),
     transforms.ToTensor(),
-    # transforms.Normalize(...) # Add if needed
+    # 4. Normalization (Highly recommended for ConvNeXt)
+    #transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
 # ----------------------------
