@@ -18,7 +18,7 @@ from pytorch_metric_learning import losses
 batch_size = 32   
 margin = 0.3
 scale = 16
-lr = 0.5e-3
+lr = 1e-3
 weight_decay = 1e-4
 epochs = 100
 lamb = 0.2       # Weight for Contrastive Loss
