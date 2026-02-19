@@ -21,7 +21,7 @@ batch_size = 32
 m_per_class = 4   # 8 classes * 4 samples = 32 batch size
 margin = 0.3
 scale = 16
-lr = 1e-4         
+lr = 1e-3         
 weight_decay = 1e-4
 epochs = 20
 lamb = 1.0
