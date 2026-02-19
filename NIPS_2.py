@@ -16,13 +16,12 @@ from pytorch_metric_learning import losses
 # Configuration
 # ----------------------------
 batch_size = 32   
-num_augs = 4       # NUMBER OF AUGMENTED POSITIVE SAMPLES PER IMAGE
 margin = 0.3
 scale = 16
 lr = 1e-3
 weight_decay = 1e-4
 epochs = 50
-lamb = 0.2        # Weight for Contrastive Loss
+lamb = 0.2       # Weight for Contrastive Loss
 
 # Choose domains by NAME
 train_domains = ["WHT", "460"]   
@@ -54,16 +53,15 @@ aug_transform = transforms.Compose([
 ])
 
 # ----------------------------
-# 2. Dataset Class (Updated for Multi-Augmentation)
+# 2. Dataset Class
 # ----------------------------
 class CASIA_MS_Dataset(Dataset):
-    def __init__(self, data_path, target_domains, orig_transform=None, aug_transform=None, is_train=True, num_augs=1):
+    def __init__(self, data_path, target_domains, orig_transform=None, aug_transform=None, is_train=True):
         self.samples = []
         self.hand_id_map = {}
         self.orig_transform = orig_transform
         self.aug_transform = aug_transform
         self.is_train = is_train
-        self.num_augs = num_augs  # How many augmented views to generate
         
         hand_id_counter = 0
 
@@ -106,11 +104,10 @@ class CASIA_MS_Dataset(Dataset):
             img_orig = transforms.Resize((224, 224))(img)
             img_orig = transforms.ToTensor()(img_orig)
 
-        # If training, ALSO return MULTIPLE Augmented versions
+        # If training, ALSO return the Augmented version
         if self.is_train and self.aug_transform:
-            # Generate a list of multiple distinct augmented versions
-            augs = [self.aug_transform(img) for _ in range(self.num_augs)]
-            return img_orig, augs, y_i
+            img_aug = self.aug_transform(img)
+            return img_orig, img_aug, y_i
         
         # If testing, just return original
         return img_orig, y_i
@@ -121,16 +118,17 @@ class CASIA_MS_Dataset(Dataset):
 data_path = "/home/pai-ng/Jamal/CASIA-MS-ROI"
 
 print("Creating Training Dataset...")
+# Pass BOTH transforms here
 train_dataset = CASIA_MS_Dataset(
     data_path, 
     target_domains=train_domains, 
     orig_transform=orig_transform, 
     aug_transform=aug_transform,
-    is_train=True,
-    num_augs=num_augs  # Pass the config variable here
+    is_train=True
 )
 
 print("Creating Test Dataset...")
+# Pass only orig_transform, is_train=False
 test_dataset  = CASIA_MS_Dataset(
     data_path, 
     target_domains=test_domains, 
@@ -188,7 +186,7 @@ optimizer = optim.AdamW(
 )
 
 # ----------------------------
-# 6. Training Loop (Fixed for Multi-Aug)
+# 6. Training Loop
 # ----------------------------
 for epoch in range(epochs):
     # -------- Training --------
@@ -198,44 +196,40 @@ for epoch in range(epochs):
     train_correct = 0
     total_train = 0
 
-    # Unpack 3 items: orig, LIST of augs, label
-    for img_orig, augs_list, y_i in tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]"):
+    # Unpack 3 items: orig, aug, label
+    for img_orig, img_aug, y_i in tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]"):
         img_orig = img_orig.to(device)
+        img_aug  = img_aug.to(device)
         y_i      = y_i.to(device)
-        
-        # augs_list is a list of tensors from the DataLoader. Move all to device.
-        augs_list = [aug.to(device) for aug in augs_list]
 
         optimizer.zero_grad()
         
         # 1. Forward Pass
-        # Concatenate original with ALL 4 augmentations 
-        # Output shape will be [(1 + num_augs) * Batch_Size, 3, 224, 224]
-        images_all = torch.cat([img_orig] + augs_list, dim=0)
+        # Process both original and augmented images
+        # Input Shape: [2*Batch_Size, 3, 224, 224]
+        images_all = torch.cat([img_orig, img_aug], dim=0)
         
-        # Get Embeddings for all views simultaneously
+        # Get Embeddings: [2*Batch_Size, 768]
         embeddings_all = model(images_all)
         
-        # Get Projections for SupCon
+        # Get Projections for SupCon: [2*Batch_Size, 128]
         projections_all = proj_head(embeddings_all)
 
         # 2. Split Embeddings for ArcFace
         # We only want to use the CLEAN (Original) images for ArcFace classification
-        # The first 'Batch_Size' elements are the originals.
         batch_size_curr = img_orig.size(0)
         emb_orig = embeddings_all[:batch_size_curr]
 
         # 3. Calculate Losses
         
-        # A) ArcFace Loss (Classification on Clean Images only)
+        # A) ArcFace Loss (Classification on Clean Images)
         loss_arc = criterion_arc(emb_orig, y_i)
         
         # B) SupCon Loss (Contrastive on ALL Images)
-        # We need to duplicate the labels for the original AND the 'num_augs' augmentations
-        # e.g., if y_i is [1, 2, 3], and num_augs is 4, it repeats 5 times total: [1,2,3, 1,2,3, 1,2,3, 1,2,3, 1,2,3]
-        labels_all = y_i.repeat(1 + len(augs_list))
+        # We need labels for the full batch (Original + Augmented)
+        labels_all = torch.cat([y_i, y_i], dim=0)
         
-        # SupCon handles the grouping automatically based on the labels
+        # SupCon now receives 2D tensors: [2B, Dim] and [2B]
         loss_con = criterion_supcon(projections_all, labels_all)
         
         # Combined Loss
