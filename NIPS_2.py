@@ -20,7 +20,7 @@ margin = 0.3
 scale = 16
 lr = 1e-4
 weight_decay = 1e-4
-epochs = 20
+epochs = 50
 lamb = 0.25        # Weight for Contrastive Loss
 
 # Choose domains by NAME
