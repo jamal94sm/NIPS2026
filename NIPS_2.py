@@ -279,4 +279,4 @@ for epoch in range(epochs):
           f"Test Acc: {test_correct/total_test:.4f}")
 
     # Step the scheduler at the very end of the epoch
-    #scheduler.step()
+    scheduler.step()
