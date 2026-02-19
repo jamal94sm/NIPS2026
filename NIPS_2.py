@@ -187,7 +187,7 @@ optimizer = optim.AdamW(
 )
 
 # FIX 3: Add Cosine Annealing Learning Rate Scheduler
-#scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
 # ----------------------------
 # 6. Training Loop
@@ -244,7 +244,7 @@ for epoch in range(epochs):
         # FIX 2: Gradient Clipping to prevent explosion in ArcFace
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         
-        optimizer.step()
+        #optimizer.step()
 
         train_loss += loss.item()
         
