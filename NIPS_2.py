@@ -43,7 +43,8 @@ orig_transform = transforms.Compose([
 # Transform 2: AUGMENTED
 # Used only for the Contrastive 'Positive' view
 aug_transform = transforms.Compose([
-    transforms.RandomResizedCrop(size=224, scale=(0.6, 1.0)),
+    # FIX 1: Restricted crop scale from 0.6 to 0.85 to preserve palm lines
+    transforms.RandomResizedCrop(size=224, scale=(0.9, 1.0)),
     transforms.RandomRotation(degrees=10),
     transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
     transforms.RandomGrayscale(p=0.2),
@@ -185,6 +186,9 @@ optimizer = optim.AdamW(
     lr=lr, weight_decay=weight_decay
 )
 
+# FIX 3: Add Cosine Annealing Learning Rate Scheduler
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+
 # ----------------------------
 # 6. Training Loop
 # ----------------------------
@@ -236,6 +240,10 @@ for epoch in range(epochs):
         loss = loss_arc + lamb * loss_con
         
         loss.backward()
+        
+        # FIX 2: Gradient Clipping to prevent explosion in ArcFace
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        
         optimizer.step()
 
         train_loss += loss.item()
@@ -269,3 +277,6 @@ for epoch in range(epochs):
           f"Train Loss: {train_loss/len(train_loader):.4f} "
           f"Train Acc: {train_correct/total_train:.4f} | "
           f"Test Acc: {test_correct/total_test:.4f}")
+
+    # Step the scheduler at the very end of the epoch
+    scheduler.step()
