@@ -242,9 +242,9 @@ for epoch in range(epochs):
         loss.backward()
         
         # FIX 2: Gradient Clipping to prevent explosion in ArcFace
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         
-        #optimizer.step()
+        optimizer.step()
 
         train_loss += loss.item()
         
