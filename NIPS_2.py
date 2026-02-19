@@ -187,7 +187,7 @@ optimizer = optim.AdamW(
 )
 
 # FIX 3: Add Cosine Annealing Learning Rate Scheduler
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+#scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
 # ----------------------------
 # 6. Training Loop
@@ -279,4 +279,4 @@ for epoch in range(epochs):
           f"Test Acc: {test_correct/total_test:.4f}")
 
     # Step the scheduler at the very end of the epoch
-    scheduler.step()
+    #scheduler.step()
