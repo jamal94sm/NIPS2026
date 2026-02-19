@@ -30,7 +30,7 @@ test_domains  = ["700"]
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ----------------------------
-# 1. Transforms (Separated)
+# 1. Transforms
 # ----------------------------
 # Transform 1: CLEAN (Original)
 # Used for ArcFace classification and as the 'Anchor' for SupCon
@@ -40,17 +40,40 @@ orig_transform = transforms.Compose([
     # transforms.Normalize(...) # Add if needed
 ])
 
-# Transform 2: AUGMENTED
-# Used only for the Contrastive 'Positive' view
+# Transform 2: AUGMENTED (Replaced with your custom SSL transform)
+class RandomCutout(object):
+    def __init__(self, n_holes=1, length=16):
+        self.n_holes = n_holes
+        self.length = length
+
+    def __call__(self, img):
+        h = img.size(1)
+        w = img.size(2)
+        mask = torch.ones((h, w), dtype=torch.float32)
+        for n in range(self.n_holes):
+            y = torch.randint(0, h, (1,)).item()
+            x = torch.randint(0, w, (1,)).item()
+            y1 = int(max(0, y - self.length // 2))
+            y2 = int(min(h, y + self.length // 2))
+            x1 = int(max(0, x - self.length // 2))
+            x2 = int(min(w, x + self.length // 2))
+            mask[y1: y2, x1: x2] = 0.
+        mask = mask.expand_as(img)
+        img = img * mask
+        return img
+
 aug_transform = transforms.Compose([
-    transforms.RandomResizedCrop(size=224, scale=(0.6, 1.0)),
+    transforms.RandomResizedCrop(224, scale=(0.8, 1.0), ratio=(0.9, 1.1)),
     transforms.RandomRotation(degrees=10),
-    transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
-    transforms.RandomGrayscale(p=0.2),
+    transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
+    transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0, hue=0),
+    transforms.RandomApply([transforms.RandomAdjustSharpness(sharpness_factor=2)], p=0.5),
     transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.2),
     transforms.ToTensor(),
-    # transforms.Normalize(...) # Add if needed
+    transforms.RandomApply([RandomCutout(n_holes=1, length=32)], p=0.5),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
+
 
 # ----------------------------
 # 2. Dataset Class (Updated)
