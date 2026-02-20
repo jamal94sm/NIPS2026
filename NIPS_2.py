@@ -25,7 +25,7 @@ lamb = 0.2       # Weight for Contrastive Loss
 
 # Choose domains by NAME
 train_domains = ["WHT", "460"]   
-test_domains  = ["700"]          
+test_domains  = ["630"]          
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
