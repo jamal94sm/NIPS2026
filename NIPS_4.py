@@ -233,7 +233,7 @@ for epoch in range(epochs):
 
         # Calculate GRL Alpha (Ramps from 0 to 1 over the course of training)
         p = float(batch_idx + epoch * len(train_loader)) / total_batches
-        alpha = 2. / (1. + np.exp(-10 * p)) - 1
+        alpha = 2. / (1. + np.exp(-25 * p)) - 1
 
         optimizer.zero_grad()
         
