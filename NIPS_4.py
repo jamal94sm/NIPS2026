@@ -24,7 +24,7 @@ epochs = 100
 lamb = 0.2       # Weight for Contrastive Loss
 
 # Choose domains by NAME
-train_domains = ["460", "630"]   
+train_domains = ["460", "630", "940"]   
 test_domains  = ["850"]          
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
