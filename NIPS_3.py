@@ -111,7 +111,7 @@ train_dataset = CASIA_MS_Dataset(data_path, train_domains, orig_transform, aug_t
 print("Creating Test Dataset...")
 test_dataset  = CASIA_MS_Dataset(data_path, test_domains, orig_transform, is_train=False)
 
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
 test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
 print(f"Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
