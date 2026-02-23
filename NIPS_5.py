@@ -27,8 +27,8 @@ aux_weight = 0.1     # Weight for MoE Load Balancing Loss
 freeze_base_mlp = True 
 
 # Choose domains by NAME
-train_domains = ["460", "WHT"]   
-test_domains  = ["700"]          
+train_domains = ["460", "WHT", "700"]   
+test_domains  = ["850"]          
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
