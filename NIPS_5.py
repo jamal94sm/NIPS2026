@@ -30,12 +30,12 @@ top_k = 2
 
 # NEW: Master Toggles for Ablation Studies
 use_moe_mlp = True          # Toggle MoE-LoRA inside Stage 3 MLPs
-use_moe_stage3_norm = True  # Toggle Parallel-MoE-Norm inside Stage 3 blocks
+use_moe_stage3_norm = False  # Toggle Parallel-MoE-Norm inside Stage 3 blocks
 use_moe_final_norm = False  # Toggle Parallel-MoE-Norm before the final head
 use_grl = True              # NEW: Toggle Gradient Reversal Layer (Adversarial Domain Loss)
 
 freeze_base_mlp = True          # Freezes the base ConvNeXt MLP (Applies whether MoE is on or off)
-freeze_base_stage3_norm = True  # Freezes the base ConvNeXt LayerNorms INSIDE Stage 3
+freeze_base_stage3_norm = False  # Freezes the base ConvNeXt LayerNorms INSIDE Stage 3
 freeze_base_final_norm = False  # Freezes the final base ConvNeXt LayerNorm BEFORE the head
 
 # Choose domains by NAME
