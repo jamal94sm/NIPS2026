@@ -21,15 +21,20 @@ lr = 1e-3
 weight_decay = 1e-4
 epochs = 100
 lamb = 0.2           # Weight for SupCon Loss
-aux_weight = 0.2     # Weight for MoE Load Balancing Loss
+aux_weight = 0.2     # Weight for MoE MLP Load Balancing Loss
+norm_weight = 0.2    # Weight for MoE LayerNorm Routing Loss
 
 ### Architectural Toggles
 num_experts = 3
 top_k = 2
 
-freeze_base_mlp = True 
-use_dsn_stage3_norm = True  # NEW: Toggle Domain-Specific Norm inside Stage 3 blocks
-use_dsn_final_norm = True   # NEW: Toggle Domain-Specific Norm before the final head
+# NEW: Master Toggles for Ablation Studies
+use_moe_mlp = True          # Toggle MoE-LoRA inside Stage 3 MLPs
+use_moe_stage3_norm = True  # Toggle Parallel-MoE-Norm inside Stage 3 blocks
+use_moe_final_norm = True   # Toggle Parallel-MoE-Norm before the final head
+
+freeze_base_mlp = True      # Freezes the base ConvNeXt MLP (Applies whether MoE is on or off)
+freeze_base_norm = True     # Freezes the base ConvNeXt LayerNorms
 
 # Choose domains by NAME
 train_domains = ["460", "WHT", "700"]   
@@ -116,43 +121,59 @@ class CASIA_MS_Dataset(Dataset):
         return img_orig, y_i, y_d
 
 # ----------------------------
-# 3. Custom Modules (DSLN & MoE)
+# 3. Custom Modules 
 # ----------------------------
 
-# --- Domain-Specific LayerNorm (DSLN) ---
-class DomainSpecificLayerNorm(nn.Module):
-    def __init__(self, normalized_shape, num_domains=3, eps=1e-6):
+# --- Parallel Mixture of LayerNorms ---
+class ParallelMoELayerNorm(nn.Module):
+    def __init__(self, orig_norm: nn.Module, normalized_shape, num_domains=3, eps=1e-6, freeze_base=True):
         super().__init__()
+        self.orig_norm = orig_norm
         self.num_domains = num_domains
+        self.freeze_base = freeze_base
+        
+        if self.freeze_base:
+            for p in self.orig_norm.parameters():
+                p.requires_grad = False
+        else:
+            for p in self.orig_norm.parameters():
+                p.requires_grad = True
+                
         self.norms = nn.ModuleList([
             nn.LayerNorm(normalized_shape, eps=eps) for _ in range(num_domains)
         ])
-        # This state will be updated externally right before model(x) is called
-        self.current_domain = None
+        
+        for norm in self.norms:
+            nn.init.zeros_(norm.weight) 
+            nn.init.zeros_(norm.bias)   
+            
+        self.router = nn.Linear(normalized_shape, num_domains)
+        self.router_logits = None 
 
     def forward(self, x):
-        # If no domain is provided (e.g., Unseen Test Data), average all experts
-        if self.current_domain is None:
-            out = 0
-            for norm in self.norms:
-                out += norm(x)
-            return out / self.num_domains
-            
-        # If domain is provided, route exactly using the label
-        out = torch.zeros_like(x)
+        orig_out = self.orig_norm(x)
+        
+        if x.dim() == 4:
+            x_pooled = x.mean(dim=(1, 2)) 
+        else:
+            x_pooled = x                  
+
+        self.router_logits = self.router(x_pooled) 
+        weights = F.softmax(self.router_logits, dim=-1) 
+
+        moe_out = 0
         for i in range(self.num_domains):
-            idx = torch.where(self.current_domain == i)[0]
-            if len(idx) > 0:
-                out[idx] = self.norms[i](x[idx])
-        return out
+            w_i = weights[:, i]
+            if x.dim() == 4:
+                w_i = w_i.view(-1, 1, 1, 1) 
+            else:
+                w_i = w_i.view(-1, 1)       
+                
+            moe_out += w_i * self.norms[i](x)
 
-def set_dsn_domain(model, domain_labels):
-    """Helper function to cleanly pass the domain labels down to all DSLN layers"""
-    for module in model.modules():
-        if isinstance(module, DomainSpecificLayerNorm):
-            module.current_domain = domain_labels
+        return orig_out + moe_out
 
-# --- Vectorized MoE LoRA ---
+# --- Vectorized MoE LoRA for MLPs ---
 class VectorizedLoRAExperts(nn.Module):
     def __init__(self, dim: int, num_experts: int, r: int = 8, alpha: int = 8):
         super().__init__()
@@ -187,7 +208,6 @@ class ConvNeXtParallelMoELoRA(nn.Module):
         self.experts = VectorizedLoRAExperts(dim, num_experts, r, alpha)
         
         self.aux_loss = 0.0
-        self.entropy_loss = 0.0  
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_out = self.orig_mlp(x)
@@ -197,8 +217,6 @@ class ConvNeXtParallelMoELoRA(nn.Module):
         
         gate_logits = self.router(x_flat)
         gate_probs = F.softmax(gate_logits, dim=-1)
-        
-        self.entropy_loss = -(gate_probs * torch.log(gate_probs + 1e-6)).sum(dim=-1).mean()
         
         topk_probs, topk_indices = torch.topk(gate_probs, self.top_k, dim=-1)
         topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-6)
@@ -240,7 +258,7 @@ test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, nu
 print(f"Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
 
 # ----------------------------
-# 5. Model Setup (MoE, DSN, GRL)
+# 5. Model Setup 
 # ----------------------------
 print("Loading ConvNeXt V2-Tiny...")
 model = timm.create_model('convnextv2_tiny', pretrained=True, num_classes=0).to(device)
@@ -252,36 +270,57 @@ for p in model.parameters(): p.requires_grad = False
 # B. Unfreeze Stage 3 Spatial Convolutions
 for p in model.stages[3].parameters(): p.requires_grad = True
 
-# C. Inject MoE-LoRA and/or DSLN into Stage 3
+# C. Inject Adapters into Stage 3
 stage_3_dim = 768
 
 for block in model.stages[3].blocks:
-    # 1. MLP Replacement
-    block.mlp = ConvNeXtParallelMoELoRA(
-        orig_mlp=block.mlp,
-        dim=stage_3_dim,
-        num_experts=num_experts,
-        top_k=top_k,
-        r=8,
-        alpha=8,
-        freeze_base=freeze_base_mlp   
-    ).to(device)
+    # 1. MLP Replacement or Fallback Freezing
+    if use_moe_mlp:
+        block.mlp = ConvNeXtParallelMoELoRA(
+            orig_mlp=block.mlp,
+            dim=stage_3_dim,
+            num_experts=num_experts,
+            top_k=top_k,
+            r=8,
+            alpha=8,
+            freeze_base=freeze_base_mlp   
+        ).to(device)
+    else:
+        # If MoE is off, explicitly set trainability of the base MLP
+        for p in block.mlp.parameters():
+            p.requires_grad = not freeze_base_mlp
     
-    # 2. LayerNorm Replacement (If toggled)
-    if use_dsn_stage3_norm and hasattr(block, 'norm'):
+    # 2. LayerNorm Wrapping (Parallel)
+    if use_moe_stage3_norm and hasattr(block, 'norm'):
         orig_shape = getattr(block.norm, 'normalized_shape', stage_3_dim)
         eps = getattr(block.norm, 'eps', 1e-6)
-        block.norm = DomainSpecificLayerNorm(orig_shape, num_domains=num_experts, eps=eps).to(device)
+        block.norm = ParallelMoELayerNorm(
+            orig_norm=block.norm, 
+            normalized_shape=orig_shape, 
+            num_domains=num_experts, 
+            eps=eps, 
+            freeze_base=freeze_base_norm
+        ).to(device)
+    elif hasattr(block, 'norm'):
+        # If MoE Norm is off, explicitly set trainability of the base norm
+        for p in block.norm.parameters():
+            p.requires_grad = not freeze_base_norm
 
-# D. Final Norm Replacement or Unfreezing
+# D. Final Norm Wrapping
 if hasattr(model, 'norm'):
-    if use_dsn_final_norm:
+    if use_moe_final_norm:
         orig_shape = getattr(model.norm, 'normalized_shape', embedding_dim)
         eps = getattr(model.norm, 'eps', 1e-6)
-        model.norm = DomainSpecificLayerNorm(orig_shape, num_domains=num_experts, eps=eps).to(device)
+        model.norm = ParallelMoELayerNorm(
+            orig_norm=model.norm, 
+            normalized_shape=orig_shape, 
+            num_domains=num_experts, 
+            eps=eps, 
+            freeze_base=freeze_base_norm
+        ).to(device)
     else:
-        # Standard unfreezing if DSN is toggled off
-        for p in model.norm.parameters(): p.requires_grad = True
+        for p in model.norm.parameters(): 
+            p.requires_grad = not freeze_base_norm
 
 # Projection Head & GRL Classes
 class ProjectionHead(nn.Module):
@@ -362,9 +401,6 @@ for epoch in range(epochs):
         # 1. Forward Pass
         images_all = torch.cat([img_orig, img_aug], dim=0)
         y_d_all = torch.cat([y_d, y_d], dim=0)
-        
-        # NEW: Inject the explicit domain labels into all DSLN layers before forwarding
-        set_dsn_domain(model, y_d_all)
 
         embeddings_all = model(images_all)
         projections_all = proj_head(embeddings_all)
@@ -375,20 +411,33 @@ for epoch in range(epochs):
         # 2. Domain Classifier Forward
         domain_logits = domain_classifier(embeddings_all, alpha_grl)
 
-        # 3. Calculate Losses
+        # 3. Calculate Core Losses
         loss_arc = criterion_arc(emb_orig, y_i)
         
         labels_all = torch.cat([y_i, y_i], dim=0)
         loss_con = criterion_supcon(projections_all, labels_all)
-        
         loss_domain = criterion_domain(domain_logits, y_d_all)
         
-        # Aggregate MoE Load Balancing Loss
+        # 4. Aggregate Auxiliary Losses (MoE-MLP Load Balancing)
         aux_loss_total = 0.0
-        for block in model.stages[3].blocks:
-            aux_loss_total += block.mlp.aux_loss
+        if use_moe_mlp:
+            for block in model.stages[3].blocks:
+                aux_loss_total += block.mlp.aux_loss
+            
+        # 5. Extract and Supervise Parallel MoE-Norm Routers
+        norm_routing_loss = 0.0
+        norm_count = 0
+        for module in model.modules():
+            if isinstance(module, ParallelMoELayerNorm) and module.router_logits is not None:
+                norm_routing_loss += F.cross_entropy(module.router_logits, y_d_all)
+                norm_count += 1
+                
+        if norm_count > 0:
+            norm_routing_loss = norm_routing_loss / norm_count
         
-        loss = loss_arc + (lamb * loss_con) + loss_domain + (aux_weight * aux_loss_total)
+        # Total Loss Equation 
+        loss = loss_arc + (lamb * loss_con) + loss_domain + \
+               (aux_weight * aux_loss_total) + (norm_weight * norm_routing_loss)
         
         loss.backward()
         optimizer.step()
@@ -409,9 +458,6 @@ for epoch in range(epochs):
         for img_orig, y_i, y_d in tqdm(test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test] "):
             img_orig, y_i = img_orig.to(device), y_i.to(device)
             
-            # NEW: Set DSLN to None so it averages experts for unseen 850nm test data
-            set_dsn_domain(model, None)
-
             embeddings = model(img_orig)
             
             loss = criterion_arc(embeddings, y_i)
