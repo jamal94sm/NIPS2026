@@ -21,7 +21,7 @@ lr = 1e-3
 weight_decay = 1e-4
 epochs = 100
 lamb = 0.2           # Weight for SupCon Loss
-aux_weight = 0.5     # Weight for MoE Load Balancing Loss
+aux_weight = 0.2     # Weight for MoE Load Balancing Loss
 
 ### MoE
 #num_experts = len(train_dataset.domain_map) 
