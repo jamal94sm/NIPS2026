@@ -30,11 +30,11 @@ top_k = 2
 
 # NEW: Master Toggles for Ablation Studies
 use_moe_mlp = True          # Toggle MoE-LoRA inside Stage 3 MLPs
-use_moe_stage3_norm = True  # Toggle Parallel-MoE-Norm inside Stage 3 blocks
+use_moe_stage3_norm = False  # Toggle Parallel-MoE-Norm inside Stage 3 blocks
 use_moe_final_norm = True   # Toggle Parallel-MoE-Norm before the final head
 
 freeze_base_mlp = True      # Freezes the base ConvNeXt MLP (Applies whether MoE is on or off)
-freeze_base_norm = False     # Freezes the base ConvNeXt LayerNorms
+freeze_base_norm = True     # Freezes the base ConvNeXt LayerNorms
 
 # Choose domains by NAME
 train_domains = ["460", "WHT", "700"]   
