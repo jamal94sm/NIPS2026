@@ -29,15 +29,15 @@ num_experts = 3
 top_k = 2
 
 # MASTER TOGGLES
-use_moe_mlp = True          
-use_moe_stage3_norm = False  
-use_moe_final_norm = False  
+use_moe_mlp = False          
+use_moe_stage3_norm = True  
+use_moe_final_norm = True  
 
 use_grl = True              
 
-freeze_base_mlp = True          
-freeze_base_stage3_norm = False 
-freeze_base_final_norm = False  
+freeze_base_mlp = False          
+freeze_base_stage3_norm = True 
+freeze_base_final_norm = True  
 
 # Choose domains by NAME
 train_domains = ["460", "WHT", "700"]   
@@ -407,7 +407,8 @@ for epoch in range(epochs):
 print("\nCreating Clean Model Snapshot for Evaluation...")
 clean_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
-def freeze_all_unfreeze_routers(target_model):
+# NEW HELPER: Dynamically unfreezes params based on TTA Strategy
+def get_tta_params(target_model, unfreeze_experts=False):
     for p in target_model.parameters(): p.requires_grad = False
     for p in proj_head.parameters(): p.requires_grad = False
     if use_grl:
@@ -415,15 +416,24 @@ def freeze_all_unfreeze_routers(target_model):
     for p in criterion_arc.parameters(): p.requires_grad = False
 
     tta_params = []
+    
     if use_moe_mlp:
         for block in target_model.stages[3].blocks:
             for p in block.mlp.router.parameters(): p.requires_grad = True
             tta_params.extend(list(block.mlp.router.parameters()))
+            # NEW: Allow MLP experts to adapt if requested
+            if unfreeze_experts:
+                for p in block.mlp.experts.parameters(): p.requires_grad = True
+                tta_params.extend(list(block.mlp.experts.parameters()))
             
     for module in target_model.modules():
         if isinstance(module, ParallelMoELayerNorm):
             for p in module.router.parameters(): p.requires_grad = True
             tta_params.extend(list(module.router.parameters()))
+            # NEW: Allow Norm experts to adapt if requested
+            if unfreeze_experts:
+                for p in module.norms.parameters(): p.requires_grad = True
+                tta_params.extend(list(module.norms.parameters()))
             
     return tta_params
 
@@ -432,10 +442,12 @@ def freeze_all_unfreeze_routers(target_model):
 # ==========================================
 if run_continuous_tta:
     print("\n" + "="*50)
-    print("🚀 APPROACH A: Continuous TTA (Tent)")
+    print("🚀 APPROACH A: Continuous TTA (Tent - Routers Only)")
     print("="*50)
     model.load_state_dict({k: v.to(device) for k, v in clean_state_dict.items()})
-    tta_params = freeze_all_unfreeze_routers(model)
+    
+    # Continuous TTA is kept strictly to Routers to prevent catastrophic forgetting
+    tta_params = get_tta_params(model, unfreeze_experts=False)
     tta_optimizer = optim.Adam(tta_params, lr=tta_lr)
 
     model.eval(); criterion_arc.eval()
@@ -461,14 +473,14 @@ if run_continuous_tta:
             tta_test_correct += (preds == y_i).sum().item()
             total_tta_test += y_i.size(0)
 
-    print(f"\n Continuous TTA Acc: {tta_test_correct / total_tta_test:.4f}")
+    print(f"\n✅ Continuous TTA Acc: {tta_test_correct / total_tta_test:.4f}")
 
 # ==========================================
 # APPROACH B: Episodic TTA (Batch Reset)
 # ==========================================
 if run_episodic_tta:
     print("\n" + "="*50)
-    print(" APPROACH B: Episodic TTA (Batch Reset)")
+    print("🚀 APPROACH B: Episodic TTA (Routers + Experts via Identity Entropy)")
     print("="*50)
     episodic_test_correct = 0; total_episodic_test = 0
     
@@ -476,20 +488,30 @@ if run_episodic_tta:
         img_orig, y_i = img_orig.to(device), y_i.to(device)
 
         model.load_state_dict({k: v.to(device) for k, v in clean_state_dict.items()})
-        tta_params = freeze_all_unfreeze_routers(model)
+        
+        # UPDATED: We unfreeze BOTH the routers and the LoRA/Norm experts here
+        tta_params = get_tta_params(model, unfreeze_experts=True)
         tta_optimizer = optim.Adam(tta_params, lr=tta_lr)
         
         model.eval() 
         for _ in range(episodic_steps):
             tta_optimizer.zero_grad()
             embeddings = model(img_orig)
-            entropy_loss_total = 0.0
+            
+            # 1. Identity Entropy (This pulls gradients through the Experts)
+            logits = criterion_arc.get_logits(embeddings)
+            probs = F.softmax(logits, dim=1)
+            identity_entropy = -torch.sum(probs * torch.log(probs + 1e-6), dim=1).mean()
+            
+            # 2. Router Entropy (This keeps the Routers stable during updates)
+            router_entropy = 0.0
             if use_moe_mlp:
-                for block in model.stages[3].blocks: entropy_loss_total += block.mlp.entropy_loss
+                for block in model.stages[3].blocks: router_entropy += block.mlp.entropy_loss
                     
-            if isinstance(entropy_loss_total, torch.Tensor):
-                entropy_loss_total.backward()
-                tta_optimizer.step()
+            # 3. Combine losses so both sub-systems update cooperatively
+            total_batch_loss = identity_entropy + router_entropy
+            total_batch_loss.backward()
+            tta_optimizer.step()
                 
         with torch.no_grad():
             final_batch_embeddings = model(img_orig)
@@ -497,14 +519,14 @@ if run_episodic_tta:
             episodic_test_correct += (preds == y_i).sum().item()
             total_episodic_test += y_i.size(0)
 
-    print(f"\n Episodic TTA Acc: {episodic_test_correct / total_episodic_test:.4f}")
+    print(f"\n✅ Episodic TTA Acc: {episodic_test_correct / total_episodic_test:.4f}")
 
 # ==========================================
 # APPROACH C: Test-Time Augmentation (TTAug)
 # ==========================================
 if run_ttaug:
     print("\n" + "="*50)
-    print(f" APPROACH C: Test-Time Augmentation (Size: {ttaug_size} Augs)")
+    print(f"🚀 APPROACH C: Test-Time Augmentation (Size: {ttaug_size} Augs)")
     print("="*50)
     
     # Restore clean state (No weights will be updated here)
@@ -545,15 +567,13 @@ if run_ttaug:
             # ----------------------------------------------------
             # Strategy 2: Majority Vote (Decision Smoothing)
             # ----------------------------------------------------
-            # Get logits for all views across the batch
             logits_all = criterion_arc.get_logits(all_embeddings.view(-1, D))
             preds_all = logits_all.argmax(dim=1).view(B, total_views)
             
-            # Compute statistical mode (majority) along the view dimension
             preds_vote, _ = torch.mode(preds_all, dim=1)
             vote_correct += (preds_vote == y_i).sum().item()
 
             total_ttaug_test += B
 
-    print(f"\n TTAug (Embedding Avg) Acc: {embed_correct / total_ttaug_test:.4f}")
-    print(f" TTAug (Majority Vote) Acc: {vote_correct / total_ttaug_test:.4f}")
+    print(f"\n✅ TTAug (Embedding Avg) Acc: {embed_correct / total_ttaug_test:.4f}")
+    print(f"✅ TTAug (Majority Vote) Acc: {vote_correct / total_ttaug_test:.4f}")
