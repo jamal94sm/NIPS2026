@@ -142,7 +142,6 @@ class ConvNeXtParallelMoELoRA(nn.Module):
         self.top_k = top_k
         self.freeze_base = freeze_base
         
-        # Conditionally freeze or unfreeze the pre-trained foundation MLP
         if self.freeze_base:
             for p in self.orig_mlp.parameters():
                 p.requires_grad = False
@@ -154,6 +153,7 @@ class ConvNeXtParallelMoELoRA(nn.Module):
         self.experts = VectorizedLoRAExperts(dim, num_experts, r, alpha)
         
         self.aux_loss = 0.0
+        self.entropy_loss = 0.0  # NEW: Tracks router confusion for TTA
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_out = self.orig_mlp(x)
@@ -164,10 +164,12 @@ class ConvNeXtParallelMoELoRA(nn.Module):
         gate_logits = self.router(x_flat)
         gate_probs = F.softmax(gate_logits, dim=-1)
         
+        # NEW: Calculate Shannon Entropy of the routing probabilities
+        self.entropy_loss = -(gate_probs * torch.log(gate_probs + 1e-6)).sum(dim=-1).mean()
+        
         topk_probs, topk_indices = torch.topk(gate_probs, self.top_k, dim=-1)
         topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-6)
         
-        # Calculate Load Balancing Loss
         fraction_routed = torch.zeros_like(gate_probs).scatter_(1, topk_indices, 1.0).mean(dim=0)
         mean_probs = gate_probs.mean(dim=0)
         self.aux_loss = self.num_experts * torch.sum(fraction_routed * mean_probs)
