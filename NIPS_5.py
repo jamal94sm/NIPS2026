@@ -30,12 +30,13 @@ top_k = 2
 
 # NEW: Master Toggles for Ablation Studies
 use_moe_mlp = True          # Toggle MoE-LoRA inside Stage 3 MLPs
-use_moe_stage3_norm = False  # Toggle Parallel-MoE-Norm inside Stage 3 blocks
-use_moe_final_norm = False   # Toggle Parallel-MoE-Norm before the final head
+use_moe_stage3_norm = True  # Toggle Parallel-MoE-Norm inside Stage 3 blocks
+use_moe_final_norm = False  # Toggle Parallel-MoE-Norm before the final head
+use_grl = True              # NEW: Toggle Gradient Reversal Layer (Adversarial Domain Loss)
 
-freeze_base_mlp = True         # Freezes the base ConvNeXt MLP (Applies whether MoE is on or off)
-freeze_base_stage3_norm = False  # Freezes the base ConvNeXt LayerNorms INSIDE Stage 3
-freeze_base_final_norm = False   # Freezes the final base ConvNeXt LayerNorm BEFORE the head
+freeze_base_mlp = True          # Freezes the base ConvNeXt MLP (Applies whether MoE is on or off)
+freeze_base_stage3_norm = True  # Freezes the base ConvNeXt LayerNorms INSIDE Stage 3
+freeze_base_final_norm = False  # Freezes the final base ConvNeXt LayerNorm BEFORE the head
 
 # Choose domains by NAME
 train_domains = ["460", "WHT", "700"]   
@@ -290,7 +291,6 @@ for block in model.stages[3].blocks:
             freeze_base=freeze_base_mlp   
         ).to(device)
     else:
-        # If MoE is off, explicitly set trainability of the base MLP
         for p in block.mlp.parameters():
             p.requires_grad = not freeze_base_mlp
     
@@ -306,7 +306,6 @@ for block in model.stages[3].blocks:
             freeze_base=freeze_base_stage3_norm
         ).to(device)
     elif hasattr(block, 'norm'):
-        # If MoE Norm is off, explicitly set trainability of the base norm
         for p in block.norm.parameters():
             p.requires_grad = not freeze_base_stage3_norm
 
@@ -326,7 +325,7 @@ if hasattr(model, 'norm'):
         for p in model.norm.parameters(): 
             p.requires_grad = not freeze_base_final_norm
 
-# Projection Head 
+# Projection Head & GRL Classes
 class ProjectionHead(nn.Module):
     def __init__(self, dim_in, dim_out=128):
         super().__init__()
@@ -338,7 +337,38 @@ class ProjectionHead(nn.Module):
     def forward(self, x):
         return F.normalize(self.head(x), dim=1)
 
+class GradientReversal(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.alpha, None
+
+class DomainClassifier(nn.Module):
+    def __init__(self, dim_in, num_domains):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim_in, dim_in // 2),
+            nn.BatchNorm1d(dim_in // 2),
+            nn.ReLU(True),
+            nn.Linear(dim_in // 2, num_domains)
+        )
+    def forward(self, x, alpha):
+        x_rev = GradientReversal.apply(x, alpha)
+        return self.net(x_rev)
+
 proj_head = ProjectionHead(embedding_dim).to(device)
+
+# Initialize GRL Domain Classifier Conditionally
+if use_grl:
+    domain_classifier = DomainClassifier(embedding_dim, num_experts).to(device)
+    criterion_domain = nn.CrossEntropyLoss().to(device)
+else:
+    domain_classifier = None
+    criterion_domain = None
 
 # ----------------------------
 # 6. Losses & Optimizer
@@ -348,8 +378,10 @@ num_classes = len(train_dataset.hand_id_map)
 criterion_arc = losses.ArcFaceLoss(num_classes=num_classes, embedding_size=embedding_dim, margin=margin, scale=scale).to(device)
 criterion_supcon = losses.SupConLoss(temperature=0.1).to(device)
 
-# Notice we've completely removed the domain_classifier from all_params
+# Dynamically build the parameter list based on toggles
 all_params = list(model.parameters()) + list(criterion_arc.parameters()) + list(proj_head.parameters())
+if use_grl:
+    all_params += list(domain_classifier.parameters())
 
 optimizer = optim.AdamW(all_params, lr=lr, weight_decay=weight_decay)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
@@ -362,6 +394,8 @@ total_batches = len(train_loader) * epochs
 for epoch in range(epochs):
     # -------- Training --------
     model.train(); proj_head.train(); criterion_arc.train()
+    if use_grl:
+        domain_classifier.train()
     
     train_loss = 0.0
     train_correct = 0
@@ -383,19 +417,27 @@ for epoch in range(epochs):
         batch_size_curr = img_orig.size(0)
         emb_orig = embeddings_all[:batch_size_curr]
 
-        # 2. Calculate Core Losses (ArcFace + SupCon)
+        # 2. Core Identity/Contrastive Losses
         loss_arc = criterion_arc(emb_orig, y_i)
         
         labels_all = torch.cat([y_i, y_i], dim=0)
         loss_con = criterion_supcon(projections_all, labels_all)
         
-        # 3. Aggregate Auxiliary Losses (MoE-MLP Load Balancing)
+        # 3. Conditional GRL / Domain Loss
+        loss_domain = 0.0
+        if use_grl:
+            p = float(batch_idx + epoch * len(train_loader)) / total_batches
+            alpha_grl = 2. / (1. + np.exp(-25 * p)) - 1
+            domain_logits = domain_classifier(embeddings_all, alpha_grl)
+            loss_domain = criterion_domain(domain_logits, y_d_all)
+        
+        # 4. Aggregate Auxiliary Losses (MoE-MLP Load Balancing)
         aux_loss_total = 0.0
         if use_moe_mlp:
             for block in model.stages[3].blocks:
                 aux_loss_total += block.mlp.aux_loss
             
-        # 4. Extract and Supervise Parallel MoE-Norm Routers
+        # 5. Extract and Supervise Parallel MoE-Norm Routers
         norm_routing_loss = 0.0
         norm_count = 0
         for module in model.modules():
@@ -406,8 +448,8 @@ for epoch in range(epochs):
         if norm_count > 0:
             norm_routing_loss = norm_routing_loss / norm_count
         
-        # Total Loss Equation (No GRL/Domain Classifier loss here anymore)
-        loss = loss_arc + (lamb * loss_con) + \
+        # Total Loss Equation 
+        loss = loss_arc + (lamb * loss_con) + loss_domain + \
                (aux_weight * aux_loss_total) + (norm_weight * norm_routing_loss)
         
         loss.backward()
