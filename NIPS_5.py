@@ -123,7 +123,6 @@ class CASIA_MS_Dataset(Dataset):
 # ----------------------------
 # 3. Custom Modules 
 # ----------------------------
-
 # --- Parallel Mixture of LayerNorms ---
 class ParallelMoELayerNorm(nn.Module):
     def __init__(self, orig_norm: nn.Module, normalized_shape, num_domains=3, eps=1e-6, freeze_base=True):
@@ -147,7 +146,10 @@ class ParallelMoELayerNorm(nn.Module):
             nn.init.zeros_(norm.weight) 
             nn.init.zeros_(norm.bias)   
             
-        self.router = nn.Linear(normalized_shape, num_domains)
+        # FIX: Safely extract the integer if normalized_shape is a tuple
+        router_dim = normalized_shape[0] if isinstance(normalized_shape, (tuple, list)) else normalized_shape
+        
+        self.router = nn.Linear(router_dim, num_domains)
         self.router_logits = None 
 
     def forward(self, x):
@@ -172,6 +174,7 @@ class ParallelMoELayerNorm(nn.Module):
             moe_out += w_i * self.norms[i](x)
 
         return orig_out + moe_out
+        
 
 # --- Vectorized MoE LoRA for MLPs ---
 class VectorizedLoRAExperts(nn.Module):
