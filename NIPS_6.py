@@ -21,28 +21,41 @@ lr = 1e-3
 weight_decay = 1e-4
 epochs = 100
 lamb = 0.2           # Weight for SupCon Loss
-aux_weight = 0.2     # Weight for MoE Load Balancing Loss
+aux_weight = 0.2     # Weight for MoE MLP Load Balancing Loss
+norm_weight = 0.2    # Weight for MoE LayerNorm Routing Loss
 
-### MoE
-#num_experts = len(train_dataset.domain_map) 
+### Architectural Toggles
 num_experts = 3
 top_k = 2
 
-# NEW: Toggle to freeze (True) or fine-tune (False) the base expansion layer
-freeze_base_mlp = True 
+# MASTER TOGGLES
+use_moe_mlp = True          
+use_moe_stage3_norm = False  
+use_moe_final_norm = False  
+
+use_grl = True              
+
+freeze_base_mlp = True          
+freeze_base_stage3_norm = False 
+freeze_base_final_norm = False  
 
 # Choose domains by NAME
 train_domains = ["460", "WHT", "700"]   
-test_domains  = ["850"]   
+test_domains  = ["850"]          
 
-### TTA
-if_tta = True
-tta_lr = 1e-4  # Keep this low to prevent destroying the router
+### Test-Time Strategies Configuration
+run_continuous_tta = True
+run_episodic_tta = True
+run_ttaug = True
+
+tta_lr = 1e-4  
+episodic_steps = 15 # Number of optimization steps per batch for Episodic TTA
+ttaug_size = 4      # Number of augmented views to generate per test sample
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ----------------------------
-# 1. Transforms (Separated)
+# 1. Transforms
 # ----------------------------
 orig_transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -57,6 +70,13 @@ aug_transform = transforms.Compose([
     transforms.RandomApply([transforms.RandomAdjustSharpness(sharpness_factor=2.0)], p=0.2),
     transforms.RandomApply([transforms.RandomAutocontrast()], p=0.2),
     transforms.ToTensor(),
+])
+
+# GPU-Accelerated Test-Time Augmentation Pipeline (Tensor Safe)
+ttaug_pipeline = transforms.Compose([
+    transforms.RandomAffine(degrees=5, translate=(0.02, 0.02)),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.5),
 ])
 
 # ----------------------------
@@ -77,17 +97,12 @@ class CASIA_MS_Dataset(Dataset):
         for root, _, files in os.walk(data_path):
             files.sort()
             for fname in files:
-                if not fname.lower().endswith(".jpg"):
-                    continue
-
+                if not fname.lower().endswith(".jpg"): continue
                 parts = fname[:-4].split("_")
-                if len(parts) != 4:
-                    continue
-
+                if len(parts) != 4: continue
                 subject_id, hand, spectrum, iteration = parts
                 
-                if spectrum not in target_domains:
-                    continue
+                if spectrum not in target_domains: continue
 
                 hand_id = f"{subject_id}_{hand}"
 
@@ -104,7 +119,6 @@ class CASIA_MS_Dataset(Dataset):
 
     def __getitem__(self, idx):
         img_path, y_i, y_d = self.samples[idx]
-        
         img = Image.open(img_path).convert("RGB")
         
         if self.orig_transform:
@@ -120,14 +134,47 @@ class CASIA_MS_Dataset(Dataset):
         return img_orig, y_i, y_d
 
 # ----------------------------
-# 3. MoE-LoRA Classes 
+# 3. Custom Modules 
 # ----------------------------
+class ParallelMoELayerNorm(nn.Module):
+    def __init__(self, orig_norm: nn.Module, normalized_shape, num_domains=3, eps=1e-6, freeze_base=True):
+        super().__init__()
+        self.orig_norm = orig_norm
+        self.num_domains = num_domains
+        self.freeze_base = freeze_base
+        
+        if self.freeze_base:
+            for p in self.orig_norm.parameters(): p.requires_grad = False
+        else:
+            for p in self.orig_norm.parameters(): p.requires_grad = True
+                
+        self.norms = nn.ModuleList([nn.LayerNorm(normalized_shape, eps=eps) for _ in range(num_domains)])
+        for norm in self.norms:
+            nn.init.zeros_(norm.weight) 
+            nn.init.zeros_(norm.bias)   
+            
+        router_dim = normalized_shape[0] if isinstance(normalized_shape, (tuple, list)) else normalized_shape
+        self.router = nn.Linear(router_dim, num_domains)
+        self.router_logits = None 
+
+    def forward(self, x):
+        orig_out = self.orig_norm(x)
+        x_pooled = x.mean(dim=(1, 2)) if x.dim() == 4 else x
+        self.router_logits = self.router(x_pooled.detach()) 
+        weights = F.softmax(self.router_logits, dim=-1) 
+
+        moe_out = 0
+        for i in range(self.num_domains):
+            w_i = weights[:, i]
+            w_i = w_i.view(-1, 1, 1, 1) if x.dim() == 4 else w_i.view(-1, 1)
+            moe_out += w_i * self.norms[i](x)
+
+        return orig_out + moe_out
+        
 class VectorizedLoRAExperts(nn.Module):
     def __init__(self, dim: int, num_experts: int, r: int = 8, alpha: int = 8):
         super().__init__()
         self.scaling = alpha / r
-        
-        # [num_experts, in_features, out_features]
         self.w_down = nn.Parameter(torch.randn(num_experts, dim, r) * (1 / dim**0.5))
         self.w_up = nn.Parameter(torch.zeros(num_experts, r, dim))
         self.act = nn.GELU()
@@ -147,28 +194,23 @@ class ConvNeXtParallelMoELoRA(nn.Module):
         self.freeze_base = freeze_base
         
         if self.freeze_base:
-            for p in self.orig_mlp.parameters():
-                p.requires_grad = False
+            for p in self.orig_mlp.parameters(): p.requires_grad = False
         else:
-            for p in self.orig_mlp.parameters():
-                p.requires_grad = True
+            for p in self.orig_mlp.parameters(): p.requires_grad = True
                 
         self.router = nn.Linear(dim, num_experts)
         self.experts = VectorizedLoRAExperts(dim, num_experts, r, alpha)
-        
         self.aux_loss = 0.0
-        self.entropy_loss = 0.0  # NEW: Tracks router confusion for TTA
+        self.entropy_loss = 0.0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_out = self.orig_mlp(x)
-        
         orig_shape = x.shape
         x_flat = x.view(-1, orig_shape[-1]) 
         
-        gate_logits = self.router(x_flat)
+        gate_logits = self.router(x_flat.detach())
         gate_probs = F.softmax(gate_logits, dim=-1)
         
-        # NEW: Calculate Shannon Entropy of the routing probabilities
         self.entropy_loss = -(gate_probs * torch.log(gate_probs + 1e-6)).sum(dim=-1).mean()
         
         topk_probs, topk_indices = torch.topk(gate_probs, self.top_k, dim=-1)
@@ -179,15 +221,11 @@ class ConvNeXtParallelMoELoRA(nn.Module):
         self.aux_loss = self.num_experts * torch.sum(fraction_routed * mean_probs)
         
         moe_out = torch.zeros_like(x_flat)
-        
         for i in range(self.num_experts):
             token_indices, k_indices = torch.where(topk_indices == i)
-            if len(token_indices) == 0:
-                continue
-                
+            if len(token_indices) == 0: continue
             tokens = x_flat[token_indices]
             expert_output = self.experts(tokens, i)
-            
             weights = topk_probs[token_indices, k_indices].unsqueeze(-1)
             moe_out[token_indices] += expert_output * weights
             
@@ -211,55 +249,48 @@ test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, nu
 print(f"Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
 
 # ----------------------------
-# 5. Model Setup (MoE + GRL)
+# 5. Model Setup 
 # ----------------------------
 print("Loading ConvNeXt V2-Tiny...")
 model = timm.create_model('convnextv2_tiny', pretrained=True, num_classes=0).to(device)
 embedding_dim = model.num_features 
 
-# A. Freeze ALL parameters first
 for p in model.parameters(): p.requires_grad = False
-
-# B. Unfreeze Stage 3 (Lets the 7x7 spatial convolutions fine-tune)
 for p in model.stages[3].parameters(): p.requires_grad = True
 
-# C. Inject MoE-LoRA into Stage 3 MLPs
 stage_3_dim = 768
-#num_experts = len(train_dataset.domain_map) 
-
 for block in model.stages[3].blocks:
-    block.mlp = ConvNeXtParallelMoELoRA(
-        orig_mlp=block.mlp,
-        dim=stage_3_dim,
-        num_experts=num_experts,
-        top_k=top_k,
-        r=8,
-        alpha=8,
-        freeze_base=freeze_base_mlp   # NEW: Passing the toggle here
-    ).to(device)
+    if use_moe_mlp:
+        block.mlp = ConvNeXtParallelMoELoRA(orig_mlp=block.mlp, dim=stage_3_dim, num_experts=num_experts, top_k=top_k, r=8, alpha=8, freeze_base=freeze_base_mlp).to(device)
+    else:
+        for p in block.mlp.parameters(): p.requires_grad = not freeze_base_mlp
+    
+    if use_moe_stage3_norm and hasattr(block, 'norm'):
+        orig_shape = getattr(block.norm, 'normalized_shape', stage_3_dim)
+        eps = getattr(block.norm, 'eps', 1e-6)
+        block.norm = ParallelMoELayerNorm(orig_norm=block.norm, normalized_shape=orig_shape, num_domains=num_experts, eps=eps, freeze_base=freeze_base_stage3_norm).to(device)
+    elif hasattr(block, 'norm'):
+        for p in block.norm.parameters(): p.requires_grad = not freeze_base_stage3_norm
 
-# D. Unfreeze Final Norm
 if hasattr(model, 'norm'):
-     for p in model.norm.parameters(): p.requires_grad = True
+    if use_moe_final_norm:
+        orig_shape = getattr(model.norm, 'normalized_shape', embedding_dim)
+        eps = getattr(model.norm, 'eps', 1e-6)
+        model.norm = ParallelMoELayerNorm(orig_norm=model.norm, normalized_shape=orig_shape, num_domains=num_experts, eps=eps, freeze_base=freeze_base_final_norm).to(device)
+    else:
+        for p in model.norm.parameters(): p.requires_grad = not freeze_base_final_norm
 
-# Projection Head & GRL Classes
 class ProjectionHead(nn.Module):
     def __init__(self, dim_in, dim_out=128):
         super().__init__()
-        self.head = nn.Sequential(
-            nn.Linear(dim_in, dim_in),
-            nn.ReLU(inplace=True),
-            nn.Linear(dim_in, dim_out)
-        )
-    def forward(self, x):
-        return F.normalize(self.head(x), dim=1)
+        self.head = nn.Sequential(nn.Linear(dim_in, dim_in), nn.ReLU(inplace=True), nn.Linear(dim_in, dim_out))
+    def forward(self, x): return F.normalize(self.head(x), dim=1)
 
 class GradientReversal(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, alpha):
         ctx.alpha = alpha
         return x.view_as(x)
-
     @staticmethod
     def backward(ctx, grad_output):
         return grad_output.neg() * ctx.alpha, None
@@ -267,34 +298,30 @@ class GradientReversal(torch.autograd.Function):
 class DomainClassifier(nn.Module):
     def __init__(self, dim_in, num_domains):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim_in, dim_in // 2),
-            nn.BatchNorm1d(dim_in // 2),
-            nn.ReLU(True),
-            nn.Linear(dim_in // 2, num_domains)
-        )
+        self.net = nn.Sequential(nn.Linear(dim_in, dim_in // 2), nn.BatchNorm1d(dim_in // 2), nn.ReLU(True), nn.Linear(dim_in // 2, num_domains))
     def forward(self, x, alpha):
-        x_rev = GradientReversal.apply(x, alpha)
-        return self.net(x_rev)
+        return self.net(GradientReversal.apply(x, alpha))
 
 proj_head = ProjectionHead(embedding_dim).to(device)
-domain_classifier = DomainClassifier(embedding_dim, num_experts).to(device)
+
+if use_grl:
+    domain_classifier = DomainClassifier(embedding_dim, num_experts).to(device)
+    criterion_domain = nn.CrossEntropyLoss().to(device)
+else:
+    domain_classifier = None; criterion_domain = None
 
 # ----------------------------
 # 6. Losses & Optimizer
 # ----------------------------
 num_classes = len(train_dataset.hand_id_map)
-
 criterion_arc = losses.ArcFaceLoss(num_classes=num_classes, embedding_size=embedding_dim, margin=margin, scale=scale).to(device)
 criterion_supcon = losses.SupConLoss(temperature=0.1).to(device)
-criterion_domain = nn.CrossEntropyLoss().to(device) 
 
-all_params = list(model.parameters()) + list(criterion_arc.parameters()) + \
-             list(proj_head.parameters()) + list(domain_classifier.parameters())
+all_params = list(model.parameters()) + list(criterion_arc.parameters()) + list(proj_head.parameters())
+if use_grl: all_params += list(domain_classifier.parameters())
 
 optimizer = optim.AdamW(all_params, lr=lr, weight_decay=weight_decay)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
-
 
 # ----------------------------
 # 7. Training Loop
@@ -302,161 +329,231 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, 
 total_batches = len(train_loader) * epochs
 
 for epoch in range(epochs):
-    # -------- Training --------
-    model.train(); proj_head.train(); criterion_arc.train(); domain_classifier.train()
+    model.train(); proj_head.train(); criterion_arc.train()
+    if use_grl: domain_classifier.train()
     
-    train_loss = 0.0
-    train_correct = 0
-    total_train = 0
+    train_loss = 0.0; train_correct = 0; total_train = 0
 
     for batch_idx, (img_orig, img_aug, y_i, y_d) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")):
         img_orig, img_aug = img_orig.to(device), img_aug.to(device)
         y_i, y_d = y_i.to(device), y_d.to(device)
 
-        # GRL Alpha calculation
-        p = float(batch_idx + epoch * len(train_loader)) / total_batches
-        alpha_grl = 2. / (1. + np.exp(-25 * p)) - 1
-
         optimizer.zero_grad()
-        
-        # 1. Forward Pass
         images_all = torch.cat([img_orig, img_aug], dim=0)
+        y_d_all = torch.cat([y_d, y_d], dim=0)
+
         embeddings_all = model(images_all)
         projections_all = proj_head(embeddings_all)
 
         batch_size_curr = img_orig.size(0)
         emb_orig = embeddings_all[:batch_size_curr]
 
-        # 2. Domain Classifier Forward
-        y_d_all = torch.cat([y_d, y_d], dim=0)
-        domain_logits = domain_classifier(embeddings_all, alpha_grl)
-
-        # 3. Calculate Losses
         loss_arc = criterion_arc(emb_orig, y_i)
-        
         labels_all = torch.cat([y_i, y_i], dim=0)
         loss_con = criterion_supcon(projections_all, labels_all)
         
-        loss_domain = criterion_domain(domain_logits, y_d_all)
+        loss_domain = 0.0
+        if use_grl:
+            p = float(batch_idx + epoch * len(train_loader)) / total_batches
+            alpha_grl = 2. / (1. + np.exp(-25 * p)) - 1
+            domain_logits = domain_classifier(embeddings_all, alpha_grl)
+            loss_domain = criterion_domain(domain_logits, y_d_all)
         
-        # Aggregate MoE Load Balancing Loss
         aux_loss_total = 0.0
-        for block in model.stages[3].blocks:
-            aux_loss_total += block.mlp.aux_loss
+        if use_moe_mlp:
+            for block in model.stages[3].blocks: aux_loss_total += block.mlp.aux_loss
+            
+        norm_routing_loss = 0.0; norm_count = 0
+        for module in model.modules():
+            if isinstance(module, ParallelMoELayerNorm) and module.router_logits is not None:
+                norm_routing_loss += F.cross_entropy(module.router_logits, y_d_all)
+                norm_count += 1
+        if norm_count > 0: norm_routing_loss = norm_routing_loss / norm_count
         
-        # Total Loss Equation
-        loss = loss_arc + (lamb * loss_con) + loss_domain + (aux_weight * aux_loss_total)
+        loss = loss_arc + (lamb * loss_con) + loss_domain + (aux_weight * aux_loss_total) + (norm_weight * norm_routing_loss)
         
         loss.backward()
         optimizer.step()
 
         train_loss += loss.item()
-        
         preds = criterion_arc.get_logits(emb_orig).argmax(dim=1)
         train_correct += (preds == y_i).sum().item()
         total_train += batch_size_curr
 
     # -------- Evaluation --------
     model.eval(); criterion_arc.eval()
-    test_loss = 0.0
-    test_correct = 0
-    total_test = 0
+    test_loss = 0.0; test_correct = 0; total_test = 0
     
     with torch.no_grad():
         for img_orig, y_i, y_d in tqdm(test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test] "):
             img_orig, y_i = img_orig.to(device), y_i.to(device)
-            
             embeddings = model(img_orig)
-            
-            # Test Loss is based purely on ArcFace (Identity mapping)
             loss = criterion_arc(embeddings, y_i)
             test_loss += loss.item()
-            
             preds = criterion_arc.get_logits(embeddings).argmax(dim=1)
             test_correct += (preds == y_i).sum().item()
             total_test += y_i.size(0)
 
-    # -------- Epoch Summary --------
-    avg_train_loss = train_loss / len(train_loader)
-    avg_train_acc = train_correct / total_train
-    
-    avg_test_loss = test_loss / len(test_loader)
-    avg_test_acc = test_correct / total_test
-
     print(f"Epoch [{epoch+1}/{epochs}] Summary:")
-    print(f"  -> Train | Loss: {avg_train_loss:.4f} | Acc: {avg_train_acc:.4f}")
-    print(f"  -> Test  | Loss: {avg_test_loss:.4f} | Acc: {avg_test_acc:.4f}")
+    print(f"  -> Train | Loss: {train_loss/len(train_loader):.4f} | Acc: {train_correct/total_train:.4f}")
+    print(f"  -> Test  | Loss: {test_loss/len(test_loader):.4f} | Acc: {test_correct/total_test:.4f}")
     print("-" * 50)
-
     scheduler.step()
 
+# --------------------------------------------------------------------------------
+# 8. Test-Time Adaptation & Augmentation (TTA / TTAug)
+# --------------------------------------------------------------------------------
 
-# ----------------------------
-# 8. Test-Time Adaptation (TTA) - Tent Strategy
-# ----------------------------
-if if_tta:
-    print("\n" + "="*50)
-    print("Starting Test-Time Adaptation (TTA) on Unseen 850nm Domain")
-    print("="*50)
+print("\nCreating Clean Model Snapshot for Evaluation...")
+clean_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
-    # A. Freeze absolutely everything in the network
-    for p in model.parameters(): p.requires_grad = False
+def freeze_all_unfreeze_routers(target_model):
+    for p in target_model.parameters(): p.requires_grad = False
     for p in proj_head.parameters(): p.requires_grad = False
-    for p in domain_classifier.parameters(): p.requires_grad = False
+    if use_grl:
+        for p in domain_classifier.parameters(): p.requires_grad = False
     for p in criterion_arc.parameters(): p.requires_grad = False
 
-    # B. Isolate and Unfreeze ONLY the MoE Routers in Stage 3
     tta_params = []
-    for block in model.stages[3].blocks:
-        for p in block.mlp.router.parameters():
-            p.requires_grad = True
-        tta_params.extend(list(block.mlp.router.parameters()))
+    if use_moe_mlp:
+        for block in target_model.stages[3].blocks:
+            for p in block.mlp.router.parameters(): p.requires_grad = True
+            tta_params.extend(list(block.mlp.router.parameters()))
+            
+    for module in target_model.modules():
+        if isinstance(module, ParallelMoELayerNorm):
+            for p in module.router.parameters(): p.requires_grad = True
+            tta_params.extend(list(module.router.parameters()))
+            
+    return tta_params
 
-    # C. Create a dedicated optimizer just for the routers
+# ==========================================
+# APPROACH A: Continuous TTA (Drift)
+# ==========================================
+if run_continuous_tta:
+    print("\n" + "="*50)
+    print("🚀 APPROACH A: Continuous TTA (Tent)")
+    print("="*50)
+    model.load_state_dict({k: v.to(device) for k, v in clean_state_dict.items()})
+    tta_params = freeze_all_unfreeze_routers(model)
     tta_optimizer = optim.Adam(tta_params, lr=tta_lr)
 
-    # D. TTA Loop (Adapting batch-by-batch on the Test Set)
-    # We use model.eval() to keep BatchNorm stats frozen, but we DO NOT use torch.no_grad()
-    model.eval() 
-    criterion_arc.eval()
-    
-    tta_test_loss = 0.0
-    tta_test_correct = 0
-    total_tta_test = 0
+    model.eval(); criterion_arc.eval()
+    tta_test_correct = 0; total_tta_test = 0
 
-    for img_orig, y_i, y_d in tqdm(test_loader, desc="[TTA] Adapting & Testing"):
+    for img_orig, y_i, y_d in tqdm(test_loader, desc="[Continuous TTA]"):
         img_orig, y_i = img_orig.to(device), y_i.to(device)
 
         tta_optimizer.zero_grad()
-        
-        # 1. Forward Pass
         embeddings = model(img_orig)
         
-        # 2. Collect Entropy from all routers
         entropy_loss_total = 0.0
-        for block in model.stages[3].blocks:
-            entropy_loss_total += block.mlp.entropy_loss
-            
-        # 3. Tent Backward Pass (Update the router to be more confident)
-        # Notice we are backpropagating the ENTROPY, not the ArcFace loss (because we don't know the labels)
-        entropy_loss_total.backward()
-        tta_optimizer.step()
+        if use_moe_mlp:
+            for block in model.stages[3].blocks: entropy_loss_total += block.mlp.entropy_loss
+                
+        if isinstance(entropy_loss_total, torch.Tensor):
+            entropy_loss_total.backward()
+            tta_optimizer.step()
         
-        # 4. Evaluate Identity Accuracy using the newly updated routing
-        # In a strict real-world TTA, you would re-forward the image here. 
-        # For academic evaluation, evaluating the current embeddings is standard and faster.
         with torch.no_grad():
-            loss = criterion_arc(embeddings, y_i)
-            tta_test_loss += loss.item()
-            
-            preds = criterion_arc.get_logits(embeddings).argmax(dim=1)
+            updated_embeddings = model(img_orig)
+            preds = criterion_arc.get_logits(updated_embeddings).argmax(dim=1)
             tta_test_correct += (preds == y_i).sum().item()
             total_tta_test += y_i.size(0)
 
-    avg_tta_loss = tta_test_loss / len(test_loader)
-    avg_tta_acc = tta_test_correct / total_tta_test
+    print(f"\n Continuous TTA Acc: {tta_test_correct / total_tta_test:.4f}")
 
-    print(f"\n TTA Completed!")
-    print(f"  -> Final Adapted TTA Loss: {avg_tta_loss:.4f}")
-    print(f"  -> Final Adapted TTA Acc:  {avg_tta_acc:.4f}")
+# ==========================================
+# APPROACH B: Episodic TTA (Batch Reset)
+# ==========================================
+if run_episodic_tta:
+    print("\n" + "="*50)
+    print(" APPROACH B: Episodic TTA (Batch Reset)")
+    print("="*50)
+    episodic_test_correct = 0; total_episodic_test = 0
+    
+    for img_orig, y_i, y_d in tqdm(test_loader, desc="[Episodic TTA]"):
+        img_orig, y_i = img_orig.to(device), y_i.to(device)
 
+        model.load_state_dict({k: v.to(device) for k, v in clean_state_dict.items()})
+        tta_params = freeze_all_unfreeze_routers(model)
+        tta_optimizer = optim.Adam(tta_params, lr=tta_lr)
+        
+        model.eval() 
+        for _ in range(episodic_steps):
+            tta_optimizer.zero_grad()
+            embeddings = model(img_orig)
+            entropy_loss_total = 0.0
+            if use_moe_mlp:
+                for block in model.stages[3].blocks: entropy_loss_total += block.mlp.entropy_loss
+                    
+            if isinstance(entropy_loss_total, torch.Tensor):
+                entropy_loss_total.backward()
+                tta_optimizer.step()
+                
+        with torch.no_grad():
+            final_batch_embeddings = model(img_orig)
+            preds = criterion_arc.get_logits(final_batch_embeddings).argmax(dim=1)
+            episodic_test_correct += (preds == y_i).sum().item()
+            total_episodic_test += y_i.size(0)
+
+    print(f"\n Episodic TTA Acc: {episodic_test_correct / total_episodic_test:.4f}")
+
+# ==========================================
+# APPROACH C: Test-Time Augmentation (TTAug)
+# ==========================================
+if run_ttaug:
+    print("\n" + "="*50)
+    print(f" APPROACH C: Test-Time Augmentation (Size: {ttaug_size} Augs)")
+    print("="*50)
+    
+    # Restore clean state (No weights will be updated here)
+    model.load_state_dict({k: v.to(device) for k, v in clean_state_dict.items()})
+    model.eval(); criterion_arc.eval()
+    
+    embed_correct = 0; vote_correct = 0; total_ttaug_test = 0
+
+    with torch.no_grad():
+        for img_orig, y_i, y_d in tqdm(test_loader, desc="[TTAug Evaluate]"):
+            img_orig, y_i = img_orig.to(device), y_i.to(device)
+            B, C, H, W = img_orig.shape
+
+            # 1. Create original + augmented views directly on GPU
+            views = [img_orig]
+            for _ in range(ttaug_size):
+                views.append(ttaug_pipeline(img_orig))
+            
+            # Combine into single batch: Shape [Batch * Total_Views, C, H, W]
+            total_views = 1 + ttaug_size
+            all_views = torch.stack(views, dim=1).view(-1, C, H, W)
+
+            # 2. Forward Pass for all views simultaneously
+            all_embeddings = model(all_views) # Shape: [B*Total_Views, Embedding_Dim]
+            _, D = all_embeddings.shape
+            
+            # Reshape back to [Batch, Total_Views, Embedding_Dim]
+            all_embeddings = all_embeddings.view(B, total_views, D)
+
+            # ----------------------------------------------------
+            # Strategy 1: Embedding Average (Feature Smoothing)
+            # ----------------------------------------------------
+            avg_embedding = all_embeddings.mean(dim=1)
+            logits_embed = criterion_arc.get_logits(avg_embedding)
+            preds_embed = logits_embed.argmax(dim=1)
+            embed_correct += (preds_embed == y_i).sum().item()
+
+            # ----------------------------------------------------
+            # Strategy 2: Majority Vote (Decision Smoothing)
+            # ----------------------------------------------------
+            # Get logits for all views across the batch
+            logits_all = criterion_arc.get_logits(all_embeddings.view(-1, D))
+            preds_all = logits_all.argmax(dim=1).view(B, total_views)
+            
+            # Compute statistical mode (majority) along the view dimension
+            preds_vote, _ = torch.mode(preds_all, dim=1)
+            vote_correct += (preds_vote == y_i).sum().item()
+
+            total_ttaug_test += B
+
+    print(f"\n TTAug (Embedding Avg) Acc: {embed_correct / total_ttaug_test:.4f}")
+    print(f" TTAug (Majority Vote) Acc: {vote_correct / total_ttaug_test:.4f}")
