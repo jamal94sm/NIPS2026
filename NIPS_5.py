@@ -23,13 +23,13 @@ epochs = 100
 lamb = 0.2           # Weight for SupCon Loss
 aux_weight = 0.2     # Weight for MoE Load Balancing Loss
 
-### MoE
-#num_experts = len(train_dataset.domain_map) 
+### Architectural Toggles
 num_experts = 3
 top_k = 2
 
-# NEW: Toggle to freeze (True) or fine-tune (False) the base expansion layer
 freeze_base_mlp = True 
+use_dsn_stage3_norm = True  # NEW: Toggle Domain-Specific Norm inside Stage 3 blocks
+use_dsn_final_norm = True   # NEW: Toggle Domain-Specific Norm before the final head
 
 # Choose domains by NAME
 train_domains = ["460", "WHT", "700"]   
@@ -38,7 +38,7 @@ test_domains  = ["850"]
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ----------------------------
-# 1. Transforms (Separated)
+# 1. Transforms
 # ----------------------------
 orig_transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -116,14 +116,48 @@ class CASIA_MS_Dataset(Dataset):
         return img_orig, y_i, y_d
 
 # ----------------------------
-# 3. MoE-LoRA Classes 
+# 3. Custom Modules (DSLN & MoE)
 # ----------------------------
+
+# --- Domain-Specific LayerNorm (DSLN) ---
+class DomainSpecificLayerNorm(nn.Module):
+    def __init__(self, normalized_shape, num_domains=3, eps=1e-6):
+        super().__init__()
+        self.num_domains = num_domains
+        self.norms = nn.ModuleList([
+            nn.LayerNorm(normalized_shape, eps=eps) for _ in range(num_domains)
+        ])
+        # This state will be updated externally right before model(x) is called
+        self.current_domain = None
+
+    def forward(self, x):
+        # If no domain is provided (e.g., Unseen Test Data), average all experts
+        if self.current_domain is None:
+            out = 0
+            for norm in self.norms:
+                out += norm(x)
+            return out / self.num_domains
+            
+        # If domain is provided, route exactly using the label
+        out = torch.zeros_like(x)
+        for i in range(self.num_domains):
+            idx = torch.where(self.current_domain == i)[0]
+            if len(idx) > 0:
+                out[idx] = self.norms[i](x[idx])
+        return out
+
+def set_dsn_domain(model, domain_labels):
+    """Helper function to cleanly pass the domain labels down to all DSLN layers"""
+    for module in model.modules():
+        if isinstance(module, DomainSpecificLayerNorm):
+            module.current_domain = domain_labels
+
+# --- Vectorized MoE LoRA ---
 class VectorizedLoRAExperts(nn.Module):
     def __init__(self, dim: int, num_experts: int, r: int = 8, alpha: int = 8):
         super().__init__()
         self.scaling = alpha / r
         
-        # [num_experts, in_features, out_features]
         self.w_down = nn.Parameter(torch.randn(num_experts, dim, r) * (1 / dim**0.5))
         self.w_up = nn.Parameter(torch.zeros(num_experts, r, dim))
         self.act = nn.GELU()
@@ -153,7 +187,7 @@ class ConvNeXtParallelMoELoRA(nn.Module):
         self.experts = VectorizedLoRAExperts(dim, num_experts, r, alpha)
         
         self.aux_loss = 0.0
-        self.entropy_loss = 0.0  # NEW: Tracks router confusion for TTA
+        self.entropy_loss = 0.0  
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_out = self.orig_mlp(x)
@@ -164,7 +198,6 @@ class ConvNeXtParallelMoELoRA(nn.Module):
         gate_logits = self.router(x_flat)
         gate_probs = F.softmax(gate_logits, dim=-1)
         
-        # NEW: Calculate Shannon Entropy of the routing probabilities
         self.entropy_loss = -(gate_probs * torch.log(gate_probs + 1e-6)).sum(dim=-1).mean()
         
         topk_probs, topk_indices = torch.topk(gate_probs, self.top_k, dim=-1)
@@ -207,7 +240,7 @@ test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, nu
 print(f"Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
 
 # ----------------------------
-# 5. Model Setup (MoE + GRL)
+# 5. Model Setup (MoE, DSN, GRL)
 # ----------------------------
 print("Loading ConvNeXt V2-Tiny...")
 model = timm.create_model('convnextv2_tiny', pretrained=True, num_classes=0).to(device)
@@ -216,14 +249,14 @@ embedding_dim = model.num_features
 # A. Freeze ALL parameters first
 for p in model.parameters(): p.requires_grad = False
 
-# B. Unfreeze Stage 3 (Lets the 7x7 spatial convolutions fine-tune)
+# B. Unfreeze Stage 3 Spatial Convolutions
 for p in model.stages[3].parameters(): p.requires_grad = True
 
-# C. Inject MoE-LoRA into Stage 3 MLPs
+# C. Inject MoE-LoRA and/or DSLN into Stage 3
 stage_3_dim = 768
-#num_experts = len(train_dataset.domain_map) 
 
 for block in model.stages[3].blocks:
+    # 1. MLP Replacement
     block.mlp = ConvNeXtParallelMoELoRA(
         orig_mlp=block.mlp,
         dim=stage_3_dim,
@@ -231,12 +264,24 @@ for block in model.stages[3].blocks:
         top_k=top_k,
         r=8,
         alpha=8,
-        freeze_base=freeze_base_mlp   # NEW: Passing the toggle here
+        freeze_base=freeze_base_mlp   
     ).to(device)
+    
+    # 2. LayerNorm Replacement (If toggled)
+    if use_dsn_stage3_norm and hasattr(block, 'norm'):
+        orig_shape = getattr(block.norm, 'normalized_shape', stage_3_dim)
+        eps = getattr(block.norm, 'eps', 1e-6)
+        block.norm = DomainSpecificLayerNorm(orig_shape, num_domains=num_experts, eps=eps).to(device)
 
-# D. Unfreeze Final Norm
+# D. Final Norm Replacement or Unfreezing
 if hasattr(model, 'norm'):
-     for p in model.norm.parameters(): p.requires_grad = True
+    if use_dsn_final_norm:
+        orig_shape = getattr(model.norm, 'normalized_shape', embedding_dim)
+        eps = getattr(model.norm, 'eps', 1e-6)
+        model.norm = DomainSpecificLayerNorm(orig_shape, num_domains=num_experts, eps=eps).to(device)
+    else:
+        # Standard unfreezing if DSN is toggled off
+        for p in model.norm.parameters(): p.requires_grad = True
 
 # Projection Head & GRL Classes
 class ProjectionHead(nn.Module):
@@ -291,7 +336,6 @@ all_params = list(model.parameters()) + list(criterion_arc.parameters()) + \
 optimizer = optim.AdamW(all_params, lr=lr, weight_decay=weight_decay)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
 
-
 # ----------------------------
 # 7. Training Loop
 # ----------------------------
@@ -317,6 +361,11 @@ for epoch in range(epochs):
         
         # 1. Forward Pass
         images_all = torch.cat([img_orig, img_aug], dim=0)
+        y_d_all = torch.cat([y_d, y_d], dim=0)
+        
+        # NEW: Inject the explicit domain labels into all DSLN layers before forwarding
+        set_dsn_domain(model, y_d_all)
+
         embeddings_all = model(images_all)
         projections_all = proj_head(embeddings_all)
 
@@ -324,7 +373,6 @@ for epoch in range(epochs):
         emb_orig = embeddings_all[:batch_size_curr]
 
         # 2. Domain Classifier Forward
-        y_d_all = torch.cat([y_d, y_d], dim=0)
         domain_logits = domain_classifier(embeddings_all, alpha_grl)
 
         # 3. Calculate Losses
@@ -340,7 +388,6 @@ for epoch in range(epochs):
         for block in model.stages[3].blocks:
             aux_loss_total += block.mlp.aux_loss
         
-        # Total Loss Equation
         loss = loss_arc + (lamb * loss_con) + loss_domain + (aux_weight * aux_loss_total)
         
         loss.backward()
@@ -362,9 +409,11 @@ for epoch in range(epochs):
         for img_orig, y_i, y_d in tqdm(test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test] "):
             img_orig, y_i = img_orig.to(device), y_i.to(device)
             
+            # NEW: Set DSLN to None so it averages experts for unseen 850nm test data
+            set_dsn_domain(model, None)
+
             embeddings = model(img_orig)
             
-            # Test Loss is based purely on ArcFace (Identity mapping)
             loss = criterion_arc(embeddings, y_i)
             test_loss += loss.item()
             
