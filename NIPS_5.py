@@ -34,7 +34,7 @@ use_moe_stage3_norm = True  # Toggle Parallel-MoE-Norm inside Stage 3 blocks
 use_moe_final_norm = True   # Toggle Parallel-MoE-Norm before the final head
 
 freeze_base_mlp = True      # Freezes the base ConvNeXt MLP (Applies whether MoE is on or off)
-freeze_base_norm = True     # Freezes the base ConvNeXt LayerNorms
+freeze_base_norm = False     # Freezes the base ConvNeXt LayerNorms
 
 # Choose domains by NAME
 train_domains = ["460", "WHT", "700"]   
