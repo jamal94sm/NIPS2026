@@ -25,11 +25,11 @@ aux_weight = 0.1     # Weight for MoE Load Balancing Loss
 
 ### MoE
 #num_experts = len(train_dataset.domain_map) 
-num_experts = 4
-top_k = 3
+num_experts = 3
+top_k = 2
 
 # NEW: Toggle to freeze (True) or fine-tune (False) the base expansion layer
-freeze_base_mlp = True 
+freeze_base_mlp = False 
 
 # Choose domains by NAME
 train_domains = ["460", "WHT", "700"]   
