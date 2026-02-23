@@ -23,6 +23,11 @@ epochs = 100
 lamb = 0.2           # Weight for SupCon Loss
 aux_weight = 0.1     # Weight for MoE Load Balancing Loss
 
+### MoE
+#num_experts = len(train_dataset.domain_map) 
+num_experts = 4
+top_k = 3
+
 # NEW: Toggle to freeze (True) or fine-tune (False) the base expansion layer
 freeze_base_mlp = True 
 
@@ -214,14 +219,14 @@ for p in model.stages[3].parameters(): p.requires_grad = True
 
 # C. Inject MoE-LoRA into Stage 3 MLPs
 stage_3_dim = 768
-num_experts = len(train_dataset.domain_map) 
+#num_experts = len(train_dataset.domain_map) 
 
 for block in model.stages[3].blocks:
     block.mlp = ConvNeXtParallelMoELoRA(
         orig_mlp=block.mlp,
         dim=stage_3_dim,
         num_experts=num_experts,
-        top_k=2,
+        top_k=top_k,
         r=8,
         alpha=8,
         freeze_base=freeze_base_mlp   # NEW: Passing the toggle here
