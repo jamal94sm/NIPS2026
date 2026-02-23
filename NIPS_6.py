@@ -396,7 +396,7 @@ for epoch in range(epochs):
 # ----------------------------
 if if_tta:
     print("\n" + "="*50)
-    print("🚀 Starting Test-Time Adaptation (TTA) on Unseen 850nm Domain")
+    print("Starting Test-Time Adaptation (TTA) on Unseen 850nm Domain")
     print("="*50)
 
     # A. Freeze absolutely everything in the network
@@ -456,7 +456,7 @@ if if_tta:
     avg_tta_loss = tta_test_loss / len(test_loader)
     avg_tta_acc = tta_test_correct / total_tta_test
 
-    print(f"\n✅ TTA Completed!")
+    print(f"\n TTA Completed!")
     print(f"  -> Final Adapted TTA Loss: {avg_tta_loss:.4f}")
     print(f"  -> Final Adapted TTA Acc:  {avg_tta_acc:.4f}")
 
