@@ -30,11 +30,12 @@ top_k = 2
 
 # NEW: Master Toggles for Ablation Studies
 use_moe_mlp = True          # Toggle MoE-LoRA inside Stage 3 MLPs
-use_moe_stage3_norm = False  # Toggle Parallel-MoE-Norm inside Stage 3 blocks
-use_moe_final_norm = True   # Toggle Parallel-MoE-Norm before the final head
+use_moe_stage3_norm = True  # Toggle Parallel-MoE-Norm inside Stage 3 blocks
+use_moe_final_norm = False   # Toggle Parallel-MoE-Norm before the final head
 
-freeze_base_mlp = True      # Freezes the base ConvNeXt MLP (Applies whether MoE is on or off)
-freeze_base_norm = True     # Freezes the base ConvNeXt LayerNorms
+freeze_base_mlp = True         # Freezes the base ConvNeXt MLP (Applies whether MoE is on or off)
+freeze_base_stage3_norm = True  # NEW: Freezes the base ConvNeXt LayerNorms INSIDE Stage 3
+freeze_base_final_norm = False   # NEW: Freezes the final base ConvNeXt LayerNorm BEFORE the head
 
 # Choose domains by NAME
 train_domains = ["460", "WHT", "700"]   
@@ -146,7 +147,7 @@ class ParallelMoELayerNorm(nn.Module):
             nn.init.zeros_(norm.weight) 
             nn.init.zeros_(norm.bias)   
             
-        # FIX: Safely extract the integer if normalized_shape is a tuple
+        # Safely extract the integer if normalized_shape is a tuple
         router_dim = normalized_shape[0] if isinstance(normalized_shape, (tuple, list)) else normalized_shape
         
         self.router = nn.Linear(router_dim, num_domains)
@@ -293,7 +294,7 @@ for block in model.stages[3].blocks:
         for p in block.mlp.parameters():
             p.requires_grad = not freeze_base_mlp
     
-    # 2. LayerNorm Wrapping (Parallel)
+    # 2. LayerNorm Wrapping (Parallel) - Using STAGE NORM TOGGLE
     if use_moe_stage3_norm and hasattr(block, 'norm'):
         orig_shape = getattr(block.norm, 'normalized_shape', stage_3_dim)
         eps = getattr(block.norm, 'eps', 1e-6)
@@ -302,14 +303,14 @@ for block in model.stages[3].blocks:
             normalized_shape=orig_shape, 
             num_domains=num_experts, 
             eps=eps, 
-            freeze_base=freeze_base_norm
+            freeze_base=freeze_base_stage3_norm
         ).to(device)
     elif hasattr(block, 'norm'):
         # If MoE Norm is off, explicitly set trainability of the base norm
         for p in block.norm.parameters():
-            p.requires_grad = not freeze_base_norm
+            p.requires_grad = not freeze_base_stage3_norm
 
-# D. Final Norm Wrapping
+# D. Final Norm Wrapping - Using HEAD NORM TOGGLE
 if hasattr(model, 'norm'):
     if use_moe_final_norm:
         orig_shape = getattr(model.norm, 'normalized_shape', embedding_dim)
@@ -319,11 +320,11 @@ if hasattr(model, 'norm'):
             normalized_shape=orig_shape, 
             num_domains=num_experts, 
             eps=eps, 
-            freeze_base=freeze_base_norm
+            freeze_base=freeze_base_final_norm
         ).to(device)
     else:
         for p in model.norm.parameters(): 
-            p.requires_grad = not freeze_base_norm
+            p.requires_grad = not freeze_base_final_norm
 
 # Projection Head & GRL Classes
 class ProjectionHead(nn.Module):
