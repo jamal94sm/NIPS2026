@@ -12,7 +12,7 @@ from PIL import Image
 from pytorch_metric_learning import losses
 
 # ----------------------------
-# Configuration
+# 1. Configuration
 # ----------------------------
 batch_size = 32   
 margin = 0.3
@@ -29,11 +29,11 @@ num_experts = 3
 top_k = 2
 
 # MASTER TOGGLES
-use_moe_mlp = True          # Enable MoE-LoRA in MLPs
-use_moe_stage3_norm = False # Keep False (MLPs are stronger spatial adapters)
-use_moe_final_norm = False  # Keep False (Let GRL own the final embedding)
+use_moe_mlp = True          
+use_moe_stage3_norm = False 
+use_moe_final_norm = False  
 
-use_grl = True              # Enable GRL to force backbone invariance
+use_grl = True              
 
 freeze_base_mlp = True          
 freeze_base_stage3_norm = False 
@@ -46,7 +46,7 @@ test_domains  = ["850"]
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ----------------------------
-# 1. Transforms
+# 2. Transforms
 # ----------------------------
 orig_transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -64,7 +64,7 @@ aug_transform = transforms.Compose([
 ])
 
 # ----------------------------
-# 2. Dataset Class
+# 3. Dataset Class
 # ----------------------------
 class CASIA_MS_Dataset(Dataset):
     def __init__(self, data_path, target_domains, orig_transform=None, aug_transform=None, is_train=True):
@@ -116,14 +116,13 @@ class CASIA_MS_Dataset(Dataset):
         return img_orig, y_i, y_d
 
 # ----------------------------
-# 3. Custom Modules (Global Scout Logic)
+# 4. Custom Modules (Global Scout Logic)
 # ----------------------------
 
 # --- NEW: The Global Domain Scout ---
 class GlobalDomainRouter(nn.Module):
     def __init__(self, num_domains=3):
         super().__init__()
-        # Lightweight CNN to detect spectrum from raw pixels
         self.features = nn.Sequential(
             nn.Conv2d(3, 16, kernel_size=7, stride=4, padding=3),
             nn.BatchNorm2d(16), nn.ReLU(),
@@ -137,7 +136,7 @@ class GlobalDomainRouter(nn.Module):
     def forward(self, x):
         return self.classifier(self.features(x))
 
-# --- Parallel MoE LayerNorm (External Routing) ---
+# --- Parallel MoE LayerNorm ---
 class ParallelMoELayerNorm(nn.Module):
     def __init__(self, orig_norm: nn.Module, normalized_shape, num_domains=3, eps=1e-6, freeze_base=True):
         super().__init__()
@@ -156,9 +155,7 @@ class ParallelMoELayerNorm(nn.Module):
             nn.init.zeros_(norm.bias)   
 
     def forward(self, x, routing_weights):
-        # routing_weights passed from Scout [Batch, Num_Experts]
         orig_out = self.orig_norm(x)
-        
         moe_out = 0
         for i in range(self.num_domains):
             w_i = routing_weights[:, i]
@@ -167,7 +164,6 @@ class ParallelMoELayerNorm(nn.Module):
             else:
                 w_i = w_i.view(-1, 1)       
             moe_out += w_i * self.norms[i](x)
-
         return orig_out + moe_out
         
 class VectorizedLoRAExperts(nn.Module):
@@ -197,13 +193,10 @@ class ConvNeXtParallelMoELoRA(nn.Module):
         else:
             for p in self.orig_mlp.parameters(): p.requires_grad = True
                 
-        # NO INTERNAL ROUTER
         self.experts = VectorizedLoRAExperts(dim, num_experts, r, alpha)
 
     def forward(self, x: torch.Tensor, routing_info) -> torch.Tensor:
-        # Unpack global routing decision
         gate_probs, topk_probs, topk_indices = routing_info
-        
         orig_out = self.orig_mlp(x)
         orig_shape = x.shape
         x_flat = x.view(-1, orig_shape[-1]) 
@@ -223,7 +216,7 @@ class ConvNeXtParallelMoELoRA(nn.Module):
         return orig_out + moe_out
 
 # ----------------------------
-# 4. Integrated Model Wrapper (Scout + Backbone)
+# 5. Integrated Model Wrapper (Scout + Backbone)
 # ----------------------------
 class IntegratedMoEModel(nn.Module):
     def __init__(self, backbone, scout, num_experts, top_k):
@@ -236,49 +229,56 @@ class IntegratedMoEModel(nn.Module):
         self.scout_logits = None 
 
     def forward(self, x):
-        # 1. SCOUT DECISION (On Raw Image)
-        # This is where the magic happens: Domain classification without GRL interference
+        # 1. SCOUT DECISION
         self.scout_logits = self.scout(x)
         gate_probs = F.softmax(self.scout_logits, dim=-1)
         
-        # 2. Global Routing Calculation
         topk_probs, topk_indices = torch.topk(gate_probs, self.top_k, dim=-1)
         topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-6)
         
-        # Load Balancing Loss
         fraction_routed = torch.zeros_like(gate_probs).scatter_(1, topk_indices, 1.0).mean(dim=0)
         mean_probs = gate_probs.mean(dim=0)
         self.aux_loss = self.num_experts * torch.sum(fraction_routed * mean_probs)
         
-        # Prepare Info bundles
         mlp_routing_info = (gate_probs, topk_probs, topk_indices)
         norm_routing_weights = gate_probs 
 
         # 3. DISTRIBUTE DECISIONS TO BLOCKS
-        # This injects the decision "down" into the backbone blocks
         for block in self.backbone.stages[3].blocks:
             if hasattr(block.mlp, 'forward'):
                 block.mlp.current_routing_info = mlp_routing_info
             if hasattr(block.norm, 'forward'):
                 block.norm.current_routing_weights = norm_routing_weights
                 
-        # Also distribute to final norm if active
         if hasattr(self.backbone, 'norm') and isinstance(self.backbone.norm, ParallelMoELayerNorm):
              self.backbone.norm.current_routing_weights = norm_routing_weights
 
-        # 4. BACKBONE PASS (Using the injected decisions)
         return self.backbone(x)
 
 # ----------------------------
-# 5. Model Setup 
+# 6. Data Loading (RESTORED HERE)
+# ----------------------------
+data_path = "/home/pai-ng/Jamal/CASIA-MS-ROI"
+
+print("Creating Training Dataset...")
+train_dataset = CASIA_MS_Dataset(data_path, train_domains, orig_transform, aug_transform, True)
+
+print("Creating Test Dataset...")
+test_dataset  = CASIA_MS_Dataset(data_path, test_domains, orig_transform, is_train=False)
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
+test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+
+print(f"Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
+
+# ----------------------------
+# 7. Model Setup 
 # ----------------------------
 print("Loading ConvNeXt V2-Tiny...")
 base_model = timm.create_model('convnextv2_tiny', pretrained=True, num_classes=0).to(device)
 embedding_dim = base_model.num_features 
 
-# Freeze backbone parameters
 for p in base_model.parameters(): p.requires_grad = False
-# Unfreeze Stage 3 Spatial Convolutions
 for p in base_model.stages[3].parameters(): p.requires_grad = True
 
 stage_3_dim = 768
@@ -295,7 +295,6 @@ class RoutedConvNeXtBlock(nn.Module):
             x = self.block.norm(x)
             x = self.block.mlp(x)
         else:
-            # Inject Global Decisions stored in the module
             if isinstance(self.block.norm, ParallelMoELayerNorm):
                 x = self.block.norm(x, self.block.norm.current_routing_weights)
             else:
@@ -310,7 +309,6 @@ class RoutedConvNeXtBlock(nn.Module):
         x = self.block.drop_path(x)
         return x + shortcut
 
-# Wrap the blocks
 for i, block in enumerate(base_model.stages[3].blocks):
     if use_moe_mlp:
         block.mlp = ConvNeXtParallelMoELoRA(block.mlp, stage_3_dim, num_experts, top_k, 8, 8, freeze_base_mlp).to(device)
@@ -327,7 +325,6 @@ if use_moe_final_norm and hasattr(base_model, 'norm'):
     eps = getattr(base_model.norm, 'eps', 1e-6)
     base_model.norm = ParallelMoELayerNorm(base_model.norm, orig_shape, num_experts, eps, freeze_base_final_norm).to(device)
 
-# Initialize System
 scout = GlobalDomainRouter(num_experts).to(device)
 model = IntegratedMoEModel(base_model, scout, num_experts, top_k).to(device)
 
@@ -362,13 +359,12 @@ else:
     domain_classifier = None; criterion_domain = None
 
 # ----------------------------
-# 6. Losses & Optimizer
+# 8. Losses & Optimizer
 # ----------------------------
-num_classes = len(train_dataset.hand_id_map)
+num_classes = len(train_dataset.hand_id_map) # Now this works because train_dataset exists!
 criterion_arc = losses.ArcFaceLoss(num_classes=num_classes, embedding_size=embedding_dim, margin=margin, scale=scale).to(device)
 criterion_supcon = losses.SupConLoss(temperature=0.1).to(device)
 
-# IMPORTANT: Include the Scout's parameters in the optimizer!
 all_params = list(model.parameters()) + list(criterion_arc.parameters()) + list(proj_head.parameters())
 if use_grl: all_params += list(domain_classifier.parameters())
 
@@ -376,7 +372,7 @@ optimizer = optim.AdamW(all_params, lr=lr, weight_decay=weight_decay)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
 
 # ----------------------------
-# 7. Training Loop
+# 9. Training Loop
 # ----------------------------
 total_batches = len(train_loader) * epochs
 
@@ -394,7 +390,7 @@ for epoch in range(epochs):
         images_all = torch.cat([img_orig, img_aug], dim=0)
         y_d_all = torch.cat([y_d, y_d], dim=0)
 
-        # 1. Forward Pass (Scout routes automatically)
+        # 1. Forward (Scout routes internally)
         embeddings_all = model(images_all)
         projections_all = proj_head(embeddings_all)
 
@@ -413,8 +409,7 @@ for epoch in range(epochs):
             domain_logits = domain_classifier(embeddings_all, alpha_grl)
             loss_domain = criterion_domain(domain_logits, y_d_all)
         
-        # 3. Scout Supervision
-        # The scout learns to predict domain from RAW images
+        # 3. Scout Supervision (Critical: We explicitly train the scout)
         norm_routing_loss = F.cross_entropy(model.scout_logits, y_d_all)
         aux_loss = model.aux_loss
         
