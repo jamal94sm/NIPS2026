@@ -26,17 +26,20 @@ aux_weight = 0.2
 norm_weight = 1.0    
 
 # --- AUGMENTATION TOGGLES ---
-use_general_aug = False      # Standard (Blur, Jitter, Sharpness)
-use_physics_aug = True       # Smart (Visible <-> NIR Simulation). Overrides General.
+use_general_aug = True      # Standard (Blur, Jitter, Sharpness)
+use_physics_aug = False       # Smart (Visible <-> NIR Simulation). Overrides General.
 use_fft_aug     = True       # Frequency Swapping. XORs with Spatial Aug in loop.
 
 # --- ARCHITECTURE TOGGLES ---
 num_experts = 3
 top_k = 2
+
 use_moe_mlp = True          
 use_moe_stage3_norm = False 
 use_moe_final_norm = False  
-use_grl = True              
+
+use_grl = True       
+
 use_global_scout = True     
 use_spectral_scout = False  
 
