@@ -155,10 +155,12 @@ class ParallelMoELayerNorm(nn.Module):
             nn.init.zeros_(norm.bias)   
 
     def forward(self, x, routing_weights):
+        # x is [B, H, W, C] due to wrapper permute logic
         orig_out = self.orig_norm(x)
         moe_out = 0
         for i in range(self.num_domains):
             w_i = routing_weights[:, i]
+            # Reshape w_i [B] to [B, 1, 1, 1] to broadcast against [B, H, W, C]
             if x.dim() == 4:
                 w_i = w_i.view(-1, 1, 1, 1) 
             else:
@@ -196,6 +198,7 @@ class ConvNeXtParallelMoELoRA(nn.Module):
         self.experts = VectorizedLoRAExperts(dim, num_experts, r, alpha)
 
     def forward(self, x: torch.Tensor, routing_info) -> torch.Tensor:
+        # x is [B, H, W, C] here
         gate_probs, topk_probs, topk_indices = routing_info
         orig_out = self.orig_mlp(x)
         orig_shape = x.shape
@@ -244,10 +247,9 @@ class IntegratedMoEModel(nn.Module):
         norm_routing_weights = gate_probs 
 
         # 3. DISTRIBUTE DECISIONS TO BLOCKS
-        # FIX: We iterate over the wrapper list, so 'block' is a RoutedConvNeXtBlock
+        # Iterate over the wrappers to inject info into the real blocks
         for wrapper in self.backbone.stages[3].blocks:
-            # We must access the internal block, not the wrapper
-            real_block = wrapper.block 
+            real_block = wrapper.block # Access the underlying block
             
             if hasattr(real_block.mlp, 'forward'):
                 real_block.mlp.current_routing_info = mlp_routing_info
@@ -260,7 +262,7 @@ class IntegratedMoEModel(nn.Module):
         return self.backbone(x)
 
 # ----------------------------
-# 6. Data Loading
+# 6. Data Loading 
 # ----------------------------
 data_path = "/home/pai-ng/Jamal/CASIA-MS-ROI"
 
@@ -287,7 +289,7 @@ for p in base_model.stages[3].parameters(): p.requires_grad = True
 
 stage_3_dim = 768
 
-# Helper Block to inject routing info during forward pass
+# Helper Block to inject routing info during forward pass - FIXED for Shape
 class RoutedConvNeXtBlock(nn.Module):
     def __init__(self, original_block):
         super().__init__()
@@ -295,11 +297,8 @@ class RoutedConvNeXtBlock(nn.Module):
     def forward(self, x):
         shortcut = x
         x = self.block.conv_dw(x)
+        
         if self.block.use_conv_mlp:
-            x = self.block.norm(x)
-            x = self.block.mlp(x)
-        else:
-            # Look for routing info stored on the module
             if isinstance(self.block.norm, ParallelMoELayerNorm):
                 x = self.block.norm(x, self.block.norm.current_routing_weights)
             else:
@@ -309,6 +308,22 @@ class RoutedConvNeXtBlock(nn.Module):
                 x = self.block.mlp(x, self.block.mlp.current_routing_info)
             else:
                 x = self.block.mlp(x)
+        else:
+            # FIX: Permute for standard MLP blocks [NCHW -> NHWC]
+            x = x.permute(0, 2, 3, 1) 
+            
+            if isinstance(self.block.norm, ParallelMoELayerNorm):
+                x = self.block.norm(x, self.block.norm.current_routing_weights)
+            else:
+                x = self.block.norm(x)
+            
+            if isinstance(self.block.mlp, ConvNeXtParallelMoELoRA):
+                x = self.block.mlp(x, self.block.mlp.current_routing_info)
+            else:
+                x = self.block.mlp(x)
+            
+            # FIX: Permute back [NHWC -> NCHW]
+            x = x.permute(0, 3, 1, 2)
                 
         if self.block.gamma is not None: x = self.block.gamma * x
         x = self.block.drop_path(x)
@@ -366,7 +381,7 @@ else:
 # ----------------------------
 # 8. Losses & Optimizer
 # ----------------------------
-num_classes = len(train_dataset.hand_id_map)
+num_classes = len(train_dataset.hand_id_map) 
 criterion_arc = losses.ArcFaceLoss(num_classes=num_classes, embedding_size=embedding_dim, margin=margin, scale=scale).to(device)
 criterion_supcon = losses.SupConLoss(temperature=0.1).to(device)
 
@@ -395,7 +410,6 @@ for epoch in range(epochs):
         images_all = torch.cat([img_orig, img_aug], dim=0)
         y_d_all = torch.cat([y_d, y_d], dim=0)
 
-        # 1. Forward (Scout routes internally)
         embeddings_all = model(images_all)
         projections_all = proj_head(embeddings_all)
 
@@ -406,7 +420,6 @@ for epoch in range(epochs):
         labels_all = torch.cat([y_i, y_i], dim=0)
         loss_con = criterion_supcon(projections_all, labels_all)
         
-        # 2. GRL Loss
         loss_domain = 0.0
         if use_grl:
             p = float(batch_idx + epoch * len(train_loader)) / total_batches
@@ -414,7 +427,6 @@ for epoch in range(epochs):
             domain_logits = domain_classifier(embeddings_all, alpha_grl)
             loss_domain = criterion_domain(domain_logits, y_d_all)
         
-        # 3. Scout Supervision
         norm_routing_loss = F.cross_entropy(model.scout_logits, y_d_all)
         aux_loss = model.aux_loss
         
