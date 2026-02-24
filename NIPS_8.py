@@ -24,16 +24,20 @@ epochs = 100
 lamb = 0.2           # SupCon Weight
 aux_weight = 0.2     # MoE Balance Weight
 norm_weight = 1.0    # Scout Weight
-consistency_weight = 2.0 
+
+# --- SMART CONSISTENCY CONFIG ---
+consistency_max_weight = 1.0  # Max weight after ramp-up
+consistency_ramp_epochs = 5   # Wait 5 epochs before starting
+confidence_threshold = 0.7    # Only enforce if Teacher is 70% sure
 
 # --- AUGMENTATION TOGGLES ---
 use_general_aug = True      
 use_physics_aug = False       
 use_fft_aug     = True       
 
-# --- NEW: ADVANCED TRAINING TOGGLES ---
-use_consistency_loss = False  # Enable JSD Loss between Clean and Aug views
-use_dynamic_beta     = True  # True = Random Box (1%-20%); False = Fixed Box (15%)
+# --- ADVANCED TRAINING TOGGLES ---
+use_consistency_loss = True  # Set to True to use the new Smart Consistency
+use_dynamic_beta     = True  # Random Box (1%-20%)
 
 # --- ARCHITECTURE TOGGLES ---
 num_experts = 3
@@ -87,7 +91,7 @@ geometric_aug = transforms.Compose([
     transforms.RandomAffine(degrees=10, translate=(0.05, 0.05)),
 ])
 
-# --- UPDATED: Dynamic Beta Controlled Mixer ---
+# --- Dynamic Beta Controlled Mixer ---
 def label_guided_fft_mixup(x, labels):
     B, C, H, W = x.shape
     fft = torch.fft.fft2(x, dim=(-2, -1))
@@ -342,25 +346,13 @@ else:
     domain_classifier = None; criterion_domain = None
 
 # ----------------------------
-# 6. Losses (Consistency Included)
+# 6. Losses (Basic)
 # ----------------------------
 num_classes = len(train_dataset.hand_id_map)
 criterion_arc = losses.ArcFaceLoss(num_classes=num_classes, embedding_size=embedding_dim, margin=margin, scale=scale).to(device)
 criterion_supcon = losses.SupConLoss(temperature=0.1).to(device)
 
-# Jensen-Shannon Divergence for Consistency
-class JSDLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.kl = nn.KLDivLoss(reduction='batchmean', log_target=True)
-    def forward(self, p_logits, q_logits):
-        p = F.softmax(p_logits, dim=1)
-        q = F.softmax(q_logits, dim=1)
-        m = 0.5 * (p + q)
-        m_log = m.log()
-        return 0.5 * (self.kl(m_log, p) + self.kl(m_log, q))
-
-criterion_consistency = JSDLoss().to(device)
+# (Note: JSD Loss class removed; we use F.kl_div inside the loop now)
 
 all_params = list(model.parameters()) + list(criterion_arc.parameters()) + list(proj_head.parameters())
 if use_grl: all_params += list(domain_classifier.parameters())
@@ -369,13 +361,22 @@ optimizer = optim.AdamW(all_params, lr=lr, weight_decay=weight_decay)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
 
 # ----------------------------
-# 7. Training Loop (Controlled)
+# 7. Training Loop (Smart Consistency)
 # ----------------------------
-print(f"Starting Training | Consist:{use_consistency_loss} | DynBeta:{use_dynamic_beta}")
+print(f"Starting Training | Ramp:{consistency_ramp_epochs}ep | Thresh:{confidence_threshold}")
+
 for epoch in range(epochs):
     model.train(); proj_head.train(); criterion_arc.train()
     if use_grl: domain_classifier.train()
     train_loss = 0.0; train_correct = 0; total_train = 0
+    
+    # --- RAMP UP LOGIC ---
+    if epoch < consistency_ramp_epochs:
+        curr_consist_weight = 0.0
+    else:
+        # Linear ramp from 0 to max_weight over 5 epochs
+        progress = min(1.0, (epoch - consistency_ramp_epochs) / 5.0)
+        curr_consist_weight = consistency_max_weight * progress
 
     for batch_idx, (img_orig, img_spatial, y_i, y_d) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")):
         img_orig, img_spatial, y_i, y_d = img_orig.to(device), img_spatial.to(device), y_i.to(device), y_d.to(device)
@@ -405,19 +406,33 @@ for epoch in range(epochs):
         loss_arc = criterion_arc(embeddings_all, y_i_all)
         loss_con = criterion_supcon(projections_all, y_i_all)
         
-        # 3. GRL Loss (Protected)
+        # 3. GRL Loss (Protected - Clean Only)
         loss_domain = 0.0
         if use_grl:
             p = float(batch_idx + epoch * len(train_loader)) / (len(train_loader) * epochs)
             alpha_grl = 2. / (1. + np.exp(-10 * p)) - 1
             loss_domain = criterion_domain(domain_classifier(emb_orig, alpha_grl), y_d)
         
-        # 4. Consistency Loss (TOGGLE CONTROLLED)
-        loss_consistency = 0.0
-        if use_consistency_loss:
+        # 4. Smart Consistency Loss (Masked & Ramped)
+        loss_consistency = torch.tensor(0.0).to(device)
+        if use_consistency_loss and curr_consist_weight > 0:
+            # Get logits
             logits_clean = criterion_arc.get_logits(emb_orig)
             logits_aug   = criterion_arc.get_logits(emb_aug)
-            loss_consistency = criterion_consistency(logits_clean, logits_aug) * consistency_weight
+            
+            # Get Teacher Probabilities (Clean)
+            probs_clean = F.softmax(logits_clean, dim=1)
+            max_probs, _ = torch.max(probs_clean, dim=1)
+            
+            # Mask: Only where Teacher is Confident
+            mask = max_probs.ge(confidence_threshold).float()
+            
+            # KL Divergence: Teacher(Fixed) vs Student(Log)
+            log_probs_aug = F.log_softmax(logits_aug, dim=1)
+            kl_loss = F.kl_div(log_probs_aug, probs_clean, reduction='none').sum(dim=1)
+            
+            # Weighted Masked Loss
+            loss_consistency = (kl_loss * mask).mean() * curr_consist_weight
 
         # 5. Scout
         norm_routing_loss = F.cross_entropy(model.scout_logits, y_d_all)
@@ -444,7 +459,7 @@ for epoch in range(epochs):
             total_test += y_i.size(0)
 
     print(f"Epoch [{epoch+1}/{epochs}] Summary:")
-    print(f"  -> Train | Loss: {train_loss/len(train_loader):.4f} | Acc: {train_correct/total_train:.4f}")
+    print(f"  -> Train | Loss: {train_loss/len(train_loader):.4f} | Acc: {train_correct/total_train:.4f} | CW: {curr_consist_weight:.2f}")
     print(f"  -> Test  | Acc: {test_correct/total_test:.4f}")
     print("-" * 50)
     scheduler.step()
