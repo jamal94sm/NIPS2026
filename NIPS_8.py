@@ -32,12 +32,10 @@ top_k = 2
 use_moe_mlp = True          
 use_moe_stage3_norm = False 
 use_moe_final_norm = False  
-
 use_grl = True              
 
-# NEW: Global Scout Toggles
-use_global_scout = True     # Enable the External Scout Architecture
-use_spectral_scout = False   # True = Scout sees FFT Amplitude (Style); False = Scout sees RGB
+use_global_scout = True     
+use_spectral_scout = False  # RGB is more stable for the Scout
 
 freeze_base_mlp = True          
 freeze_base_stage3_norm = False 
@@ -50,13 +48,14 @@ test_domains  = ["850"]
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ----------------------------
-# 2. Transforms
+# 2. Transforms (Standard + FFT Plan)
 # ----------------------------
 orig_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
 ])
 
+# The "General" Augmentations you requested
 aug_transform = transforms.Compose([
     transforms.RandomResizedCrop(size=224, scale=(0.9, 1.0), ratio=(0.95, 1.05)),
     transforms.RandomAffine(degrees=10, translate=(0.05, 0.05)),
@@ -68,7 +67,49 @@ aug_transform = transforms.Compose([
 ])
 
 # ----------------------------
-# 3. Dataset Class
+# 3. FFT Batch Mixer (The Swapping Mechanism)
+# ----------------------------
+def label_guided_fft_mixup(x, labels, beta=0.15):
+    """
+    Swaps low-freq amplitude between images in the batch.
+    It sorts the batch by label to maximize cross-domain swapping.
+    """
+    B, C, H, W = x.shape
+    
+    # 1. FFT to Frequency Domain
+    fft = torch.fft.fft2(x, dim=(-2, -1))
+    amp = torch.abs(fft)
+    pha = torch.angle(fft)
+    
+    # 2. Shift to center (Low Frequencies)
+    amp_shifted = torch.fft.fftshift(amp, dim=(-2, -1))
+    
+    # 3. Target Selection (Label-Guided Sorting)
+    # We sort by label, then roll by B/2. 
+    # This pairs Domain A images with Domain B images (if batch is balanced).
+    sorted_idx = torch.argsort(labels)
+    roll_amount = B // 2
+    target_indices = torch.roll(sorted_idx, shifts=roll_amount, dims=0)
+    
+    # Get the "Style" (Amplitude) from the target images
+    amp_shifted_trg = amp_shifted[target_indices]
+    
+    # 4. Swap Low Frequencies (The "Style" Box)
+    b = int(np.floor(np.amin((H, W)) * beta))
+    c_h, c_w = int(np.floor(H / 2.0)), int(np.floor(W / 2.0))
+    
+    # Replace Source Low-Freqs with Target Low-Freqs
+    amp_shifted[..., c_h-b:c_h+b, c_w-b:c_w+b] = amp_shifted_trg[..., c_h-b:c_h+b, c_w-b:c_w+b]
+    
+    # 5. Inverse FFT
+    amp_mixed = torch.fft.ifftshift(amp_shifted, dim=(-2, -1))
+    fft_new = amp_mixed * torch.exp(1j * pha) # New Amp + Original Phase
+    x_aug = torch.fft.ifft2(fft_new, dim=(-2, -1)).real
+    
+    return torch.clamp(x_aug, 0, 1)
+
+# ----------------------------
+# 4. Dataset Class
 # ----------------------------
 class CASIA_MS_Dataset(Dataset):
     def __init__(self, data_path, target_domains, orig_transform=None, aug_transform=None, is_train=True):
@@ -77,7 +118,7 @@ class CASIA_MS_Dataset(Dataset):
         self.domain_map = {d: i for i, d in enumerate(target_domains)}
         
         self.orig_transform = orig_transform
-        self.aug_transform = aug_transform
+        self.aug_transform = aug_transform # Standard Augs
         self.is_train = is_train
         
         hand_id_counter = 0
@@ -107,12 +148,14 @@ class CASIA_MS_Dataset(Dataset):
         img_path, y_i, y_d = self.samples[idx]
         img = Image.open(img_path).convert("RGB")
         
+        # 1. Clean
         if self.orig_transform:
             img_orig = self.orig_transform(img)
         else:
             img_orig = transforms.Resize((224, 224))(img)
             img_orig = transforms.ToTensor()(img_orig)
 
+        # 2. Augmented (Standard Spatial Augs)
         if self.is_train and self.aug_transform:
             img_aug = self.aug_transform(img)
             return img_orig, img_aug, y_i, y_d
@@ -120,173 +163,99 @@ class CASIA_MS_Dataset(Dataset):
         return img_orig, y_i, y_d
 
 # ----------------------------
-# 4. Custom Modules & Scout
+# 5. Modules & Scout
 # ----------------------------
-
-# --- NEW: Spectral Splitter (For Spectral Scout) ---
 class SpectralPreprocess(nn.Module):
-    def __init__(self):
-        super().__init__()
+    def __init__(self): super().__init__()
     def forward(self, x):
-        # 1. FFT
         fft = torch.fft.fft2(x, dim=(-2, -1))
-        # 2. Extract Amplitude (Style)
-        amp = torch.abs(fft)
-        # 3. Reconstruct Image from Amplitude only (Phase = 0)
-        # This creates a "Texture Map" without lines/geometry
-        fft_amp_only = amp * torch.exp(1j * torch.zeros_like(fft))
-        x_amp = torch.fft.ifft2(fft_amp_only, dim=(-2, -1)).real
-        return F.instance_norm(x_amp) # Normalize for stability
+        x_amp = torch.fft.ifft2(torch.abs(fft) * torch.exp(1j * torch.zeros_like(fft)), dim=(-2, -1)).real
+        return torch.clamp(x_amp, 0, 1)
 
-# --- NEW: Global Scout CNN ---
 class GlobalDomainRouter(nn.Module):
     def __init__(self, num_domains=3):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=7, stride=4, padding=3),
-            nn.BatchNorm2d(16), nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(32), nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten()
+            nn.Conv2d(3, 16, 7, 4, 3), nn.BatchNorm2d(16), nn.ReLU(),
+            nn.Conv2d(16, 32, 3, 2, 1), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten()
         )
         self.classifier = nn.Linear(32, num_domains)
+    def forward(self, x): return self.classifier(self.features(x))
 
-    def forward(self, x):
-        return self.classifier(self.features(x))
-
-# --- UPDATED: Parallel MoE LayerNorm (External Routing) ---
 class ParallelMoELayerNorm(nn.Module):
-    def __init__(self, orig_norm: nn.Module, normalized_shape, num_domains=3, eps=1e-6, freeze_base=True):
+    def __init__(self, orig_norm, normalized_shape, num_domains=3, eps=1e-6, freeze_base=True):
         super().__init__()
-        self.orig_norm = orig_norm
-        self.num_domains = num_domains
-        
-        if freeze_base:
+        self.orig_norm = orig_norm; self.num_domains = num_domains
+        if freeze_base: 
             for p in self.orig_norm.parameters(): p.requires_grad = False
         else:
             for p in self.orig_norm.parameters(): p.requires_grad = True
-                
         self.norms = nn.ModuleList([nn.LayerNorm(normalized_shape, eps=eps) for _ in range(num_domains)])
-        for norm in self.norms:
-            nn.init.zeros_(norm.weight); nn.init.zeros_(norm.bias)   
-
-    def forward(self, x, routing_weights):
-        # routing_weights passed from Scout [Batch, Num_Experts]
-        orig_out = self.orig_norm(x)
-        moe_out = 0
+        for n in self.norms: nn.init.zeros_(n.weight); nn.init.zeros_(n.bias)
+    def forward(self, x, weights):
+        out = self.orig_norm(x)
+        moe = 0
         for i in range(self.num_domains):
-            w_i = routing_weights[:, i]
-            if x.dim() == 4:
-                w_i = w_i.view(-1, 1, 1, 1) 
-            else:
-                w_i = w_i.view(-1, 1)       
-            moe_out += w_i * self.norms[i](x)
-        return orig_out + moe_out
-        
+            w = weights[:, i]
+            if x.dim()==4: w = w.view(-1, 1, 1, 1)
+            else: w = w.view(-1, 1)
+            moe += w * self.norms[i](x)
+        return out + moe
+
 class VectorizedLoRAExperts(nn.Module):
-    def __init__(self, dim: int, num_experts: int, r: int = 8, alpha: int = 8):
+    def __init__(self, dim, num_experts, r=8, alpha=8):
         super().__init__()
-        self.scaling = alpha / r
-        self.w_down = nn.Parameter(torch.randn(num_experts, dim, r) * (1 / dim**0.5))
+        self.scaling = alpha/r
+        self.w_down = nn.Parameter(torch.randn(num_experts, dim, r)*(1/dim**0.5))
         self.w_up = nn.Parameter(torch.zeros(num_experts, r, dim))
         self.act = nn.GELU()
+    def forward(self, x, idx):
+        return torch.matmul(self.act(torch.matmul(x, self.w_down[idx])), self.w_up[idx]) * self.scaling
 
-    def forward(self, x: torch.Tensor, expert_idx: int) -> torch.Tensor:
-        down = torch.matmul(x, self.w_down[expert_idx])
-        act = self.act(down)
-        up = torch.matmul(act, self.w_up[expert_idx])
-        return up * self.scaling
-
-# --- UPDATED: ConvNeXt MoE (External Routing) ---
 class ConvNeXtParallelMoELoRA(nn.Module):
-    def __init__(self, orig_mlp: nn.Module, dim: int, num_experts: int = 3, top_k: int = 2, r: int = 8, alpha: int = 8, freeze_base: bool = True):
+    def __init__(self, orig_mlp, dim, num_experts=3, top_k=2, r=8, alpha=8, freeze_base=True):
         super().__init__()
-        self.orig_mlp = orig_mlp
-        self.num_experts = num_experts
-        self.top_k = top_k
-        
-        if freeze_base:
+        self.orig_mlp = orig_mlp; self.num_experts = num_experts; self.top_k = top_k
+        if freeze_base: 
             for p in self.orig_mlp.parameters(): p.requires_grad = False
         else:
             for p in self.orig_mlp.parameters(): p.requires_grad = True
-                
-        # NO INTERNAL ROUTER
         self.experts = VectorizedLoRAExperts(dim, num_experts, r, alpha)
-
-    def forward(self, x: torch.Tensor, routing_info) -> torch.Tensor:
-        # Unpack global routing decision
-        gate_probs, topk_probs, topk_indices = routing_info
-        
-        orig_out = self.orig_mlp(x)
-        orig_shape = x.shape
-        x_flat = x.view(-1, orig_shape[-1]) 
-        
-        moe_out = torch.zeros_like(x_flat)
+    def forward(self, x, info):
+        gate, topk_probs, topk_idx = info
+        orig = self.orig_mlp(x); shape = x.shape
+        x_flat = x.view(-1, shape[-1]); moe = torch.zeros_like(x_flat)
         for i in range(self.num_experts):
-            token_indices, k_indices = torch.where(topk_indices == i)
-            if len(token_indices) == 0: continue
-            
-            tokens = x_flat[token_indices]
-            expert_output = self.experts(tokens, i)
-            weights = topk_probs[token_indices, k_indices].unsqueeze(-1)
-            moe_out[token_indices] += expert_output * weights
-            
-        moe_out = moe_out.view(*orig_shape)
-        return orig_out + moe_out
+            idx, k_idx = torch.where(topk_idx == i)
+            if len(idx)==0: continue
+            moe[idx] += self.experts(x_flat[idx], i) * topk_probs[idx, k_idx].unsqueeze(-1)
+        return orig + moe.view(*shape)
 
-# ----------------------------
-# 5. Integrated Model Wrapper (The Brain)
-# ----------------------------
 class IntegratedMoEModel(nn.Module):
     def __init__(self, backbone, scout, num_experts, top_k, use_spectral_scout=False):
         super().__init__()
-        self.backbone = backbone
-        self.scout = scout
-        self.num_experts = num_experts
-        self.top_k = top_k
+        self.backbone = backbone; self.scout = scout; self.num_experts = num_experts; self.top_k = top_k
         self.use_spectral_scout = use_spectral_scout
-        
-        if self.use_spectral_scout:
-            self.spectral_split = SpectralPreprocess()
-            
-        self.aux_loss = 0.0
-        self.scout_logits = None 
-
+        if use_spectral_scout: self.spectral_split = SpectralPreprocess()
+        self.aux_loss = 0.0; self.scout_logits = None
     def forward(self, x):
-        # 1. PREPARE SCOUT INPUT
-        if self.use_spectral_scout:
-            scout_input = self.spectral_split(x) # Amplitude Only
-        else:
-            scout_input = x # Raw RGB
-            
-        # 2. SCOUT DECISION
-        self.scout_logits = self.scout(scout_input)
-        gate_probs = F.softmax(self.scout_logits, dim=-1)
+        scout_in = self.spectral_split(x) if self.use_spectral_scout else x
+        self.scout_logits = self.scout(scout_in)
+        gate = F.softmax(self.scout_logits, dim=-1)
+        topk_p, topk_i = torch.topk(gate, self.top_k, dim=-1)
+        topk_p = topk_p / (topk_p.sum(-1, keepdim=True)+1e-6)
+        frac = torch.zeros_like(gate).scatter_(1, topk_i, 1.0).mean(0)
+        self.aux_loss = self.num_experts * torch.sum(frac * gate.mean(0))
         
-        # 3. COMPUTE ROUTING
-        topk_probs, topk_indices = torch.topk(gate_probs, self.top_k, dim=-1)
-        topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-6)
+        info = (gate, topk_p, topk_i)
+        for w in self.backbone.stages[3].blocks:
+            if hasattr(w.block.mlp, 'forward'): w.block.mlp.current_routing_info = info
+            if hasattr(w.block.norm, 'forward'): w.block.norm.current_routing_weights = gate
         
-        fraction_routed = torch.zeros_like(gate_probs).scatter_(1, topk_indices, 1.0).mean(dim=0)
-        mean_probs = gate_probs.mean(dim=0)
-        self.aux_loss = self.num_experts * torch.sum(fraction_routed * mean_probs)
-        
-        mlp_routing_info = (gate_probs, topk_probs, topk_indices)
-        norm_routing_weights = gate_probs 
-
-        # 4. INJECT INTO BACKBONE
-        for wrapper in self.backbone.stages[3].blocks:
-            real_block = wrapper.block 
-            if hasattr(real_block.mlp, 'forward'):
-                real_block.mlp.current_routing_info = mlp_routing_info
-            if hasattr(real_block.norm, 'forward'):
-                real_block.norm.current_routing_weights = norm_routing_weights
-                
         if hasattr(self.backbone, 'norm') and isinstance(self.backbone.norm, ParallelMoELayerNorm):
-             self.backbone.norm.current_routing_weights = norm_routing_weights
-
-        # 5. BACKBONE FORWARD (Original Image)
+             self.backbone.norm.current_routing_weights = gate
+             
         return self.backbone(x)
 
 # ----------------------------
@@ -295,10 +264,10 @@ class IntegratedMoEModel(nn.Module):
 data_path = "/home/pai-ng/Jamal/CASIA-MS-ROI"
 
 print("Creating Training Dataset...")
-train_dataset = CASIA_MS_Dataset(data_path, train_domains, orig_transform, aug_transform, True)
-
+# Note: aug_transform passed here contains only standard augs. FFT happens in loop.
+train_dataset = CASIA_MS_Dataset(data_path, train_domains, orig_transform=orig_transform, aug_transform=aug_transform, is_train=True)
 print("Creating Test Dataset...")
-test_dataset  = CASIA_MS_Dataset(data_path, test_domains, orig_transform, is_train=False)
+test_dataset  = CASIA_MS_Dataset(data_path, test_domains, orig_transform=orig_transform, is_train=False)
 
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
 test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
@@ -317,53 +286,24 @@ for p in base_model.stages[3].parameters(): p.requires_grad = True
 
 stage_3_dim = 768
 
-# Helper Block
 class RoutedConvNeXtBlock(nn.Module):
     def __init__(self, original_block):
-        super().__init__()
-        self.block = original_block
+        super().__init__(); self.block = original_block
     def forward(self, x):
-        shortcut = x
-        x = self.block.conv_dw(x)
-        
+        shortcut = x; x = self.block.conv_dw(x)
         if self.block.use_conv_mlp:
-            # Conv MLP case
-            if isinstance(self.block.norm, ParallelMoELayerNorm):
-                x = self.block.norm(x, self.block.norm.current_routing_weights)
-            else:
-                x = self.block.norm(x)
-            
-            if isinstance(self.block.mlp, ConvNeXtParallelMoELoRA):
-                x = self.block.mlp(x, self.block.mlp.current_routing_info)
-            else:
-                x = self.block.mlp(x)
+            x = self.block.norm(x, self.block.norm.current_routing_weights) if isinstance(self.block.norm, ParallelMoELayerNorm) else self.block.norm(x)
+            x = self.block.mlp(x, self.block.mlp.current_routing_info) if isinstance(self.block.mlp, ConvNeXtParallelMoELoRA) else self.block.mlp(x)
         else:
-            # Standard MLP case (Permutation needed)
-            x = x.permute(0, 2, 3, 1) 
-            if isinstance(self.block.norm, ParallelMoELayerNorm):
-                x = self.block.norm(x, self.block.norm.current_routing_weights)
-            else:
-                x = self.block.norm(x)
-            
-            if isinstance(self.block.mlp, ConvNeXtParallelMoELoRA):
-                x = self.block.mlp(x, self.block.mlp.current_routing_info)
-            else:
-                x = self.block.mlp(x)
+            x = x.permute(0, 2, 3, 1)
+            x = self.block.norm(x, self.block.norm.current_routing_weights) if isinstance(self.block.norm, ParallelMoELayerNorm) else self.block.norm(x)
+            x = self.block.mlp(x, self.block.mlp.current_routing_info) if isinstance(self.block.mlp, ConvNeXtParallelMoELoRA) else self.block.mlp(x)
             x = x.permute(0, 3, 1, 2)
-                
         if self.block.gamma is not None: x = self.block.gamma * x
-        x = self.block.drop_path(x)
-        return x + shortcut
+        return self.block.drop_path(x) + shortcut
 
 for i, block in enumerate(base_model.stages[3].blocks):
-    if use_moe_mlp:
-        block.mlp = ConvNeXtParallelMoELoRA(block.mlp, stage_3_dim, num_experts, top_k, 8, 8, freeze_base_mlp).to(device)
-    
-    if use_moe_stage3_norm:
-        orig_shape = getattr(block.norm, 'normalized_shape', stage_3_dim)
-        eps = getattr(block.norm, 'eps', 1e-6)
-        block.norm = ParallelMoELayerNorm(block.norm, orig_shape, num_experts, eps, freeze_base_stage3_norm).to(device)
-        
+    if use_moe_mlp: block.mlp = ConvNeXtParallelMoELoRA(block.mlp, stage_3_dim, num_experts, top_k, 8, 8, freeze_base_mlp).to(device)
     base_model.stages[3].blocks[i] = RoutedConvNeXtBlock(block)
 
 if use_moe_final_norm and hasattr(base_model, 'norm'):
@@ -373,36 +313,29 @@ if use_moe_final_norm and hasattr(base_model, 'norm'):
 
 if use_global_scout:
     scout = GlobalDomainRouter(num_experts).to(device)
-    # This wrapper manages the toggling between Spectral and Normal scout internally
     model = IntegratedMoEModel(base_model, scout, num_experts, top_k, use_spectral_scout).to(device)
 else:
-    # Fallback if you disable global scout (though code relies on it now)
     model = base_model 
 
 class ProjectionHead(nn.Module):
     def __init__(self, dim_in, dim_out=128):
         super().__init__()
-        self.head = nn.Sequential(nn.Linear(dim_in, dim_in), nn.ReLU(inplace=True), nn.Linear(dim_in, dim_out))
+        self.head = nn.Sequential(nn.Linear(dim_in, dim_in), nn.ReLU(True), nn.Linear(dim_in, dim_out))
     def forward(self, x): return F.normalize(self.head(x), dim=1)
 
 class GradientReversal(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, alpha):
-        ctx.alpha = alpha
-        return x.view_as(x)
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output.neg() * ctx.alpha, None
+    @staticmethod 
+    def forward(ctx, x, alpha): ctx.alpha=alpha; return x.view_as(x)
+    @staticmethod 
+    def backward(ctx, grad_output): return grad_output.neg() * ctx.alpha, None
 
 class DomainClassifier(nn.Module):
     def __init__(self, dim_in, num_domains):
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(dim_in, dim_in // 2), nn.BatchNorm1d(dim_in // 2), nn.ReLU(True), nn.Linear(dim_in // 2, num_domains))
-    def forward(self, x, alpha):
-        return self.net(GradientReversal.apply(x, alpha))
+        self.net = nn.Sequential(nn.Linear(dim_in, dim_in//2), nn.BatchNorm1d(dim_in//2), nn.ReLU(True), nn.Linear(dim_in//2, num_domains))
+    def forward(self, x, alpha): return self.net(GradientReversal.apply(x, alpha))
 
 proj_head = ProjectionHead(embedding_dim).to(device)
-
 if use_grl:
     domain_classifier = DomainClassifier(embedding_dim, num_experts).to(device)
     criterion_domain = nn.CrossEntropyLoss().to(device)
@@ -425,23 +358,27 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, 
 # ----------------------------
 # 9. Training Loop
 # ----------------------------
-total_batches = len(train_loader) * epochs
-
 for epoch in range(epochs):
     model.train(); proj_head.train(); criterion_arc.train()
     if use_grl: domain_classifier.train()
-    
     train_loss = 0.0; train_correct = 0; total_train = 0
 
     for batch_idx, (img_orig, img_aug, y_i, y_d) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")):
         img_orig, img_aug = img_orig.to(device), img_aug.to(device)
         y_i, y_d = y_i.to(device), y_d.to(device)
 
+        # === FFT BATCH MIXUP (Label-Guided) ===
+        # We apply this to the Augmented images to make them "Hardest Negatives"
+        # 50% chance to replace standard augs with Amplitude Swapped version
+        if torch.rand(1) < 0.99:
+            # Swap amplitudes between different domains if possible
+            img_aug = label_guided_fft_mixup(img_aug, y_d, beta=0.15)
+
         optimizer.zero_grad()
         images_all = torch.cat([img_orig, img_aug], dim=0)
         y_d_all = torch.cat([y_d, y_d], dim=0)
 
-        # 1. Forward Pass (Scout decision happens inside model.forward)
+        # Forward
         embeddings_all = model(images_all)
         projections_all = proj_head(embeddings_all)
 
@@ -452,16 +389,15 @@ for epoch in range(epochs):
         labels_all = torch.cat([y_i, y_i], dim=0)
         loss_con = criterion_supcon(projections_all, labels_all)
         
-        # 2. GRL Loss
+        # GRL Loss
         loss_domain = 0.0
         if use_grl:
-            p = float(batch_idx + epoch * len(train_loader)) / total_batches
-            alpha_grl = 2. / (1. + np.exp(-25 * p)) - 1
+            p = float(batch_idx + epoch * len(train_loader)) / (len(train_loader) * epochs)
+            alpha_grl = 2. / (1. + np.exp(-10 * p)) - 1
             domain_logits = domain_classifier(embeddings_all, alpha_grl)
             loss_domain = criterion_domain(domain_logits, y_d_all)
         
-        # 3. Scout Supervision
-        # model.scout_logits is populated during the forward pass
+        # Scout Supervision
         norm_routing_loss = F.cross_entropy(model.scout_logits, y_d_all)
         aux_loss = model.aux_loss
         
