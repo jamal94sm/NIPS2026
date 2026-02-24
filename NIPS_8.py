@@ -37,7 +37,7 @@ use_grl = True
 
 # NEW: Global Scout Toggles
 use_global_scout = True     # Enable the External Scout Architecture
-use_spectral_scout = True   # True = Scout sees FFT Amplitude (Style); False = Scout sees RGB
+use_spectral_scout = False   # True = Scout sees FFT Amplitude (Style); False = Scout sees RGB
 
 freeze_base_mlp = True          
 freeze_base_stage3_norm = False 
