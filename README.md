@@ -9,3 +9,5 @@ NIPS_4.py: finetuning last stage of ConvNeXt foundation model with CASIS-MS-ROI 
 NIPS_5.py: Adding LoRA-MoE to the last stage (stage 3) of ConvNeXt foundation model and fine-tune the model on CASIS-MS-ROI using ArcFace, SupCon (supervised Contrastive), and GRL (cross-entropy) loss functions.
 
 NIPS_6.py: Adding LoRA-MoE to the last stage (stage 3) of ConvNeXt foundation model and fine-tune the model on CASIS-MS-ROI using ArcFace, SupCon (supervised Contrastive), and GRL (cross-entropy) loss functions. Then we freeze the whole model except the router (gating network) and perform test-time adaptation (TENT). 
+
+NIPS_7.py: Adding LoRA-MoE to the last stage (stage 3) of ConvNeXt foundation model and fine-tune the model on CASIS-MS-ROI using ArcFace, SupCon (supervised Contrastive), and GRL (cross-entropy) loss functions. There is a conflict between GRL and MoE. We use One-Way-Mirror technique to make a better cooperation between them and resolve network ossilation and convergence.  
