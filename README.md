@@ -20,5 +20,5 @@ NIPS_7.py:
 Adding LoRA-MoE to the last stage (stage 3) of ConvNeXt foundation model and fine-tune the model on CASIS-MS-ROI using ArcFace, SupCon (supervised Contrastive), and GRL (cross-entropy) loss functions. There is a conflict between GRL and MoE. We use the Scout model to make a better cooperation between them, and achieve a better performance and convergence.   
 
 NIPS_8.py: 
-Adding LoRA-MoE to the last stage (stage 3) of ConvNeXt foundation model and fine-tune the model on CASIS-MS-ROI using ArcFace, SupCon (supervised Contrastive), and GRL (cross-entropy) loss functions. We want to use FFT (amplitude/phase) transformation to learn a more general representation.  
+Adding LoRA-MoE to the last stage (stage 3) of ConvNeXt foundation model and fine-tune the model on CASIS-MS-ROI using ArcFace, SupCon (supervised Contrastive), and GRL (cross-entropy) loss functions. We want to use FFT-Swapping technique for augmentation along with general augmentations.  
 
