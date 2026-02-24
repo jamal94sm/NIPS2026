@@ -36,7 +36,7 @@ use_physics_aug = False
 use_fft_aug     = True       
 
 # --- ADVANCED TRAINING TOGGLES ---
-use_consistency_loss = True  # Set to True to use the new Smart Consistency
+use_consistency_loss = False  # Set to True to use the new Smart Consistency
 use_dynamic_beta     = True  # Random Box (1%-20%)
 
 # --- ARCHITECTURE TOGGLES ---
