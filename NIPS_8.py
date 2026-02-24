@@ -1,805 +1,496 @@
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import timm
 from torchvision import transforms
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-
-# ----------------------------
-# Device
-# ----------------------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-
-############################################ MOE
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Tuple, List
-
-# ----------------------------
-# LoRA Expert
-# ----------------------------
-class LoRAExpert(nn.Module):
-    """Single LoRA expert (same as before)"""
-    def __init__(self, dim, r=8, alpha=16, dropout=0.1):
-        super().__init__()
-        self.scaling = alpha / r
-        self.fc1 = nn.Linear(dim, r, bias=False)
-        self.fc2 = nn.Linear(r, dim, bias=False)
-        self.act = nn.GELU()
-        self.dropout = nn.Dropout(dropout)
-        nn.init.kaiming_uniform_(self.fc1.weight, a=5**0.5)
-        nn.init.zeros_(self.fc2.weight)
-
-    def forward(self, x):
-        return self.scaling * self.fc2(self.dropout(self.act(self.fc1(x))))
-
-# ----------------------------
-# Top-K Router / Gating Network
-# ----------------------------
-class GatingNetwork(nn.Module):
-    """Gating network for MoE"""
-    def __init__(self, input_dim: int, num_experts: int, top_k: int = 2):
-        super().__init__()
-        self.num_experts = num_experts
-        self.top_k = top_k
-        self.gate = nn.Linear(input_dim, num_experts)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # [batch, num_experts]
-        gate_logits = self.gate(x)
-        top_k_gates, top_k_indices = torch.topk(gate_logits, self.top_k, dim=-1)
-        top_k_gates = F.softmax(top_k_gates, dim=-1)
-        return top_k_gates, top_k_indices
-
-# ----------------------------
-# MoE-LoRA Adapter
-# ----------------------------
-class MoELoRA(nn.Module):
-    """Mixture-of-Experts LoRA adapter parallel to frozen MLP"""
-    def __init__(self, dim, num_experts=4, top_k=2, r=8, alpha=16):
-        super().__init__()
-        self.num_experts = num_experts
-        self.top_k = top_k
-
-        # Create multiple LoRA experts
-        self.experts = nn.ModuleList([LoRAExpert(dim, r, alpha) for _ in range(num_experts)])
-        self.router = GatingNetwork(dim, num_experts, top_k)
-
-    def forward(self, x):
-        # x: [batch, seq_len, dim] or [batch, dim]
-        orig_shape = x.shape
-        if x.dim() == 3:
-            # flatten batch and seq for routing: [B*S, D]
-            x_flat = x.reshape(-1, x.shape[-1])
-        else:
-            x_flat = x
-
-        # Router -> top-k gates and indices
-        top_k_gates, top_k_indices = self.router(x_flat)  # [B*S, top_k], [B*S, top_k]
-
-        # Accumulate expert outputs
-        expert_out = torch.zeros_like(x_flat)
-        for i in range(self.top_k):
-            idx = top_k_indices[:, i]  # [B*S]
-            g = top_k_gates[:, i].unsqueeze(-1)  # [B*S, 1]
-
-            # select corresponding experts
-            expert_outputs = torch.stack([self.experts[j](x_flat) for j in range(self.num_experts)], dim=0)  # [num_experts, B*S, D]
-            selected = expert_outputs[idx, torch.arange(x_flat.shape[0]), :]  # [B*S, D]
-
-            expert_out += g * selected
-
-        # restore original shape
-        expert_out = expert_out.view(*orig_shape)
-        return expert_out
-
-# ----------------------------
-# MLP + MoE-LoRA block
-# ----------------------------
-class MLPWithMoELoRA(nn.Module):
-    """Frozen MLP + parallel MoE LoRA"""
-    def __init__(self, mlp, dim, num_experts=4, top_k=2, r=8, alpha=16):
-        super().__init__()
-        self.mlp = mlp
-        self.moe = MoELoRA(dim, num_experts, top_k, r, alpha)
-        # Freeze original MLP
-        for p in self.mlp.parameters():
-            p.requires_grad = False
-
-    def forward(self, x):
-        return self.mlp(x) + self.moe(x)
-
-# ----------------------------
-# Replace ViT block with MoE-LoRA
-# ----------------------------
-class ViTBlockWithMoELoRA(nn.Module):
-    """ViT block with frozen attention and MLP + MoE-LoRA"""
-    def __init__(self, block, r=8, alpha=16, num_experts=4, top_k=2):
-        super().__init__()
-        self.norm1 = block.norm1
-        self.attn = block.attn
-        self.norm2 = block.norm2
-        for p in self.attn.parameters():
-            p.requires_grad = False
-
-        dim = block.attn.qkv.in_features
-        self.mlp = MLPWithMoELoRA(block.mlp, dim, num_experts, top_k, r, alpha)
-
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-
-# --------------------------------------------------
-# Embedding Model Wrapper
-# --------------------------------------------------
-class ViTEmbeddingModel(nn.Module):
-    def __init__(self, backbone, embed_dim=512):
-        super().__init__()
-        self.backbone = backbone
-        self.backbone.reset_classifier(0)  # remove classification head
-        self.embedding = nn.Linear(backbone.num_features, embed_dim)
-
-    def forward(self, x):
-        x = self.backbone(x)
-        x = self.embedding(x)
-        return x
-
-
-
-
-
-########################################### DATA
 import os
 import numpy as np
 from PIL import Image
-import cv2
+from pytorch_metric_learning import losses
 
-import torch
-from torch.utils.data import Dataset, DataLoader, Subset
+# ----------------------------
+# 1. Configuration
+# ----------------------------
+batch_size = 32   
+margin = 0.3
+scale = 16
+lr = 1e-3
+weight_decay = 1e-4
+epochs = 100
+lamb = 0.2           # Weight for SupCon Loss
+aux_weight = 0.2     # Weight for MoE MLP Load Balancing Loss
+norm_weight = 1.0    # HIGH: The Scout acts as the "General" for the network.
 
-import mediapipe as mp
+### Architectural Toggles
+num_experts = 3
+top_k = 2
 
+# MASTER TOGGLES
+use_moe_mlp = True          
+use_moe_stage3_norm = False 
+use_moe_final_norm = False  
 
+use_grl = True              
+
+# NEW: Global Scout Toggles
+use_global_scout = True     # Enable the External Scout Architecture
+use_spectral_scout = True   # True = Scout sees FFT Amplitude (Style); False = Scout sees RGB
+
+freeze_base_mlp = True          
+freeze_base_stage3_norm = False 
+freeze_base_final_norm = False  
+
+# Choose domains by NAME
+train_domains = ["460", "WHT", "700"]   
+test_domains  = ["850"]          
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ----------------------------
+# 2. Transforms
+# ----------------------------
+orig_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+aug_transform = transforms.Compose([
+    transforms.RandomResizedCrop(size=224, scale=(0.9, 1.0), ratio=(0.95, 1.05)),
+    transforms.RandomAffine(degrees=10, translate=(0.05, 0.05)),
+    transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0, hue=0),
+    transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.2),
+    transforms.RandomApply([transforms.RandomAdjustSharpness(sharpness_factor=2.0)], p=0.2),
+    transforms.RandomApply([transforms.RandomAutocontrast()], p=0.2),
+    transforms.ToTensor(),
+])
+
+# ----------------------------
+# 3. Dataset Class
+# ----------------------------
 class CASIA_MS_Dataset(Dataset):
-    def __init__(self, data_path):
+    def __init__(self, data_path, target_domains, orig_transform=None, aug_transform=None, is_train=True):
         self.samples = []
         self.hand_id_map = {}
-        self.domain_map = {}
-
+        self.domain_map = {d: i for i, d in enumerate(target_domains)}
+        
+        self.orig_transform = orig_transform
+        self.aug_transform = aug_transform
+        self.is_train = is_train
+        
         hand_id_counter = 0
-        domain_counter = 0
 
         for root, _, files in os.walk(data_path):
+            files.sort()
             for fname in files:
-                if not fname.lower().endswith(".jpg"):
-                    continue
-
-                # Expected format: ID_{l|r}_{spectrum}_{iteration}.jpg
+                if not fname.lower().endswith(".jpg"): continue
                 parts = fname[:-4].split("_")
-                if len(parts) != 4:
-                    continue
-
+                if len(parts) != 4: continue
                 subject_id, hand, spectrum, iteration = parts
-                hand_id = f"{subject_id}_{hand}"
+                if spectrum not in target_domains: continue
 
+                hand_id = f"{subject_id}_{hand}"
                 if hand_id not in self.hand_id_map:
                     self.hand_id_map[hand_id] = hand_id_counter
                     hand_id_counter += 1
-
-                if spectrum not in self.domain_map:
-                    self.domain_map[spectrum] = domain_counter
-                    domain_counter += 1
-
+                
                 img_path = os.path.join(root, fname)
-                self.samples.append(
-                    (img_path,
-                     self.hand_id_map[hand_id],   # y_i (ID label)
-                     self.domain_map[spectrum])   # y_d (domain)
-                )
-
-        # MediaPipe initialized ONCE
-        self.mp_hands = mp.solutions.hands.Hands(
-            static_image_mode=True,
-            max_num_hands=1,
-            min_detection_confidence=0.5
-        )
+                y_d = self.domain_map[spectrum]
+                self.samples.append((img_path, self.hand_id_map[hand_id], y_d))
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         img_path, y_i, y_d = self.samples[idx]
-
-        # Load image
         img = Image.open(img_path).convert("RGB")
-        img_np = np.array(img)
+        
+        if self.orig_transform:
+            img_orig = self.orig_transform(img)
+        else:
+            img_orig = transforms.Resize((224, 224))(img)
+            img_orig = transforms.ToTensor()(img_orig)
 
-        # Resize AFTER ROI extraction
-        img_np = cv2.resize(img_np, (224,224), interpolation=cv2.INTER_LINEAR)
+        if self.is_train and self.aug_transform:
+            img_aug = self.aug_transform(img)
+            return img_orig, img_aug, y_i, y_d
+        
+        return img_orig, y_i, y_d
 
-        img = torch.tensor(
-            img_np, dtype=torch.float32
-        ).permute(2, 0, 1) / 255.0
+# ----------------------------
+# 4. Custom Modules & Scout
+# ----------------------------
 
-        return img, y_i, y_d
+# --- NEW: Spectral Splitter (For Spectral Scout) ---
+class SpectralPreprocess(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        # 1. FFT
+        fft = torch.fft.fft2(x, dim=(-2, -1))
+        # 2. Extract Amplitude (Style)
+        amp = torch.abs(fft)
+        # 3. Reconstruct Image from Amplitude only (Phase = 0)
+        # This creates a "Texture Map" without lines/geometry
+        fft_amp_only = amp * torch.exp(1j * torch.zeros_like(fft))
+        x_amp = torch.fft.ifft2(fft_amp_only, dim=(-2, -1)).real
+        return F.instance_norm(x_amp) # Normalize for stability
 
-
-# ================================
-# Dataset
-# ================================
-data_path = "CASIA-MS-ROI"
-dataset = CASIA_MS_Dataset(data_path)
-
-num_classes = len(dataset.hand_id_map)
-num_domains = len(dataset.domain_map)
-
-print("Total samples:", len(dataset))
-print("Hand ID classes:", num_classes)
-print("Domains:", dataset.domain_map)
-
-# ================================
-# Cross-Domain Split Configuration
-# ================================
-
-# Choose domains by NAME: 460, 630, 700, WHT, 850, 940
-train_domains = ["WHT", "460"]   # training spectra
-test_domains  = ["700"]          # unseen test spectrum
-
-# Reverse domain map: id → name
-inv_domain_map = {v: k for k, v in dataset.domain_map.items()}
-
-train_indices = []
-test_indices = []
-
-for idx, (_, _, y_d) in enumerate(dataset.samples):
-    domain_name = inv_domain_map[y_d]
-
-    if domain_name in train_domains:
-        train_indices.append(idx)
-    elif domain_name in test_domains:
-        test_indices.append(idx)
-
-# ================================
-# Subsets
-# ================================
-train_dataset = Subset(dataset, train_indices)
-test_dataset  = Subset(dataset, test_indices)
-
-print("Train samples:", len(train_dataset))
-print("Test samples:", len(test_dataset))
-
-# ================================
-# DataLoaders
-# ================================
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=32,
-    shuffle=True,
-    num_workers=2,
-    pin_memory=True
-)
-
-test_loader = DataLoader(
-    test_dataset,
-    batch_size=32,
-    shuffle=False,
-    num_workers=2,
-    pin_memory=True
-)
-
-# ================================
-# Sanity Check
-# ================================
-images, y_i, y_d = next(iter(train_loader))
-
-# Verify domain separation
-train_domains_seen = set(inv_domain_map[d.item()] for d in y_d)
-print("Domains seen in train batch:", train_domains_seen)
-
-
-images, y_i, y_d = next(iter(test_loader))
-
-# Verify domain separation
-test_domains_seen = set(inv_domain_map[d.item()] for d in y_d)
-print("Domains seen in test batch:", test_domains_seen)
-
-
-
-
-
-
-
-################################################ MODELS
-
-import torch
-import timm
-from fvcore.nn import FlopCountAnalysis, parameter_count_table
-
-class CustomCNN160(nn.Module):
-    def __init__(self, input_channels=3):
-        super(CustomCNN160, self).__init__()
-
-        # --- Feature Extraction ---
+# --- NEW: Global Scout CNN ---
+class GlobalDomainRouter(nn.Module):
+    def __init__(self, num_domains=3):
+        super().__init__()
         self.features = nn.Sequential(
-            # Output: 16 x 40 x 40 -> MaxPool: 16 x 39 x 39
-            nn.Conv2d(input_channels, 16, kernel_size=3, stride=4, padding=1),
-            nn.LeakyReLU(negative_slope=0.01),
-            nn.MaxPool2d(kernel_size=2, stride=1),
-
-            # Output: 32 x 19 x 19 -> MaxPool: 32 x 18 x 18
-            nn.Conv2d(16, 32, kernel_size=5, stride=2, padding=2),
-            nn.LeakyReLU(negative_slope=0.01),
-            nn.MaxPool2d(kernel_size=2, stride=1),
-
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(negative_slope=0.01),
-
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(negative_slope=0.01),
-            # Output: 128 x 18 x 18 -> MaxPool: 128 x 17 x 17
-            nn.MaxPool2d(kernel_size=2, stride=1)
+            nn.Conv2d(3, 16, kernel_size=7, stride=4, padding=3),
+            nn.BatchNorm2d(16), nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(32), nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten()
         )
-
-        # --- Fully Connected Layers ---
-        self.flatten = nn.Flatten()
-
-        # Calculation: 128 * 17 * 17 = 36992
-        self.classifier = nn.Sequential(
-            nn.Linear(41472, 1024),
-            nn.LeakyReLU(negative_slope=0.01),
-            nn.Linear(1024, 512),
-            nn.LeakyReLU(negative_slope=0.01),
-            nn.Linear(512, 128)
-        )
+        self.classifier = nn.Linear(32, num_domains)
 
     def forward(self, x):
-        x = self.features(x)
-        x = self.flatten(x)
-        x = self.classifier(x)
-        return x
+        return self.classifier(self.features(x))
 
-
-
-
-# --------------------------------------------------
-# 1. Standard Attention Class
-# --------------------------------------------------
-class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=True):
+# --- UPDATED: Parallel MoE LayerNorm (External Routing) ---
+class ParallelMoELayerNorm(nn.Module):
+    def __init__(self, orig_norm: nn.Module, normalized_shape, num_domains=3, eps=1e-6, freeze_base=True):
         super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
+        self.orig_norm = orig_norm
+        self.num_domains = num_domains
+        
+        if freeze_base:
+            for p in self.orig_norm.parameters(): p.requires_grad = False
+        else:
+            for p in self.orig_norm.parameters(): p.requires_grad = True
+                
+        self.norms = nn.ModuleList([nn.LayerNorm(normalized_shape, eps=eps) for _ in range(num_domains)])
+        for norm in self.norms:
+            nn.init.zeros_(norm.weight); nn.init.zeros_(norm.bias)   
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.proj = nn.Linear(dim, dim)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        return x
-
-# --------------------------------------------------
-# 2. Normal ViT Block (Standard)
-# --------------------------------------------------
-class TimmStyleBlock(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=3.0):
+    def forward(self, x, routing_weights):
+        # routing_weights passed from Scout [Batch, Num_Experts]
+        orig_out = self.orig_norm(x)
+        moe_out = 0
+        for i in range(self.num_domains):
+            w_i = routing_weights[:, i]
+            if x.dim() == 4:
+                w_i = w_i.view(-1, 1, 1, 1) 
+            else:
+                w_i = w_i.view(-1, 1)       
+            moe_out += w_i * self.norms[i](x)
+        return orig_out + moe_out
+        
+class VectorizedLoRAExperts(nn.Module):
+    def __init__(self, dim: int, num_experts: int, r: int = 8, alpha: int = 8):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = Attention(dim, num_heads=num_heads)
-        self.norm2 = nn.LayerNorm(dim)
+        self.scaling = alpha / r
+        self.w_down = nn.Parameter(torch.randn(num_experts, dim, r) * (1 / dim**0.5))
+        self.w_up = nn.Parameter(torch.zeros(num_experts, r, dim))
+        self.act = nn.GELU()
 
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, mlp_hidden_dim),
-            nn.GELU(),
-            nn.Linear(mlp_hidden_dim, dim)
-        )
+    def forward(self, x: torch.Tensor, expert_idx: int) -> torch.Tensor:
+        down = torch.matmul(x, self.w_down[expert_idx])
+        act = self.act(down)
+        up = torch.matmul(act, self.w_up[expert_idx])
+        return up * self.scaling
 
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-class CustomViTBackbone(nn.Module):
-    def __init__(self, img_size=160, patch_size=16, in_chans=3,
-                 embed_dim=64, depth=6, num_heads=8, mlp_ratio=3.0):
+# --- UPDATED: ConvNeXt MoE (External Routing) ---
+class ConvNeXtParallelMoELoRA(nn.Module):
+    def __init__(self, orig_mlp: nn.Module, dim: int, num_experts: int = 3, top_k: int = 2, r: int = 8, alpha: int = 8, freeze_base: bool = True):
         super().__init__()
+        self.orig_mlp = orig_mlp
+        self.num_experts = num_experts
+        self.top_k = top_k
+        
+        if freeze_base:
+            for p in self.orig_mlp.parameters(): p.requires_grad = False
+        else:
+            for p in self.orig_mlp.parameters(): p.requires_grad = True
+                
+        # NO INTERNAL ROUTER
+        self.experts = VectorizedLoRAExperts(dim, num_experts, r, alpha)
 
-        # ADD THIS LINE:
-        self.embed_dim = embed_dim
+    def forward(self, x: torch.Tensor, routing_info) -> torch.Tensor:
+        # Unpack global routing decision
+        gate_probs, topk_probs, topk_indices = routing_info
+        
+        orig_out = self.orig_mlp(x)
+        orig_shape = x.shape
+        x_flat = x.view(-1, orig_shape[-1]) 
+        
+        moe_out = torch.zeros_like(x_flat)
+        for i in range(self.num_experts):
+            token_indices, k_indices = torch.where(topk_indices == i)
+            if len(token_indices) == 0: continue
+            
+            tokens = x_flat[token_indices]
+            expert_output = self.experts(tokens, i)
+            weights = topk_probs[token_indices, k_indices].unsqueeze(-1)
+            moe_out[token_indices] += expert_output * weights
+            
+        moe_out = moe_out.view(*orig_shape)
+        return orig_out + moe_out
 
-        self.patch_embed = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-        num_patches = (img_size // patch_size) ** 2
-
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
-
-        self.blocks = nn.ModuleList([
-            TimmStyleBlock(embed_dim, num_heads, mlp_ratio)
-            for _ in range(depth)
-        ])
-
-        self.norm = nn.LayerNorm(embed_dim)
-
-    def forward(self, x):
-        x = self.patch_embed(x).flatten(2).transpose(1, 2)
-        cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-        x = x + self.pos_embed
-        for block in self.blocks:
-            x = block(x)
-        x = self.norm(x)
-        return x[:, 0]
-
-
-class ViTEmbeddingModel(nn.Module):
-    def __init__(self, backbone, embed_dim=512):
+# ----------------------------
+# 5. Integrated Model Wrapper (The Brain)
+# ----------------------------
+class IntegratedMoEModel(nn.Module):
+    def __init__(self, backbone, scout, num_experts, top_k, use_spectral_scout=False):
         super().__init__()
         self.backbone = backbone
-        # We use the embed_dim (64) we defined in our CustomViTBackbone
-        # No need for reset_classifier because we built it without a head
-        self.embedding = nn.Linear(backbone.embed_dim, embed_dim)
+        self.scout = scout
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.use_spectral_scout = use_spectral_scout
+        
+        if self.use_spectral_scout:
+            self.spectral_split = SpectralPreprocess()
+            
+        self.aux_loss = 0.0
+        self.scout_logits = None 
 
     def forward(self, x):
-        # Backbone returns the [B, 64] CLS token embedding
-        x = self.backbone(x)
-        # Project it to [B, 512] for ArcFace
-        x = self.embedding(x)
-        return x
+        # 1. PREPARE SCOUT INPUT
+        if self.use_spectral_scout:
+            scout_input = self.spectral_split(x) # Amplitude Only
+        else:
+            scout_input = x # Raw RGB
+            
+        # 2. SCOUT DECISION
+        self.scout_logits = self.scout(scout_input)
+        gate_probs = F.softmax(self.scout_logits, dim=-1)
+        
+        # 3. COMPUTE ROUTING
+        topk_probs, topk_indices = torch.topk(gate_probs, self.top_k, dim=-1)
+        topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-6)
+        
+        fraction_routed = torch.zeros_like(gate_probs).scatter_(1, topk_indices, 1.0).mean(dim=0)
+        mean_probs = gate_probs.mean(dim=0)
+        self.aux_loss = self.num_experts * torch.sum(fraction_routed * mean_probs)
+        
+        mlp_routing_info = (gate_probs, topk_probs, topk_indices)
+        norm_routing_weights = gate_probs 
 
+        # 4. INJECT INTO BACKBONE
+        for wrapper in self.backbone.stages[3].blocks:
+            real_block = wrapper.block 
+            if hasattr(real_block.mlp, 'forward'):
+                real_block.mlp.current_routing_info = mlp_routing_info
+            if hasattr(real_block.norm, 'forward'):
+                real_block.norm.current_routing_weights = norm_routing_weights
+                
+        if hasattr(self.backbone, 'norm') and isinstance(self.backbone.norm, ParallelMoELayerNorm):
+             self.backbone.norm.current_routing_weights = norm_routing_weights
 
-
-# --- Analysis Cell ---
-model = CustomViTBackbone()
-model.eval()
-
-dummy_input = torch.randn(1, 3, 160, 160)
-flops = FlopCountAnalysis(model, dummy_input)
-param_table = parameter_count_table(model, max_depth=2)
-
-print(f"--- Standard ViT Backbone Analysis (160x160) ---")
-print(f"Total Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.4f} Million")
-print(f"Inference Cost:   {flops.total() / 1e9:.4f} GFLOPs")
-#print(f"Output Shape:     {model(dummy_input).shape}") # Should be [1, 64]
-#print("\nDetailed Breakdown:")
-#print(param_table)
-
-"""# **Main**"""
-
-pip install pytorch_metric_learning
+        # 5. BACKBONE FORWARD (Original Image)
+        return self.backbone(x)
 
 # ----------------------------
-# Main Script for Custom ViT + MoE-LoRA + ArcFace
+# 6. Data Loading 
 # ----------------------------
+data_path = "/home/pai-ng/Jamal/CASIA-MS-ROI"
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import timm
-from tqdm import tqdm
-import torch.nn.functional as F
-from pytorch_metric_learning.losses import ArcFaceLoss
+print("Creating Training Dataset...")
+train_dataset = CASIA_MS_Dataset(data_path, train_domains, orig_transform, aug_transform, True)
 
+print("Creating Test Dataset...")
+test_dataset  = CASIA_MS_Dataset(data_path, test_domains, orig_transform, is_train=False)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
+test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
-# ================================
-# Backbone: DeiT + MoE-LoRA
-# ================================
-# 21M params, inference cost ? GFLOPs ---> deit_small_patch16_224
-# 5M params, inference cost ? GFLOPs ---> deit_tiny_patch16_224
-# 0.9M params, inference cost ? GFLOPs ---> test_vit3.r160_in1k
-# inference cost 0.0885 GFLOPs ---> test_vit2.r160_in1k
-# 0.4M params, inference cost 0.03 GFLOPs (less than baseline's CNN model) ---> test_vit.r160_in1k
+print(f"Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
 
-backbone = timm.create_model(
-    "deit_tiny_patch16_224",
-    pretrained=True,
-    num_classes=0
-)
+# ----------------------------
+# 7. Model Setup 
+# ----------------------------
+print("Loading ConvNeXt V2-Tiny...")
+base_model = timm.create_model('convnextv2_tiny', pretrained=True, num_classes=0).to(device)
+embedding_dim = base_model.num_features 
 
-# Freeze backbone
-for p in backbone.parameters():
-    p.requires_grad = False
+for p in base_model.parameters(): p.requires_grad = False
+for p in base_model.stages[3].parameters(): p.requires_grad = True
 
-# Replace blocks with MoE-LoRA
-for i, block in enumerate(backbone.blocks):
-    backbone.blocks[i] = ViTBlockWithMoELoRA(
-        block,
-        r=8,
-        alpha=16,
-        num_experts=4,
-        top_k=2
-    )
+stage_3_dim = 768
 
-# ================================
-# Embedding Model
-# ================================
-embedding_dim = 512
-model = ViTEmbeddingModel(backbone, embed_dim=embedding_dim).to(device)
+# Helper Block
+class RoutedConvNeXtBlock(nn.Module):
+    def __init__(self, original_block):
+        super().__init__()
+        self.block = original_block
+    def forward(self, x):
+        shortcut = x
+        x = self.block.conv_dw(x)
+        
+        if self.block.use_conv_mlp:
+            # Conv MLP case
+            if isinstance(self.block.norm, ParallelMoELayerNorm):
+                x = self.block.norm(x, self.block.norm.current_routing_weights)
+            else:
+                x = self.block.norm(x)
+            
+            if isinstance(self.block.mlp, ConvNeXtParallelMoELoRA):
+                x = self.block.mlp(x, self.block.mlp.current_routing_info)
+            else:
+                x = self.block.mlp(x)
+        else:
+            # Standard MLP case (Permutation needed)
+            x = x.permute(0, 2, 3, 1) 
+            if isinstance(self.block.norm, ParallelMoELayerNorm):
+                x = self.block.norm(x, self.block.norm.current_routing_weights)
+            else:
+                x = self.block.norm(x)
+            
+            if isinstance(self.block.mlp, ConvNeXtParallelMoELoRA):
+                x = self.block.mlp(x, self.block.mlp.current_routing_info)
+            else:
+                x = self.block.mlp(x)
+            x = x.permute(0, 3, 1, 2)
+                
+        if self.block.gamma is not None: x = self.block.gamma * x
+        x = self.block.drop_path(x)
+        return x + shortcut
 
+for i, block in enumerate(base_model.stages[3].blocks):
+    if use_moe_mlp:
+        block.mlp = ConvNeXtParallelMoELoRA(block.mlp, stage_3_dim, num_experts, top_k, 8, 8, freeze_base_mlp).to(device)
+    
+    if use_moe_stage3_norm:
+        orig_shape = getattr(block.norm, 'normalized_shape', stage_3_dim)
+        eps = getattr(block.norm, 'eps', 1e-6)
+        block.norm = ParallelMoELayerNorm(block.norm, orig_shape, num_experts, eps, freeze_base_stage3_norm).to(device)
+        
+    base_model.stages[3].blocks[i] = RoutedConvNeXtBlock(block)
 
-# ================================
-# 5. ArcFace Loss & Optimizer
-# ================================
-num_classes = 200
-criterion = ArcFaceLoss(
-    num_classes=num_classes,
-    embedding_size=embedding_dim,
-    margin=0.3,
-    scale=16
-).to(device)
+if use_moe_final_norm and hasattr(base_model, 'norm'):
+    orig_shape = getattr(base_model.norm, 'normalized_shape', embedding_dim)
+    eps = getattr(base_model.norm, 'eps', 1e-6)
+    base_model.norm = ParallelMoELayerNorm(base_model.norm, orig_shape, num_experts, eps, freeze_base_final_norm).to(device)
 
-optimizer = optim.AdamW(
-    list(model.parameters()) + list(criterion.parameters()),
-    lr=1e-3,
-    weight_decay=1e-3
-)
+if use_global_scout:
+    scout = GlobalDomainRouter(num_experts).to(device)
+    # This wrapper manages the toggling between Spectral and Normal scout internally
+    model = IntegratedMoEModel(base_model, scout, num_experts, top_k, use_spectral_scout).to(device)
+else:
+    # Fallback if you disable global scout (though code relies on it now)
+    model = base_model 
 
-# ================================
-# 6. Training + Evaluation Loop
-# ================================
-epochs = 50
+class ProjectionHead(nn.Module):
+    def __init__(self, dim_in, dim_out=128):
+        super().__init__()
+        self.head = nn.Sequential(nn.Linear(dim_in, dim_in), nn.ReLU(inplace=True), nn.Linear(dim_in, dim_out))
+    def forward(self, x): return F.normalize(self.head(x), dim=1)
+
+class GradientReversal(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.alpha, None
+
+class DomainClassifier(nn.Module):
+    def __init__(self, dim_in, num_domains):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(dim_in, dim_in // 2), nn.BatchNorm1d(dim_in // 2), nn.ReLU(True), nn.Linear(dim_in // 2, num_domains))
+    def forward(self, x, alpha):
+        return self.net(GradientReversal.apply(x, alpha))
+
+proj_head = ProjectionHead(embedding_dim).to(device)
+
+if use_grl:
+    domain_classifier = DomainClassifier(embedding_dim, num_experts).to(device)
+    criterion_domain = nn.CrossEntropyLoss().to(device)
+else:
+    domain_classifier = None; criterion_domain = None
+
+# ----------------------------
+# 8. Losses & Optimizer
+# ----------------------------
+num_classes = len(train_dataset.hand_id_map)
+criterion_arc = losses.ArcFaceLoss(num_classes=num_classes, embedding_size=embedding_dim, margin=margin, scale=scale).to(device)
+criterion_supcon = losses.SupConLoss(temperature=0.1).to(device)
+
+all_params = list(model.parameters()) + list(criterion_arc.parameters()) + list(proj_head.parameters())
+if use_grl: all_params += list(domain_classifier.parameters())
+
+optimizer = optim.AdamW(all_params, lr=lr, weight_decay=weight_decay)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
+
+# ----------------------------
+# 9. Training Loop
+# ----------------------------
+total_batches = len(train_loader) * epochs
+
 for epoch in range(epochs):
-    # -------- Training --------
-    model.train()
-    train_loss, train_correct, total_train = 0.0, 0, 0
+    model.train(); proj_head.train(); criterion_arc.train()
+    if use_grl: domain_classifier.train()
+    
+    train_loss = 0.0; train_correct = 0; total_train = 0
 
-    # FIXED: Added the third value '_' for unpacking
-    for images, y_i, _ in tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]"):
-        images, y_i = images.to(device), y_i.to(device)
+    for batch_idx, (img_orig, img_aug, y_i, y_d) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")):
+        img_orig, img_aug = img_orig.to(device), img_aug.to(device)
+        y_i, y_d = y_i.to(device), y_d.to(device)
 
         optimizer.zero_grad()
-        embeddings = model(images)
-        loss = criterion(embeddings, y_i)
+        images_all = torch.cat([img_orig, img_aug], dim=0)
+        y_d_all = torch.cat([y_d, y_d], dim=0)
+
+        # 1. Forward Pass (Scout decision happens inside model.forward)
+        embeddings_all = model(images_all)
+        projections_all = proj_head(embeddings_all)
+
+        batch_size_curr = img_orig.size(0)
+        emb_orig = embeddings_all[:batch_size_curr]
+
+        loss_arc = criterion_arc(emb_orig, y_i)
+        labels_all = torch.cat([y_i, y_i], dim=0)
+        loss_con = criterion_supcon(projections_all, labels_all)
+        
+        # 2. GRL Loss
+        loss_domain = 0.0
+        if use_grl:
+            p = float(batch_idx + epoch * len(train_loader)) / total_batches
+            alpha_grl = 2. / (1. + np.exp(-25 * p)) - 1
+            domain_logits = domain_classifier(embeddings_all, alpha_grl)
+            loss_domain = criterion_domain(domain_logits, y_d_all)
+        
+        # 3. Scout Supervision
+        # model.scout_logits is populated during the forward pass
+        norm_routing_loss = F.cross_entropy(model.scout_logits, y_d_all)
+        aux_loss = model.aux_loss
+        
+        loss = loss_arc + (lamb * loss_con) + loss_domain + (aux_weight * aux_loss) + (norm_weight * norm_routing_loss)
+        
         loss.backward()
         optimizer.step()
 
         train_loss += loss.item()
-        preds = criterion.get_logits(embeddings).argmax(dim=1)
+        preds = criterion_arc.get_logits(emb_orig).argmax(dim=1)
         train_correct += (preds == y_i).sum().item()
-        total_train += y_i.size(0)
+        total_train += batch_size_curr
 
     # -------- Evaluation --------
-    model.eval()
-    test_loss, test_correct, total_test = 0.0, 0, 0
+    model.eval(); criterion_arc.eval()
+    test_loss = 0.0; test_correct = 0; total_test = 0
+    
     with torch.no_grad():
-        for images, y_i, _ in tqdm(test_loader, desc=f"Epoch {epoch+1} [Test]"):
-            images, y_i = images.to(device), y_i.to(device)
-            embeddings = model(images)
-            loss = criterion(embeddings, y_i)
+        for img_orig, y_i, y_d in tqdm(test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test] "):
+            img_orig, y_i = img_orig.to(device), y_i.to(device)
+            embeddings = model(img_orig)
+            loss = criterion_arc(embeddings, y_i)
             test_loss += loss.item()
-            preds = criterion.get_logits(embeddings).argmax(dim=1)
+            preds = criterion_arc.get_logits(embeddings).argmax(dim=1)
             test_correct += (preds == y_i).sum().item()
             total_test += y_i.size(0)
 
-    print(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {train_loss/len(train_loader):.4f} Acc: {train_correct/total_train:.4f} | Test Acc: {test_correct/total_test:.4f}")
-
-# ----------------------------
-# Main Script for Custom ViT + MoE-LoRA + ArcFace
-# ----------------------------
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import timm
-from tqdm import tqdm
-import torch.nn.functional as F
-from pytorch_metric_learning.losses import ArcFaceLoss
-
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Model Setup (Ensure these classes are defined above)
-backbone = CustomViTBackbone(embed_dim=64)
-for i, block in enumerate(backbone.blocks):
-    backbone.blocks[i] = ViTBlockWithMoELoRA(block, num_experts=4, top_k=2)
-
-model = ViTEmbeddingModel(backbone, embed_dim=512).to(device)
-
-# Enable gradients for everything
-for p in model.parameters():
-    p.requires_grad = True
-
-
-
-# ================================
-# 5. ArcFace Loss & Optimizer
-# ================================
-num_classes = 200
-criterion = ArcFaceLoss(
-    num_classes=num_classes,
-    embedding_size=embedding_dim,
-    margin=0.3,
-    scale=16
-).to(device)
-
-optimizer = optim.AdamW(
-    list(model.parameters()) + list(criterion.parameters()),
-    lr=50e-3,
-    weight_decay=1e-3
-)
-
-# ================================
-# 6. Training + Evaluation Loop
-# ================================
-epochs = 50
-for epoch in range(epochs):
-    # -------- Training --------
-    model.train()
-    train_loss, train_correct, total_train = 0.0, 0, 0
-
-    # FIXED: Added the third value '_' for unpacking
-    for images, y_i, _ in tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]"):
-        images, y_i = images.to(device), y_i.to(device)
-
-        optimizer.zero_grad()
-        embeddings = model(images)
-        loss = criterion(embeddings, y_i)
-        loss.backward()
-        optimizer.step()
-
-        train_loss += loss.item()
-        preds = criterion.get_logits(embeddings).argmax(dim=1)
-        train_correct += (preds == y_i).sum().item()
-        total_train += y_i.size(0)
-
-    # -------- Evaluation --------
-    model.eval()
-    test_loss, test_correct, total_test = 0.0, 0, 0
-    with torch.no_grad():
-        for images, y_i, _ in tqdm(test_loader, desc=f"Epoch {epoch+1} [Test]"):
-            images, y_i = images.to(device), y_i.to(device)
-            embeddings = model(images)
-            loss = criterion(embeddings, y_i)
-            test_loss += loss.item()
-            preds = criterion.get_logits(embeddings).argmax(dim=1)
-            test_correct += (preds == y_i).sum().item()
-            total_test += y_i.size(0)
-
-    print(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {train_loss/len(train_loader):.4f} Acc: {train_correct/total_train:.4f} | Test Acc: {test_correct/total_test:.4f}")
-
-import os
-
-def save_model_to_drive(model, save_path, filename="palmprint_moe_vit_roi_42.pth"):
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
-
-    full_path = os.path.join(save_path, filename)
-
-    # Save the weights (state_dict)
-    # Moving to CPU before saving is a best practice for compatibility
-    torch.save(model.state_dict(), full_path)
-    print(f"✅ Model weights successfully saved to: {full_path}")
-
-# Usage:
-DRIVE_PATH = '/content/drive/MyDrive/SIT_Palmprint_Project'
-save_model_to_drive(model, DRIVE_PATH)
-
-def load_moe_vit_model(checkpoint_path, device, num_experts=4, top_k=2):
-    # 1. Rebuild the exact same architecture
-    backbone = timm.create_model(
-    "test_vit2.r160_in1k",
-    pretrained=True,
-    num_classes=0
-    )
-    for i, block in enumerate(backbone.blocks):
-        backbone.blocks[i] = ViTBlockWithMoELoRA(
-            block,
-            r=8,
-            alpha=16,
-            num_experts=num_experts,
-            top_k=top_k
-        )
-
-    # 2. Wrap and move to device
-    model = ViTEmbeddingModel(backbone, embed_dim=512).to(device)
-
-    # 3. Load the weights
-    if os.path.exists(checkpoint_path):
-        # map_location=device handles the CPU -> GPU transfer if needed
-        state_dict = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(state_dict, strict=True)
-        print("✅ Weights loaded and architecture matched successfully.")
-    else:
-        raise FileNotFoundError(f"No checkpoint found at {checkpoint_path}")
-
-    return model
-
-# Usage for TTA:
-CHECKPOINT = os.path.join(DRIVE_PATH, 'palmprint_moe_vit_roi_42.pth')
-model = load_moe_vit_model(CHECKPOINT, device, num_experts=4, top_k=2)
-
-# --------------------------------------------------------------------------------
-# Test-Time Adaptation (Episodic Entropy Minimization)
-# --------------------------------------------------------------------------------
-print("\nStarting Global TTA Evaluation...")
-
-# 1. Create a CPU backup for episodic reset
-# Since 'model' is already loaded via load_moe_vit_model, we clone its current state.
-cpu_reset_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-
-# 2. Freeze all parameters except MoE Experts/Routers
-for p in model.parameters():
-    p.requires_grad = False
-
-for name, p in model.named_parameters():
-    if any(k in name.lower() for k in ["lora", "expert", "gate", "router"]):
-        p.requires_grad = True
-
-total_baseline_acc = 0.0
-total_tta_acc = 0.0
-num_batches = len(test_loader)
-
-# 3. Iterate through all batches
-for images, labels, _ in tqdm(test_loader, desc="TTA on Test Set"):
-    images, labels = images.to(device), labels.to(device)
-
-    # --- Step A: Episodic Reset ---
-    # Return to the clean, trained state for every new batch
-    model.load_state_dict(cpu_reset_state)
-
-    # --- Step B: Baseline Check (Before TTA) ---
-    model.eval()
-    with torch.no_grad():
-        embeddings = model(images)
-        logits = criterion.get_logits(embeddings)
-        baseline_batch_acc = (logits.argmax(dim=1) == labels).float().mean().item()
-        total_baseline_acc += baseline_batch_acc
-
-    # --- Step C: Perform TTA (Entropy Minimization) ---
-    # Optimizer specifically for MoE/LoRA parameters
-    tta_optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
-
-    model.train()
-    for _ in range(20): # 20 steps based on your BS=32 observations
-        tta_optimizer.zero_grad()
-        embeddings = model(images)
-        logits = criterion.get_logits(embeddings)
-        probs = F.softmax(logits, dim=1)
-
-        # Entropy loss calculation: -sum(p * log(p))
-        entropy_loss = -torch.sum(probs * torch.log(probs + 1e-6), dim=1).mean()
-        entropy_loss.backward()
-        tta_optimizer.step()
-
-    # --- Step D: Inference (After TTA) ---
-    model.eval()
-    with torch.no_grad():
-        embeddings = model(images)
-        logits = criterion.get_logits(embeddings)
-        tta_batch_acc = (logits.argmax(dim=1) == labels).float().mean().item()
-        total_tta_acc += tta_batch_acc
-
-# 4. Final Results Summary
-final_baseline = total_baseline_acc / num_batches
-final_tta = total_tta_acc / num_batches
-
-print("\n" + "="*40)
-print(f"FINAL TTA RESULTS ({num_batches} Batches)")
-print(f"Average Baseline Acc: {final_baseline:.4f}")
-print(f"Average TTA Acc:      {final_tta:.4f}")
-print(f"Absolute Improvement: {final_tta - final_baseline:.4f}")
-print("="*40)
-
-
-# if steps = 20, for BS=32 (4-5%), BS = 16 (3-4%), BS = 8 (2-3%), BS = 4 (1.5-2), BS = 1 (0)
-
-# if BS=32, for steps = 1 (1% improvement), 3 (1.5%), 5 (2%), 10 (3.5-4%), 20 (4-5%), 30 (4-5%)
+    print(f"Epoch [{epoch+1}/{epochs}] Summary:")
+    print(f"  -> Train | Loss: {train_loss/len(train_loader):.4f} | Acc: {train_correct/total_train:.4f}")
+    print(f"  -> Test  | Loss: {test_loss/len(test_loader):.4f} | Acc: {test_correct/total_test:.4f}")
+    print("-" * 50)
+    scheduler.step()
