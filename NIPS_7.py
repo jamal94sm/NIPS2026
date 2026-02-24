@@ -30,10 +30,15 @@ top_k = 2
 
 # MASTER TOGGLES
 use_moe_mlp = True          # Enable MoE-LoRA in MLPs
-use_moe_stage3_norm = False  # Disable MoE-Norm in Stage 3
+use_moe_stage3_norm = True  # Enable MoE-Norm in Stage 3
 use_moe_final_norm = False  # Disable final MoE-Norm (Let GRL handle global invariance)
 
 use_grl = True              # Enable Gradient Reversal Layer
+
+# NEW: The One-Way Mirror Toggle
+# True  = Detach router input (Cooperation: GRL owns backbone, MoE adapts)
+# False = Normal router input (Conflict: GRL and MoE fight for gradients)
+use_one_way_mirror = False   
 
 freeze_base_mlp = True          
 freeze_base_stage3_norm = False 
@@ -118,14 +123,15 @@ class CASIA_MS_Dataset(Dataset):
         return img_orig, y_i, y_d
 
 # ----------------------------
-# 3. Custom Modules (One-Way Mirror Implemented)
+# 3. Custom Modules 
 # ----------------------------
 class ParallelMoELayerNorm(nn.Module):
-    def __init__(self, orig_norm: nn.Module, normalized_shape, num_domains=3, eps=1e-6, freeze_base=True):
+    def __init__(self, orig_norm: nn.Module, normalized_shape, num_domains=3, eps=1e-6, freeze_base=True, use_one_way_mirror=True):
         super().__init__()
         self.orig_norm = orig_norm
         self.num_domains = num_domains
         self.freeze_base = freeze_base
+        self.use_one_way_mirror = use_one_way_mirror # Store the toggle
         
         if self.freeze_base:
             for p in self.orig_norm.parameters(): p.requires_grad = False
@@ -148,8 +154,13 @@ class ParallelMoELayerNorm(nn.Module):
         else:
             x_pooled = x                  
 
-        # ONE-WAY MIRROR: Detach input to router
-        self.router_logits = self.router(x_pooled.detach()) #########################################################################
+        # CONDITIONAL ONE-WAY MIRROR
+        if self.use_one_way_mirror:
+            router_input = x_pooled.detach()
+        else:
+            router_input = x_pooled
+
+        self.router_logits = self.router(router_input) 
         weights = F.softmax(self.router_logits, dim=-1) 
 
         moe_out = 0
@@ -178,12 +189,13 @@ class VectorizedLoRAExperts(nn.Module):
         return up * self.scaling
 
 class ConvNeXtParallelMoELoRA(nn.Module):
-    def __init__(self, orig_mlp: nn.Module, dim: int, num_experts: int = 3, top_k: int = 2, r: int = 8, alpha: int = 8, freeze_base: bool = True):
+    def __init__(self, orig_mlp: nn.Module, dim: int, num_experts: int = 3, top_k: int = 2, r: int = 8, alpha: int = 8, freeze_base: bool = True, use_one_way_mirror=True):
         super().__init__()
         self.orig_mlp = orig_mlp
         self.num_experts = num_experts
         self.top_k = top_k
         self.freeze_base = freeze_base
+        self.use_one_way_mirror = use_one_way_mirror # Store the toggle
         
         if self.freeze_base:
             for p in self.orig_mlp.parameters(): p.requires_grad = False
@@ -199,8 +211,13 @@ class ConvNeXtParallelMoELoRA(nn.Module):
         orig_shape = x.shape
         x_flat = x.view(-1, orig_shape[-1]) 
         
-        # ONE-WAY MIRROR: Detach input to router
-        gate_logits = self.router(x_flat.detach()) #########################################################################
+        # CONDITIONAL ONE-WAY MIRROR
+        if self.use_one_way_mirror:
+            router_input = x_flat.detach()
+        else:
+            router_input = x_flat
+        
+        gate_logits = self.router(router_input)
         gate_probs = F.softmax(gate_logits, dim=-1)
         
         topk_probs, topk_indices = torch.topk(gate_probs, self.top_k, dim=-1)
@@ -253,14 +270,30 @@ for p in model.stages[3].parameters(): p.requires_grad = True
 stage_3_dim = 768
 for block in model.stages[3].blocks:
     if use_moe_mlp:
-        block.mlp = ConvNeXtParallelMoELoRA(orig_mlp=block.mlp, dim=stage_3_dim, num_experts=num_experts, top_k=top_k, r=8, alpha=8, freeze_base=freeze_base_mlp).to(device)
+        block.mlp = ConvNeXtParallelMoELoRA(
+            orig_mlp=block.mlp, 
+            dim=stage_3_dim, 
+            num_experts=num_experts, 
+            top_k=top_k, 
+            r=8, 
+            alpha=8, 
+            freeze_base=freeze_base_mlp,
+            use_one_way_mirror=use_one_way_mirror # Passing Toggle
+        ).to(device)
     else:
         for p in block.mlp.parameters(): p.requires_grad = not freeze_base_mlp
     
     if use_moe_stage3_norm and hasattr(block, 'norm'):
         orig_shape = getattr(block.norm, 'normalized_shape', stage_3_dim)
         eps = getattr(block.norm, 'eps', 1e-6)
-        block.norm = ParallelMoELayerNorm(orig_norm=block.norm, normalized_shape=orig_shape, num_domains=num_experts, eps=eps, freeze_base=freeze_base_stage3_norm).to(device)
+        block.norm = ParallelMoELayerNorm(
+            orig_norm=block.norm, 
+            normalized_shape=orig_shape, 
+            num_domains=num_experts, 
+            eps=eps, 
+            freeze_base=freeze_base_stage3_norm,
+            use_one_way_mirror=use_one_way_mirror # Passing Toggle
+        ).to(device)
     elif hasattr(block, 'norm'):
         for p in block.norm.parameters(): p.requires_grad = not freeze_base_stage3_norm
 
@@ -268,7 +301,14 @@ if hasattr(model, 'norm'):
     if use_moe_final_norm:
         orig_shape = getattr(model.norm, 'normalized_shape', embedding_dim)
         eps = getattr(model.norm, 'eps', 1e-6)
-        model.norm = ParallelMoELayerNorm(orig_norm=model.norm, normalized_shape=orig_shape, num_domains=num_experts, eps=eps, freeze_base=freeze_base_final_norm).to(device)
+        model.norm = ParallelMoELayerNorm(
+            orig_norm=model.norm, 
+            normalized_shape=orig_shape, 
+            num_domains=num_experts, 
+            eps=eps, 
+            freeze_base=freeze_base_final_norm,
+            use_one_way_mirror=use_one_way_mirror # Passing Toggle
+        ).to(device)
     else:
         for p in model.norm.parameters(): p.requires_grad = not freeze_base_final_norm
 
