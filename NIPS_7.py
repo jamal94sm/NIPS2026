@@ -244,11 +244,15 @@ class IntegratedMoEModel(nn.Module):
         norm_routing_weights = gate_probs 
 
         # 3. DISTRIBUTE DECISIONS TO BLOCKS
-        for block in self.backbone.stages[3].blocks:
-            if hasattr(block.mlp, 'forward'):
-                block.mlp.current_routing_info = mlp_routing_info
-            if hasattr(block.norm, 'forward'):
-                block.norm.current_routing_weights = norm_routing_weights
+        # FIX: We iterate over the wrapper list, so 'block' is a RoutedConvNeXtBlock
+        for wrapper in self.backbone.stages[3].blocks:
+            # We must access the internal block, not the wrapper
+            real_block = wrapper.block 
+            
+            if hasattr(real_block.mlp, 'forward'):
+                real_block.mlp.current_routing_info = mlp_routing_info
+            if hasattr(real_block.norm, 'forward'):
+                real_block.norm.current_routing_weights = norm_routing_weights
                 
         if hasattr(self.backbone, 'norm') and isinstance(self.backbone.norm, ParallelMoELayerNorm):
              self.backbone.norm.current_routing_weights = norm_routing_weights
@@ -256,7 +260,7 @@ class IntegratedMoEModel(nn.Module):
         return self.backbone(x)
 
 # ----------------------------
-# 6. Data Loading (RESTORED HERE)
+# 6. Data Loading
 # ----------------------------
 data_path = "/home/pai-ng/Jamal/CASIA-MS-ROI"
 
@@ -295,6 +299,7 @@ class RoutedConvNeXtBlock(nn.Module):
             x = self.block.norm(x)
             x = self.block.mlp(x)
         else:
+            # Look for routing info stored on the module
             if isinstance(self.block.norm, ParallelMoELayerNorm):
                 x = self.block.norm(x, self.block.norm.current_routing_weights)
             else:
@@ -361,7 +366,7 @@ else:
 # ----------------------------
 # 8. Losses & Optimizer
 # ----------------------------
-num_classes = len(train_dataset.hand_id_map) # Now this works because train_dataset exists!
+num_classes = len(train_dataset.hand_id_map)
 criterion_arc = losses.ArcFaceLoss(num_classes=num_classes, embedding_size=embedding_dim, margin=margin, scale=scale).to(device)
 criterion_supcon = losses.SupConLoss(temperature=0.1).to(device)
 
@@ -409,7 +414,7 @@ for epoch in range(epochs):
             domain_logits = domain_classifier(embeddings_all, alpha_grl)
             loss_domain = criterion_domain(domain_logits, y_d_all)
         
-        # 3. Scout Supervision (Critical: We explicitly train the scout)
+        # 3. Scout Supervision
         norm_routing_loss = F.cross_entropy(model.scout_logits, y_d_all)
         aux_loss = model.aux_loss
         
