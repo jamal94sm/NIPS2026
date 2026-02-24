@@ -288,6 +288,10 @@ class IntegratedMoEModel(nn.Module):
 # ----------------------------
 # 5. Data Loading & Setup
 # ----------------------------
+
+data_path = "/home/pai-ng/Jamal/CASIA-MS-ROI"  # <--- DEFINED HERE BEFORE DATASET CREATION
+
+
 print("Creating Training Dataset...")
 train_dataset = CASIA_MS_Dataset(data_path, train_domains, is_train=True)
 print("Creating Test Dataset...")
