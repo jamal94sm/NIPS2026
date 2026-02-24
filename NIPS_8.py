@@ -8,11 +8,12 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import os
 import numpy as np
-from PIL import Image
+import random
+from PIL import Image, ImageFilter, ImageEnhance
 from pytorch_metric_learning import losses
 
 # ----------------------------
-# 1. Configuration
+# 1. Configuration & Toggles
 # ----------------------------
 batch_size = 32   
 margin = 0.3
@@ -20,109 +21,119 @@ scale = 16
 lr = 1e-3
 weight_decay = 1e-4
 epochs = 100
-lamb = 0.2           # Weight for SupCon Loss
-aux_weight = 0.2     # Weight for MoE MLP Load Balancing Loss
-norm_weight = 1.0    # HIGH: The Scout acts as the "General" for the network.
+lamb = 0.2           
+aux_weight = 0.2     
+norm_weight = 1.0    
 
-### Architectural Toggles
+# --- AUGMENTATION TOGGLES ---
+use_general_aug = False      # Standard (Blur, Jitter, Sharpness)
+use_physics_aug = True       # Smart (Visible <-> NIR Simulation). Overrides General.
+use_fft_aug     = True       # Frequency Swapping. XORs with Spatial Aug in loop.
+
+# --- ARCHITECTURE TOGGLES ---
 num_experts = 3
 top_k = 2
-
-# MASTER TOGGLES
 use_moe_mlp = True          
 use_moe_stage3_norm = False 
 use_moe_final_norm = False  
 use_grl = True              
-
 use_global_scout = True     
-use_spectral_scout = False  # RGB is more stable for the Scout
+use_spectral_scout = False  
 
 freeze_base_mlp = True          
 freeze_base_stage3_norm = False 
 freeze_base_final_norm = False  
 
-# Choose domains by NAME
+# DOMAINS
 train_domains = ["460", "WHT", "700"]   
 test_domains  = ["850"]          
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ----------------------------
-# 2. Transforms (Standard + FFT Plan)
+# 2. Augmentation Logic (Physics & General)
 # ----------------------------
-orig_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-])
 
-# The "General" Augmentations you requested
-aug_transform = transforms.Compose([
-    transforms.RandomResizedCrop(size=224, scale=(0.9, 1.0), ratio=(0.95, 1.05)),
-    transforms.RandomAffine(degrees=10, translate=(0.05, 0.05)),
+# A. Physics-Based Simulation (Context-Aware)
+def simulate_spectrum_shift(img, current_nm, target_nm_type):
+    """
+    Simulates shifting the image style based on wavelength distance.
+    """
+    if target_nm_type == 'NIR': # Simulate Dark/Blurry NIR
+        blur_strength = 0.0
+        if current_nm in ["460", "WHT", "480"]: blur_strength = 1.5
+        elif current_nm == "530": blur_strength = 1.2
+        elif current_nm == "630": blur_strength = 0.8
+        elif current_nm == "700": blur_strength = 0.4
+        
+        img = ImageEnhance.Brightness(img).enhance(random.uniform(0.6, 0.9))
+        img = ImageEnhance.Contrast(img).enhance(random.uniform(0.7, 0.9))
+        if blur_strength > 0:
+            img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.1, blur_strength)))
+            
+    elif target_nm_type == 'VIS': # Simulate Bright/Sharp Visible
+        sharp_strength = 0.0
+        if current_nm == "940": sharp_strength = 3.0
+        elif current_nm == "850": sharp_strength = 2.0
+        
+        img = ImageEnhance.Brightness(img).enhance(random.uniform(1.2, 1.5))
+        if sharp_strength > 0:
+            img = ImageEnhance.Sharpness(img).enhance(random.uniform(1.0, sharp_strength))
+            
+    return img
+
+# B. General Augmentation (Blind)
+general_photometric_aug = transforms.Compose([
     transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0, hue=0),
     transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.2),
     transforms.RandomApply([transforms.RandomAdjustSharpness(sharpness_factor=2.0)], p=0.2),
     transforms.RandomApply([transforms.RandomAutocontrast()], p=0.2),
-    transforms.ToTensor(),
 ])
 
-# ----------------------------
-# 3. FFT Batch Mixer (The Swapping Mechanism)
-# ----------------------------
+# C. Geometric Augmentation (Always Applied)
+geometric_aug = transforms.Compose([
+    transforms.RandomResizedCrop(size=224, scale=(0.9, 1.0), ratio=(0.95, 1.05)),
+    transforms.RandomAffine(degrees=10, translate=(0.05, 0.05)),
+])
+
+# D. FFT Batch Mixer (GPU)
 def label_guided_fft_mixup(x, labels, beta=0.15):
-    """
-    Swaps low-freq amplitude between images in the batch.
-    It sorts the batch by label to maximize cross-domain swapping.
-    """
     B, C, H, W = x.shape
-    
-    # 1. FFT to Frequency Domain
     fft = torch.fft.fft2(x, dim=(-2, -1))
-    amp = torch.abs(fft)
-    pha = torch.angle(fft)
-    
-    # 2. Shift to center (Low Frequencies)
+    amp, pha = torch.abs(fft), torch.angle(fft)
     amp_shifted = torch.fft.fftshift(amp, dim=(-2, -1))
     
-    # 3. Target Selection (Label-Guided Sorting)
-    # We sort by label, then roll by B/2. 
-    # This pairs Domain A images with Domain B images (if batch is balanced).
+    # Sort by label and roll to pair different domains
     sorted_idx = torch.argsort(labels)
     roll_amount = B // 2
     target_indices = torch.roll(sorted_idx, shifts=roll_amount, dims=0)
     
-    # Get the "Style" (Amplitude) from the target images
     amp_shifted_trg = amp_shifted[target_indices]
     
-    # 4. Swap Low Frequencies (The "Style" Box)
     b = int(np.floor(np.amin((H, W)) * beta))
     c_h, c_w = int(np.floor(H / 2.0)), int(np.floor(W / 2.0))
-    
-    # Replace Source Low-Freqs with Target Low-Freqs
     amp_shifted[..., c_h-b:c_h+b, c_w-b:c_w+b] = amp_shifted_trg[..., c_h-b:c_h+b, c_w-b:c_w+b]
     
-    # 5. Inverse FFT
     amp_mixed = torch.fft.ifftshift(amp_shifted, dim=(-2, -1))
-    fft_new = amp_mixed * torch.exp(1j * pha) # New Amp + Original Phase
-    x_aug = torch.fft.ifft2(fft_new, dim=(-2, -1)).real
-    
+    x_aug = torch.fft.ifft2(amp_mixed * torch.exp(1j * pha), dim=(-2, -1)).real
     return torch.clamp(x_aug, 0, 1)
 
 # ----------------------------
-# 4. Dataset Class
+# 3. Dataset Class (Smart Switching)
 # ----------------------------
 class CASIA_MS_Dataset(Dataset):
-    def __init__(self, data_path, target_domains, orig_transform=None, aug_transform=None, is_train=True):
+    def __init__(self, data_path, target_domains, is_train=True):
         self.samples = []
         self.hand_id_map = {}
         self.domain_map = {d: i for i, d in enumerate(target_domains)}
-        
-        self.orig_transform = orig_transform
-        self.aug_transform = aug_transform # Standard Augs
         self.is_train = is_train
         
+        # Base Transforms
+        self.to_tensor = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
+        self.geometric = geometric_aug
+        self.general = general_photometric_aug
+        
         hand_id_counter = 0
-
         for root, _, files in os.walk(data_path):
             files.sort()
             for fname in files:
@@ -136,34 +147,47 @@ class CASIA_MS_Dataset(Dataset):
                 if hand_id not in self.hand_id_map:
                     self.hand_id_map[hand_id] = hand_id_counter
                     hand_id_counter += 1
-                
                 img_path = os.path.join(root, fname)
                 y_d = self.domain_map[spectrum]
-                self.samples.append((img_path, self.hand_id_map[hand_id], y_d))
+                self.samples.append((img_path, self.hand_id_map[hand_id], y_d, spectrum))
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        img_path, y_i, y_d = self.samples[idx]
+        img_path, y_i, y_d, spectrum = self.samples[idx]
         img = Image.open(img_path).convert("RGB")
         
-        # 1. Clean
-        if self.orig_transform:
-            img_orig = self.orig_transform(img)
-        else:
-            img_orig = transforms.Resize((224, 224))(img)
-            img_orig = transforms.ToTensor()(img_orig)
+        # 1. Clean Image (Always returned for GRL)
+        img_orig = self.to_tensor(img)
 
-        # 2. Augmented (Standard Spatial Augs)
-        if self.is_train and self.aug_transform:
-            img_aug = self.aug_transform(img)
+        # 2. Augmented Image (Logic Switching)
+        if self.is_train:
+            # Step A: Geometry (Always applied first)
+            img_aug_pil = self.geometric(img)
+            
+            # Step B: Photometric Choice
+            if use_physics_aug:
+                # Context-Aware Simulation
+                if random.random() < 0.5:
+                    if spectrum in ["460", "530", "630", "700", "WHT", "480"]:
+                        img_aug_pil = simulate_spectrum_shift(img_aug_pil, spectrum, 'NIR')
+                    elif spectrum in ["850", "940"]:
+                        img_aug_pil = simulate_spectrum_shift(img_aug_pil, spectrum, 'VIS')
+                        
+            elif use_general_aug:
+                # Blind Standard Augmentation
+                img_aug_pil = self.general(img_aug_pil)
+            
+            # (If both False, we just return Geometric Aug)
+            
+            img_aug = self.to_tensor(img_aug_pil)
             return img_orig, img_aug, y_i, y_d
         
         return img_orig, y_i, y_d
 
 # ----------------------------
-# 5. Modules & Scout
+# 4. Modules & Scout (Condensed)
 # ----------------------------
 class SpectralPreprocess(nn.Module):
     def __init__(self): super().__init__()
@@ -259,24 +283,18 @@ class IntegratedMoEModel(nn.Module):
         return self.backbone(x)
 
 # ----------------------------
-# 6. Data Loading 
+# 5. Data Loading & Setup
 # ----------------------------
-data_path = "/home/pai-ng/Jamal/CASIA-MS-ROI"
-
 print("Creating Training Dataset...")
-# Note: aug_transform passed here contains only standard augs. FFT happens in loop.
-train_dataset = CASIA_MS_Dataset(data_path, train_domains, orig_transform=orig_transform, aug_transform=aug_transform, is_train=True)
+train_dataset = CASIA_MS_Dataset(data_path, train_domains, is_train=True)
 print("Creating Test Dataset...")
-test_dataset  = CASIA_MS_Dataset(data_path, test_domains, orig_transform=orig_transform, is_train=False)
+test_dataset  = CASIA_MS_Dataset(data_path, test_domains, is_train=False)
 
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
 test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
 print(f"Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
 
-# ----------------------------
-# 7. Model Setup 
-# ----------------------------
 print("Loading ConvNeXt V2-Tiny...")
 base_model = timm.create_model('convnextv2_tiny', pretrained=True, num_classes=0).to(device)
 embedding_dim = base_model.num_features 
@@ -343,7 +361,7 @@ else:
     domain_classifier = None; criterion_domain = None
 
 # ----------------------------
-# 8. Losses & Optimizer
+# 6. Losses & Optimizer
 # ----------------------------
 num_classes = len(train_dataset.hand_id_map)
 criterion_arc = losses.ArcFaceLoss(num_classes=num_classes, embedding_size=embedding_dim, margin=margin, scale=scale).to(device)
@@ -356,77 +374,83 @@ optimizer = optim.AdamW(all_params, lr=lr, weight_decay=weight_decay)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
 
 # ----------------------------
-# 9. Training Loop
+# 7. Training Loop (XOR Logic)
 # ----------------------------
+print("Starting Training...")
 for epoch in range(epochs):
     model.train(); proj_head.train(); criterion_arc.train()
     if use_grl: domain_classifier.train()
     train_loss = 0.0; train_correct = 0; total_train = 0
 
-    for batch_idx, (img_orig, img_aug, y_i, y_d) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")):
-        img_orig, img_aug = img_orig.to(device), img_aug.to(device)
-        y_i, y_d = y_i.to(device), y_d.to(device)
+    for batch_idx, (img_orig, img_spatial, y_i, y_d) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")):
+        img_orig = img_orig.to(device)
+        img_spatial = img_spatial.to(device) # Can be General or Physics based on toggle
+        y_i = y_i.to(device)
+        y_d = y_d.to(device)
 
-        # === FFT BATCH MIXUP (Label-Guided) ===
-        # We apply this to the Augmented images to make them "Hardest Negatives"
-        # 50% chance to replace standard augs with Amplitude Swapped version
-        if torch.rand(1) < 0.99:
-            # Swap amplitudes between different domains if possible
-            img_aug = label_guided_fft_mixup(img_aug, y_d, beta=0.15)
+        # === THE XOR SWITCH ===
+        # Use FFT Aug? (Only if enabled and random chance hits)
+        if use_fft_aug and torch.rand(1) < 0.5:
+            # Replaces Spatial Aug for this batch
+            # We derive it from CLEAN image to ensure pure spectral mixing
+            img_aug = label_guided_fft_mixup(img_orig, y_d, beta=0.15)
+        else:
+            # Use the Spatial Aug from DataLoader (Physics or General)
+            img_aug = img_spatial
 
         optimizer.zero_grad()
+        
+        # 1. Forward Clean + Selected Aug
         images_all = torch.cat([img_orig, img_aug], dim=0)
+        y_i_all = torch.cat([y_i, y_i], dim=0)
         y_d_all = torch.cat([y_d, y_d], dim=0)
 
-        # Forward
         embeddings_all = model(images_all)
         projections_all = proj_head(embeddings_all)
 
-        batch_size_curr = img_orig.size(0)
-        emb_orig = embeddings_all[:batch_size_curr]
+        # 2. Split for GRL Protection
+        batch_curr = img_orig.size(0)
+        emb_orig = embeddings_all[:batch_curr]  # Clean
+        emb_aug  = embeddings_all[batch_curr:]  # Distorted
 
-        loss_arc = criterion_arc(emb_orig, y_i)
-        labels_all = torch.cat([y_i, y_i], dim=0)
-        loss_con = criterion_supcon(projections_all, labels_all)
+        # 3. ArcFace & SupCon (Train on All)
+        loss_arc = criterion_arc(embeddings_all, y_i_all)
+        loss_con = criterion_supcon(projections_all, y_i_all)
         
-        # GRL Loss
+        # 4. GRL Loss (Protected - Clean Only)
         loss_domain = 0.0
         if use_grl:
             p = float(batch_idx + epoch * len(train_loader)) / (len(train_loader) * epochs)
             alpha_grl = 2. / (1. + np.exp(-10 * p)) - 1
-            domain_logits = domain_classifier(embeddings_all, alpha_grl)
-            loss_domain = criterion_domain(domain_logits, y_d_all)
+            domain_pred = domain_classifier(emb_orig, alpha_grl)
+            loss_domain = criterion_domain(domain_pred, y_d)
         
-        # Scout Supervision
+        # 5. Scout Supervision
         norm_routing_loss = F.cross_entropy(model.scout_logits, y_d_all)
-        aux_loss = model.aux_loss
         
-        loss = loss_arc + (lamb * loss_con) + loss_domain + (aux_weight * aux_loss) + (norm_weight * norm_routing_loss)
+        loss = loss_arc + (lamb * loss_con) + loss_domain + (aux_weight * model.aux_loss) + (norm_weight * norm_routing_loss)
         
         loss.backward()
         optimizer.step()
 
         train_loss += loss.item()
-        preds = criterion_arc.get_logits(emb_orig).argmax(dim=1)
-        train_correct += (preds == y_i).sum().item()
-        total_train += batch_size_curr
+        preds = criterion_arc.get_logits(embeddings_all).argmax(dim=1)
+        train_correct += (preds == y_i_all).sum().item()
+        total_train += images_all.size(0)
 
     # -------- Evaluation --------
     model.eval(); criterion_arc.eval()
-    test_loss = 0.0; test_correct = 0; total_test = 0
-    
+    test_correct = 0; total_test = 0
     with torch.no_grad():
-        for img_orig, y_i, y_d in tqdm(test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test] "):
+        for img_orig, y_i, y_d in tqdm(test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test]"):
             img_orig, y_i = img_orig.to(device), y_i.to(device)
             embeddings = model(img_orig)
-            loss = criterion_arc(embeddings, y_i)
-            test_loss += loss.item()
             preds = criterion_arc.get_logits(embeddings).argmax(dim=1)
             test_correct += (preds == y_i).sum().item()
             total_test += y_i.size(0)
 
     print(f"Epoch [{epoch+1}/{epochs}] Summary:")
     print(f"  -> Train | Loss: {train_loss/len(train_loader):.4f} | Acc: {train_correct/total_train:.4f}")
-    print(f"  -> Test  | Loss: {test_loss/len(test_loader):.4f} | Acc: {test_correct/total_test:.4f}")
+    print(f"  -> Test  | Acc: {test_correct/total_test:.4f}")
     print("-" * 50)
     scheduler.step()
