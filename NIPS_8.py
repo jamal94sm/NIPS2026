@@ -32,7 +32,7 @@ use_physics_aug = False
 use_fft_aug     = True       
 
 # --- NEW: ADVANCED TRAINING TOGGLES ---
-use_consistency_loss = True  # Enable JSD Loss between Clean and Aug views
+use_consistency_loss = False  # Enable JSD Loss between Clean and Aug views
 use_dynamic_beta     = True  # True = Random Box (1%-20%); False = Fixed Box (15%)
 
 # --- ARCHITECTURE TOGGLES ---
