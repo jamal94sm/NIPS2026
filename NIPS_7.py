@@ -30,7 +30,7 @@ top_k = 2
 
 # MASTER TOGGLES
 use_moe_mlp = True          # Enable MoE-LoRA in MLPs
-use_moe_stage3_norm = True  # Enable MoE-Norm in Stage 3
+use_moe_stage3_norm = False  # Enable MoE-Norm in Stage 3
 use_moe_final_norm = False  # Disable final MoE-Norm (Let GRL handle global invariance)
 
 use_grl = True              # Enable Gradient Reversal Layer
