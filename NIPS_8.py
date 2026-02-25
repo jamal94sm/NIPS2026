@@ -26,7 +26,7 @@ aux_weight = 0.2     # MoE Balance Weight
 norm_weight = 1.0    # Scout Weight (Only used if Global Scout is ON)
 
 # --- EXPANSION MODE ---
-augmentation_expansion_mode = '2x' 
+augmentation_expansion_mode = '4x' 
 
 # --- VISIBILITY TOGGLE ---
 use_aug_only_for_supcon = False 
