@@ -25,30 +25,21 @@ lamb = 0.2           # SupCon Weight
 aux_weight = 0.2     # MoE Balance Weight
 norm_weight = 1.0    # Scout Weight
 
-# --- SMART CONSISTENCY CONFIG ---
-consistency_max_weight = 1.0  # Max weight after ramp-up
-consistency_ramp_epochs = 10   # Wait 5 epochs before starting
-confidence_threshold = 0.8    # Only enforce if Teacher is 70% sure
-
 # --- AUGMENTATION TOGGLES ---
 use_general_aug = True      
 use_physics_aug = False       
 use_fft_aug     = True       
 
 # --- ADVANCED TRAINING TOGGLES ---
-use_consistency_loss = False  # Set to True to enable the new Feature Consistency
-use_dynamic_beta     = True   # Random Box (1%-20%)
+use_dynamic_beta = True   # Random Box (1%-20%)
 
 # --- ARCHITECTURE TOGGLES ---
 num_experts = 3
 top_k = 2
-
 use_moe_mlp = True          
 use_moe_stage3_norm = False 
-use_moe_final_norm = False
-
-use_grl = True  
-
+use_moe_final_norm = False  
+use_grl = True              
 use_global_scout = True     
 use_spectral_scout = False  
 
@@ -56,8 +47,8 @@ freeze_base_mlp = True
 freeze_base_stage3_norm = False 
 freeze_base_final_norm = False  
 
-train_domains = ["460", "630"]   
-test_domains  = ["940"]          
+train_domains = ["460", "WHT", "700"]   
+test_domains  = ["850"]          
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -106,9 +97,9 @@ def label_guided_fft_mixup(x, labels):
     amp_shifted_trg = amp_shifted[target_indices]
     
     if use_dynamic_beta:
-        beta = np.random.uniform(0.01, 0.20)
+        beta = np.random.uniform(0.01, 0.20) # Dynamic
     else:
-        beta = 0.15
+        beta = 0.15 # Fixed
     
     b = int(np.floor(np.amin((H, W)) * beta))
     c_h, c_w = int(np.floor(H / 2.0)), int(np.floor(W / 2.0))
@@ -348,15 +339,11 @@ else:
     domain_classifier = None; criterion_domain = None
 
 # ----------------------------
-# 6. Losses (Updated)
+# 6. Losses & Optimizer
 # ----------------------------
 num_classes = len(train_dataset.hand_id_map)
 criterion_arc = losses.ArcFaceLoss(num_classes=num_classes, embedding_size=embedding_dim, margin=margin, scale=scale).to(device)
 criterion_supcon = losses.SupConLoss(temperature=0.1).to(device)
-
-# UPDATED: Cosine Feature Consistency
-# We use reduction='none' so we can apply the confidence mask later
-criterion_feature_consistency = nn.CosineEmbeddingLoss(reduction='none').to(device)
 
 all_params = list(model.parameters()) + list(criterion_arc.parameters()) + list(proj_head.parameters())
 if use_grl: all_params += list(domain_classifier.parameters())
@@ -365,24 +352,21 @@ optimizer = optim.AdamW(all_params, lr=lr, weight_decay=weight_decay)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
 
 # ----------------------------
-# 7. Training Loop (Feature Consistency + Mask)
+# 7. Training Loop (Consistency Removed)
 # ----------------------------
-print(f"Starting Training | Ramp:{consistency_ramp_epochs}ep | Thresh:{confidence_threshold} | Consist: {use_consistency_loss}")
+print("Starting Training (Safe Mode: XOR + Protected GRL + Dynamic Beta)...")
 
 for epoch in range(epochs):
     model.train(); proj_head.train(); criterion_arc.train()
     if use_grl: domain_classifier.train()
     train_loss = 0.0; train_correct = 0; total_train = 0
-    
-    if epoch < consistency_ramp_epochs:
-        curr_consist_weight = 0.0
-    else:
-        progress = min(1.0, (epoch - consistency_ramp_epochs) / 5.0)
-        curr_consist_weight = consistency_max_weight * progress
 
     for batch_idx, (img_orig, img_spatial, y_i, y_d) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")):
         img_orig, img_spatial, y_i, y_d = img_orig.to(device), img_spatial.to(device), y_i.to(device), y_d.to(device)
 
+        # === THE XOR SWITCH ===
+        # 50% chance: Use FFT Mixup (Dynamic Beta)
+        # 50% chance: Use Spatial Augmentation
         if use_fft_aug and torch.rand(1) < 0.5:
             img_aug = label_guided_fft_mixup(img_orig, y_d) 
         else:
@@ -402,40 +386,22 @@ for epoch in range(epochs):
         emb_orig = embeddings_all[:batch_curr]
         emb_aug  = embeddings_all[batch_curr:]
 
-        # 2. ArcFace & SupCon
+        # 2. Main Losses (ArcFace + SupCon)
         loss_arc = criterion_arc(embeddings_all, y_i_all)
         loss_con = criterion_supcon(projections_all, y_i_all)
         
-        # 3. GRL Loss
+        # 3. GRL Loss (Protected - Clean Only)
         loss_domain = 0.0
         if use_grl:
             p = float(batch_idx + epoch * len(train_loader)) / (len(train_loader) * epochs)
             alpha_grl = 2. / (1. + np.exp(-10 * p)) - 1
             loss_domain = criterion_domain(domain_classifier(emb_orig, alpha_grl), y_d)
         
-        # 4. Feature Consistency (Masked)
-        loss_consistency = torch.tensor(0.0).to(device)
-        if use_consistency_loss and curr_consist_weight > 0:
-            # A. Get Confidence from CLEAN logits
-            logits_clean = criterion_arc.get_logits(emb_orig)
-            probs_clean = F.softmax(logits_clean, dim=1)
-            max_probs, _ = torch.max(probs_clean, dim=1)
-            
-            # B. Mask
-            mask = max_probs.ge(confidence_threshold).float()
-            
-            # C. Cosine Loss (Features)
-            # Target = 1 (Vectors should be similar)
-            target = torch.ones(emb_orig.size(0)).to(device)
-            raw_loss = criterion_feature_consistency(emb_orig, emb_aug, target)
-            
-            # D. Apply Mask
-            loss_consistency = (raw_loss * mask).mean() * curr_consist_weight
-
-        # 5. Scout
+        # 4. Scout Supervision
         norm_routing_loss = F.cross_entropy(model.scout_logits, y_d_all)
         
-        loss = loss_arc + (lamb * loss_con) + loss_domain + loss_consistency + (aux_weight * model.aux_loss) + (norm_weight * norm_routing_loss)
+        # Total Loss
+        loss = loss_arc + (lamb * loss_con) + loss_domain + (aux_weight * model.aux_loss) + (norm_weight * norm_routing_loss)
         
         loss.backward()
         optimizer.step()
@@ -457,7 +423,7 @@ for epoch in range(epochs):
             total_test += y_i.size(0)
 
     print(f"Epoch [{epoch+1}/{epochs}] Summary:")
-    print(f"  -> Train | Loss: {train_loss/len(train_loader):.4f} | Acc: {train_correct/total_train:.4f} | CW: {curr_consist_weight:.2f}")
+    print(f"  -> Train | Loss: {train_loss/len(train_loader):.4f} | Acc: {train_correct/total_train:.4f}")
     print(f"  -> Test  | Acc: {test_correct/total_test:.4f}")
     print("-" * 50)
     scheduler.step()
