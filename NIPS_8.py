@@ -54,7 +54,7 @@ freeze_base_stage3_norm = False
 freeze_base_final_norm = False  
 
 train_domains = ["460", "WHT"]   
-test_domains  = ["700"]          
+test_domains  = ["630"]          
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
