@@ -42,11 +42,12 @@ use_global_scout = True
 
 num_experts = 3
 top_k = 2
+
 use_moe_mlp = True          
 use_moe_stage3_norm = False 
-use_moe_final_norm = False  
-use_grl = True              
-use_spectral_scout = False  
+use_moe_final_norm = False
+
+use_grl = True               
 
 freeze_base_mlp = True          
 freeze_base_stage3_norm = False 
