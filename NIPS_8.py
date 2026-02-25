@@ -15,7 +15,7 @@ from pytorch_metric_learning import losses
 # ----------------------------
 # 1. Configuration & Toggles
 # ----------------------------
-batch_size = 32   
+batch_size = 32      
 margin = 0.3
 scale = 16
 lr = 1e-3
@@ -23,27 +23,29 @@ weight_decay = 1e-4
 epochs = 200
 lamb = 0.2           # SupCon Weight
 aux_weight = 0.2     # MoE Balance Weight
-norm_weight = 1.0    # Scout Weight
+norm_weight = 1.0    # Scout Weight (Only used if Global Scout is ON)
 
-# --- NEW TOGGLE ---
-use_aug_only_for_supcon = True  # True: Augs used ONLY for SupCon. False: Augs used for EVERYTHING.
+# --- EXPANSION MODE ---
+augmentation_expansion_mode = '4x' 
 
-# --- AUGMENTATION TOGGLES ---
-use_general_aug = True      
-use_physics_aug = False       
-use_fft_aug     = True       
+# --- VISIBILITY TOGGLE ---
+use_aug_only_for_supcon = False 
 
-# --- ADVANCED TRAINING TOGGLES ---
-use_dynamic_beta = True   # Random Box (1%-20%)
+# --- AUGMENTATION SETTINGS ---
+use_dynamic_beta = True
 
 # --- ARCHITECTURE TOGGLES ---
+# Master Switch: 
+# True  = Global Scout (Your Method: One brain routing all layers)
+# False = Normal MoE (Baseline: Each layer routes itself independently)
+use_global_scout = True     
+
 num_experts = 3
 top_k = 2
 use_moe_mlp = True          
 use_moe_stage3_norm = False 
 use_moe_final_norm = False  
 use_grl = True              
-use_global_scout = True     
 use_spectral_scout = False  
 
 freeze_base_mlp = True          
@@ -58,37 +60,15 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ----------------------------
 # 2. Augmentation Logic
 # ----------------------------
-def simulate_spectrum_shift(img, current_nm, target_nm_type):
-    if target_nm_type == 'NIR':
-        blur_strength = 0.0
-        if current_nm in ["460", "WHT", "480"]: blur_strength = 1.5
-        elif current_nm == "530": blur_strength = 1.2
-        elif current_nm == "630": blur_strength = 0.8
-        elif current_nm == "700": blur_strength = 0.4
-        img = ImageEnhance.Brightness(img).enhance(random.uniform(0.6, 0.9))
-        img = ImageEnhance.Contrast(img).enhance(random.uniform(0.7, 0.9))
-        if blur_strength > 0: img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.1, blur_strength)))
-    elif target_nm_type == 'VIS':
-        sharp_strength = 0.0
-        if current_nm == "940": sharp_strength = 3.0
-        elif current_nm == "850": sharp_strength = 2.0
-        img = ImageEnhance.Brightness(img).enhance(random.uniform(1.2, 1.5))
-        if sharp_strength > 0: img = ImageEnhance.Sharpness(img).enhance(random.uniform(1.0, sharp_strength))
-    return img
-
-general_photometric_aug = transforms.Compose([
+general_aug = transforms.Compose([
+    transforms.RandomResizedCrop(size=224, scale=(0.9, 1.0), ratio=(0.95, 1.05)),
+    transforms.RandomAffine(degrees=10, translate=(0.05, 0.05)),
     transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0, hue=0),
     transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.2),
     transforms.RandomApply([transforms.RandomAdjustSharpness(sharpness_factor=2.0)], p=0.2),
     transforms.RandomApply([transforms.RandomAutocontrast()], p=0.2),
 ])
 
-geometric_aug = transforms.Compose([
-    transforms.RandomResizedCrop(size=224, scale=(0.9, 1.0), ratio=(0.95, 1.05)),
-    transforms.RandomAffine(degrees=10, translate=(0.05, 0.05)),
-])
-
-# --- Dynamic Beta Controlled Mixer ---
 def label_guided_fft_mixup(x, labels):
     B, C, H, W = x.shape
     fft = torch.fft.fft2(x, dim=(-2, -1))
@@ -100,9 +80,9 @@ def label_guided_fft_mixup(x, labels):
     amp_shifted_trg = amp_shifted[target_indices]
     
     if use_dynamic_beta:
-        beta = np.random.uniform(0.01, 0.20) # Dynamic
+        beta = np.random.uniform(0.01, 0.20)
     else:
-        beta = 0.15 # Fixed
+        beta = 0.15
     
     b = int(np.floor(np.amin((H, W)) * beta))
     c_h, c_w = int(np.floor(H / 2.0)), int(np.floor(W / 2.0))
@@ -124,8 +104,7 @@ class CASIA_MS_Dataset(Dataset):
         self.domain_map = {d: i for i, d in enumerate(target_domains)}
         self.is_train = is_train
         self.to_tensor = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
-        self.geometric = geometric_aug
-        self.general = general_photometric_aug
+        self.general_aug = general_aug
         
         hand_id_counter = 0
         for root, _, files in os.walk(data_path):
@@ -153,29 +132,14 @@ class CASIA_MS_Dataset(Dataset):
         img_orig = self.to_tensor(img)
 
         if self.is_train:
-            img_aug_pil = self.geometric(img)
-            if use_physics_aug:
-                if random.random() < 0.5:
-                    if spectrum in ["460", "530", "630", "700", "WHT", "480"]:
-                        img_aug_pil = simulate_spectrum_shift(img_aug_pil, spectrum, 'NIR')
-                    elif spectrum in ["850", "940"]:
-                        img_aug_pil = simulate_spectrum_shift(img_aug_pil, spectrum, 'VIS')
-            elif use_general_aug:
-                img_aug_pil = self.general(img_aug_pil)
+            img_aug_pil = self.general_aug(img)
             return img_orig, self.to_tensor(img_aug_pil), y_i, y_d
         
         return img_orig, y_i, y_d
 
 # ----------------------------
-# 4. Modules & Scout
+# 4. Modules & Routers
 # ----------------------------
-class SpectralPreprocess(nn.Module):
-    def __init__(self): super().__init__()
-    def forward(self, x):
-        fft = torch.fft.fft2(x, dim=(-2, -1))
-        x_amp = torch.fft.ifft2(torch.abs(fft) * torch.exp(1j * torch.zeros_like(fft)), dim=(-2, -1)).real
-        return torch.clamp(x_amp, 0, 1)
-
 class GlobalDomainRouter(nn.Module):
     def __init__(self, num_domains=3):
         super().__init__()
@@ -217,35 +181,64 @@ class VectorizedLoRAExperts(nn.Module):
     def forward(self, x, idx):
         return torch.matmul(self.act(torch.matmul(x, self.w_down[idx])), self.w_up[idx]) * self.scaling
 
+# --- HYBRID EXPERT LAYER (Supports Global OR Local Routing) ---
 class ConvNeXtParallelMoELoRA(nn.Module):
-    def __init__(self, orig_mlp, dim, num_experts=3, top_k=2, r=8, alpha=8, freeze_base=True):
+    def __init__(self, orig_mlp, dim, num_experts=3, top_k=2, r=8, alpha=8, freeze_base=True, use_global_routing=True):
         super().__init__()
         self.orig_mlp = orig_mlp; self.num_experts = num_experts; self.top_k = top_k
+        self.use_global_routing = use_global_routing
+        self.local_aux_loss = 0.0 # Store loss if local
+        
         if freeze_base: 
             for p in self.orig_mlp.parameters(): p.requires_grad = False
         else:
             for p in self.orig_mlp.parameters(): p.requires_grad = True
+            
         self.experts = VectorizedLoRAExperts(dim, num_experts, r, alpha)
-    def forward(self, x, info):
-        gate, topk_probs, topk_idx = info
+        
+        # If Local Routing (Normal MoE), we need a router PER LAYER
+        if not self.use_global_routing:
+            self.router = nn.Linear(dim, num_experts) 
+
+    def forward(self, x, info=None):
+        # 1. Determine Routing Info (Gate, TopK_Probs, TopK_Idx)
+        if self.use_global_routing:
+            # Global Mode: Router info comes from outside (Scout)
+            gate, topk_probs, topk_idx = info
+        else:
+            # Local Mode: Calculate routing based on THIS layer's input
+            # x shape in ConvNeXt MLP is (Batch, Height, Width, Channels)
+            B, H, W, C = x.shape
+            x_flat = x.view(B, -1, C).mean(dim=1) # Global Avg Pool to (B, C)
+            
+            logits = self.router(x_flat)
+            gate = F.softmax(logits, dim=-1)
+            
+            # TopK logic
+            topk_probs, topk_idx = torch.topk(gate, self.top_k, dim=-1)
+            topk_probs = topk_probs / (topk_probs.sum(-1, keepdim=True) + 1e-6) # Normalize
+            
+            # Calculate Load Balancing Loss Locally
+            frac = torch.zeros_like(gate).scatter_(1, topk_idx, 1.0).mean(0)
+            self.local_aux_loss = self.num_experts * torch.sum(frac * gate.mean(0))
+
+        # 2. Apply Experts
         orig = self.orig_mlp(x); shape = x.shape
         x_flat = x.view(-1, shape[-1]); moe = torch.zeros_like(x_flat)
         for i in range(self.num_experts):
             idx, k_idx = torch.where(topk_idx == i)
             if len(idx)==0: continue
             moe[idx] += self.experts(x_flat[idx], i) * topk_probs[idx, k_idx].unsqueeze(-1)
+            
         return orig + moe.view(*shape)
 
 class IntegratedMoEModel(nn.Module):
-    def __init__(self, backbone, scout, num_experts, top_k, use_spectral_scout=False):
+    def __init__(self, backbone, scout, num_experts, top_k):
         super().__init__()
         self.backbone = backbone; self.scout = scout; self.num_experts = num_experts; self.top_k = top_k
-        self.use_spectral_scout = use_spectral_scout
-        if use_spectral_scout: self.spectral_split = SpectralPreprocess()
         self.aux_loss = 0.0; self.scout_logits = None
     def forward(self, x):
-        scout_in = self.spectral_split(x) if self.use_spectral_scout else x
-        self.scout_logits = self.scout(scout_in)
+        self.scout_logits = self.scout(x)
         gate = F.softmax(self.scout_logits, dim=-1)
         topk_p, topk_i = torch.topk(gate, self.top_k, dim=-1)
         topk_p = topk_p / (topk_p.sum(-1, keepdim=True)+1e-6)
@@ -266,22 +259,21 @@ class IntegratedMoEModel(nn.Module):
 # 5. Data Loading & Setup
 # ----------------------------
 data_path = "/home/pai-ng/Jamal/CASIA-MS-ROI"
-
-print("Creating Training Dataset...")
+print(f"Creating Training Dataset... (Batch Size: {batch_size})")
 train_dataset = CASIA_MS_Dataset(data_path, train_domains, is_train=True)
-print("Creating Test Dataset...")
 test_dataset  = CASIA_MS_Dataset(data_path, test_domains, is_train=False)
 
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
 test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
-print(f"Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
+# --- MODEL SETUP ---
+print(f"Model Mode: {'MoE + Global Scout' if use_global_scout else 'Normal MoE (Local Routing)'}")
 
-print("Loading ConvNeXt V2-Tiny...")
 base_model = timm.create_model('convnextv2_tiny', pretrained=True, num_classes=0).to(device)
-embedding_dim = base_model.num_features 
+embedding_dim = base_model.num_features
 stage_3_dim = 768
 
+# Inject MoE layers (works for both modes, but configured differently)
 for p in base_model.parameters(): p.requires_grad = False
 for p in base_model.stages[3].parameters(): p.requires_grad = True
 
@@ -292,17 +284,23 @@ class RoutedConvNeXtBlock(nn.Module):
         shortcut = x; x = self.block.conv_dw(x)
         if self.block.use_conv_mlp:
             x = self.block.norm(x, self.block.norm.current_routing_weights) if isinstance(self.block.norm, ParallelMoELayerNorm) else self.block.norm(x)
-            x = self.block.mlp(x, self.block.mlp.current_routing_info) if isinstance(self.block.mlp, ConvNeXtParallelMoELoRA) else self.block.mlp(x)
+            # Pass 'None' if local routing; layer handles it self.
+            info = getattr(self.block.mlp, 'current_routing_info', None)
+            x = self.block.mlp(x, info) if isinstance(self.block.mlp, ConvNeXtParallelMoELoRA) else self.block.mlp(x)
         else:
             x = x.permute(0, 2, 3, 1)
             x = self.block.norm(x, self.block.norm.current_routing_weights) if isinstance(self.block.norm, ParallelMoELayerNorm) else self.block.norm(x)
-            x = self.block.mlp(x, self.block.mlp.current_routing_info) if isinstance(self.block.mlp, ConvNeXtParallelMoELoRA) else self.block.mlp(x)
+            info = getattr(self.block.mlp, 'current_routing_info', None)
+            x = self.block.mlp(x, info) if isinstance(self.block.mlp, ConvNeXtParallelMoELoRA) else self.block.mlp(x)
             x = x.permute(0, 3, 1, 2)
         if self.block.gamma is not None: x = self.block.gamma * x
         return self.block.drop_path(x) + shortcut
 
 for i, block in enumerate(base_model.stages[3].blocks):
-    if use_moe_mlp: block.mlp = ConvNeXtParallelMoELoRA(block.mlp, stage_3_dim, num_experts, top_k, 8, 8, freeze_base_mlp).to(device)
+    if use_moe_mlp: 
+        # INJECT HYBRID EXPERTS
+        # use_global_routing=False means Normal MoE (internal Linear router)
+        block.mlp = ConvNeXtParallelMoELoRA(block.mlp, stage_3_dim, num_experts, top_k, 8, 8, freeze_base_mlp, use_global_routing=use_global_scout).to(device)
     base_model.stages[3].blocks[i] = RoutedConvNeXtBlock(block)
 
 if use_moe_final_norm and hasattr(base_model, 'norm'):
@@ -312,9 +310,10 @@ if use_moe_final_norm and hasattr(base_model, 'norm'):
 
 if use_global_scout:
     scout = GlobalDomainRouter(num_experts).to(device)
-    model = IntegratedMoEModel(base_model, scout, num_experts, top_k, use_spectral_scout).to(device)
+    model = IntegratedMoEModel(base_model, scout, num_experts, top_k).to(device)
 else:
-    model = base_model 
+    # Just the Backbone (with internal local routers)
+    model = base_model
 
 class ProjectionHead(nn.Module):
     def __init__(self, dim_in, dim_out=128):
@@ -355,9 +354,9 @@ optimizer = optim.AdamW(all_params, lr=lr, weight_decay=weight_decay)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
 
 # ----------------------------
-# 7. Training Loop (Safe Mode: XOR + Protected GRL + Dynamic Beta)
+# 7. Training Loop
 # ----------------------------
-print(f"Starting Training | SupCon Only Aug: {use_aug_only_for_supcon}")
+print(f"Starting Training | Mode: {augmentation_expansion_mode} | SupCon Only Aug: {use_aug_only_for_supcon} | Global Scout: {use_global_scout}")
 
 for epoch in range(epochs):
     model.train(); proj_head.train(); criterion_arc.train()
@@ -367,61 +366,81 @@ for epoch in range(epochs):
     for batch_idx, (img_orig, img_spatial, y_i, y_d) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")):
         img_orig, img_spatial, y_i, y_d = img_orig.to(device), img_spatial.to(device), y_i.to(device), y_d.to(device)
 
-        # === THE XOR SWITCH ===
-        if use_fft_aug and torch.rand(1) < 0.5:
-            img_aug = label_guided_fft_mixup(img_orig, y_d) 
+        # === DATA GENERATION ===
+        images_list = [img_orig]; labels_list = [y_i]; domains_list = [y_d]
+
+        # 1. XOR View
+        if torch.rand(1) < 0.5:
+            img_xor = label_guided_fft_mixup(img_orig, y_d)
         else:
-            img_aug = img_spatial
+            img_xor = img_spatial
 
+        if augmentation_expansion_mode == '2x':
+            images_list.append(img_xor); labels_list.append(y_i); domains_list.append(y_d)
+        elif augmentation_expansion_mode == '4x':
+            img_fft = label_guided_fft_mixup(img_orig, y_d)
+            images_list.extend([img_spatial, img_fft, img_xor])
+            labels_list.extend([y_i, y_i, y_i])
+            domains_list.extend([y_d, y_d, y_d])
+
+        images_all = torch.cat(images_list, dim=0)
+        y_i_all = torch.cat(labels_list, dim=0)
+        y_d_all = torch.cat(domains_list, dim=0)
+
+        # === FORWARD ===
         optimizer.zero_grad()
-        
-        # 1. Forward All
-        images_all = torch.cat([img_orig, img_aug], dim=0)
-        y_i_all = torch.cat([y_i, y_i], dim=0)
-        y_d_all = torch.cat([y_d, y_d], dim=0)
-
         embeddings_all = model(images_all)
         projections_all = proj_head(embeddings_all)
 
         batch_curr = img_orig.size(0)
         emb_orig = embeddings_all[:batch_curr]
-        emb_aug  = embeddings_all[batch_curr:]
 
-        # 2. ArcFace & Scout Loss Calculation (Conditional)
+        # === LOSSES ===
+        # 1. Classifiers
+        norm_routing_loss = 0.0
         if use_aug_only_for_supcon:
-            # OPTION A: Train Classifiers ONLY on Clean Images
-            # This prevents strong augmentations from confusing the identity boundary
             loss_arc = criterion_arc(emb_orig, y_i)
-            
-            # For Scout, we only want to penalize routing of clean images
-            # Note: embeddings_all calculation generated scout_logits for the full batch.
-            # We must slice the logits to match the labels.
-            scout_logits_clean = model.scout_logits[:batch_curr]
-            norm_routing_loss = F.cross_entropy(scout_logits_clean, y_d)
+            # Only calc routing loss if Global Scout is ON
+            if use_global_scout:
+                norm_routing_loss = F.cross_entropy(model.scout_logits[:batch_curr], y_d)
         else:
-            # OPTION B: Train Classifiers on EVERYTHING (Default)
             loss_arc = criterion_arc(embeddings_all, y_i_all)
-            norm_routing_loss = F.cross_entropy(model.scout_logits, y_d_all)
+            if use_global_scout:
+                norm_routing_loss = F.cross_entropy(model.scout_logits, y_d_all)
 
-        # 3. SupCon Loss (Always on ALL images to cluster views)
+        # 2. SupCon
         loss_con = criterion_supcon(projections_all, y_i_all)
         
-        # 4. GRL Loss (Protected - Clean Only)
+        # 3. GRL
         loss_domain = 0.0
         if use_grl:
             p = float(batch_idx + epoch * len(train_loader)) / (len(train_loader) * epochs)
             alpha_grl = 2. / (1. + np.exp(-10 * p)) - 1
             loss_domain = criterion_domain(domain_classifier(emb_orig, alpha_grl), y_d)
         
-        # Total Loss
-        loss = loss_arc + (lamb * loss_con) + loss_domain + (aux_weight * model.aux_loss) + (norm_weight * norm_routing_loss)
+        # 4. Aux Loss Calculation (Global vs Local)
+        loss_aux = 0.0
+        if use_global_scout:
+            # Global: Calculated once in IntegratedMoEModel
+            loss_aux = model.aux_loss
+        else:
+            # Local: Sum up aux_loss from every expert layer
+            # We traverse the model to find all MoE layers
+            aux_losses = []
+            for module in model.modules():
+                if isinstance(module, ConvNeXtParallelMoELoRA):
+                    aux_losses.append(module.local_aux_loss)
+            if aux_losses:
+                loss_aux = sum(aux_losses)
+
+        # Total
+        loss = loss_arc + (lamb * loss_con) + loss_domain + (aux_weight * loss_aux) + (norm_weight * norm_routing_loss)
         
         loss.backward()
         optimizer.step()
 
         train_loss += loss.item()
         
-        # Accuracy reporting (if using Augs only for SupCon, report clean acc)
         if use_aug_only_for_supcon:
              preds = criterion_arc.get_logits(emb_orig).argmax(dim=1)
              train_correct += (preds == y_i).sum().item()
