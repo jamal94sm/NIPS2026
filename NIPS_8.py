@@ -25,6 +25,9 @@ lamb = 0.2           # SupCon Weight
 aux_weight = 0.2     # MoE Balance Weight
 norm_weight = 1.0    # Scout Weight
 
+# --- NEW TOGGLE ---
+use_aug_only_for_supcon = True  # True: Augs used ONLY for SupCon. False: Augs used for EVERYTHING.
+
 # --- AUGMENTATION TOGGLES ---
 use_general_aug = True      
 use_physics_aug = False       
@@ -47,8 +50,8 @@ freeze_base_mlp = True
 freeze_base_stage3_norm = False 
 freeze_base_final_norm = False  
 
-train_domains = ["460", "WHT", "700"]   
-test_domains  = ["850"]          
+train_domains = ["460", "630"]   
+test_domains  = ["940"]          
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -352,9 +355,9 @@ optimizer = optim.AdamW(all_params, lr=lr, weight_decay=weight_decay)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
 
 # ----------------------------
-# 7. Training Loop (Consistency Removed)
+# 7. Training Loop (Safe Mode: XOR + Protected GRL + Dynamic Beta)
 # ----------------------------
-print("Starting Training (Safe Mode: XOR + Protected GRL + Dynamic Beta)...")
+print(f"Starting Training | SupCon Only Aug: {use_aug_only_for_supcon}")
 
 for epoch in range(epochs):
     model.train(); proj_head.train(); criterion_arc.train()
@@ -365,8 +368,6 @@ for epoch in range(epochs):
         img_orig, img_spatial, y_i, y_d = img_orig.to(device), img_spatial.to(device), y_i.to(device), y_d.to(device)
 
         # === THE XOR SWITCH ===
-        # 50% chance: Use FFT Mixup (Dynamic Beta)
-        # 50% chance: Use Spatial Augmentation
         if use_fft_aug and torch.rand(1) < 0.5:
             img_aug = label_guided_fft_mixup(img_orig, y_d) 
         else:
@@ -386,19 +387,31 @@ for epoch in range(epochs):
         emb_orig = embeddings_all[:batch_curr]
         emb_aug  = embeddings_all[batch_curr:]
 
-        # 2. Main Losses (ArcFace + SupCon)
-        loss_arc = criterion_arc(embeddings_all, y_i_all)
+        # 2. ArcFace & Scout Loss Calculation (Conditional)
+        if use_aug_only_for_supcon:
+            # OPTION A: Train Classifiers ONLY on Clean Images
+            # This prevents strong augmentations from confusing the identity boundary
+            loss_arc = criterion_arc(emb_orig, y_i)
+            
+            # For Scout, we only want to penalize routing of clean images
+            # Note: embeddings_all calculation generated scout_logits for the full batch.
+            # We must slice the logits to match the labels.
+            scout_logits_clean = model.scout_logits[:batch_curr]
+            norm_routing_loss = F.cross_entropy(scout_logits_clean, y_d)
+        else:
+            # OPTION B: Train Classifiers on EVERYTHING (Default)
+            loss_arc = criterion_arc(embeddings_all, y_i_all)
+            norm_routing_loss = F.cross_entropy(model.scout_logits, y_d_all)
+
+        # 3. SupCon Loss (Always on ALL images to cluster views)
         loss_con = criterion_supcon(projections_all, y_i_all)
         
-        # 3. GRL Loss (Protected - Clean Only)
+        # 4. GRL Loss (Protected - Clean Only)
         loss_domain = 0.0
         if use_grl:
             p = float(batch_idx + epoch * len(train_loader)) / (len(train_loader) * epochs)
             alpha_grl = 2. / (1. + np.exp(-10 * p)) - 1
             loss_domain = criterion_domain(domain_classifier(emb_orig, alpha_grl), y_d)
-        
-        # 4. Scout Supervision
-        norm_routing_loss = F.cross_entropy(model.scout_logits, y_d_all)
         
         # Total Loss
         loss = loss_arc + (lamb * loss_con) + loss_domain + (aux_weight * model.aux_loss) + (norm_weight * norm_routing_loss)
@@ -407,9 +420,16 @@ for epoch in range(epochs):
         optimizer.step()
 
         train_loss += loss.item()
-        preds = criterion_arc.get_logits(embeddings_all).argmax(dim=1)
-        train_correct += (preds == y_i_all).sum().item()
-        total_train += images_all.size(0)
+        
+        # Accuracy reporting (if using Augs only for SupCon, report clean acc)
+        if use_aug_only_for_supcon:
+             preds = criterion_arc.get_logits(emb_orig).argmax(dim=1)
+             train_correct += (preds == y_i).sum().item()
+             total_train += img_orig.size(0)
+        else:
+             preds = criterion_arc.get_logits(embeddings_all).argmax(dim=1)
+             train_correct += (preds == y_i_all).sum().item()
+             total_train += images_all.size(0)
 
     # -------- Evaluation --------
     model.eval(); criterion_arc.eval()
