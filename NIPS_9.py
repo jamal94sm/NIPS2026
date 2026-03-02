@@ -35,9 +35,6 @@ use_aug_only_for_supcon = False
 use_dynamic_beta = True
 
 # --- ARCHITECTURE TOGGLES ---
-# Master Switch: 
-# True  = Global Scout (Your Method: One brain routing all layers)
-# False = Normal MoE (Baseline: Each layer routes itself independently)
 use_global_scout = True     
 
 num_experts = 3
@@ -98,10 +95,6 @@ def label_guided_fft_mixup(x, labels):
 # ----------------------------
 # 3. Dataset Class
 # ----------------------------
-# ── Build shared label map from train domains ─────────────────────────────────
-# Train and test share the same identities. Building the map from train domains
-# and passing it to both datasets ensures integer label k means the same
-# hand_id everywhere — essential for ArcFace evaluation on the test set.
 data_path = "/home/pai-ng/Jamal/CASIA-MS-ROI"
 
 _all_hand_ids = set()
@@ -119,14 +112,9 @@ num_total_classes = len(shared_label_map)
 print(f"Shared identity space: {num_total_classes} identities (same in train & test)")
 
 class CASIA_MS_Dataset(Dataset):
-    """
-    Uses a shared_label_map so that integer labels are consistent across
-    train and test datasets. Required for valid ArcFace classification
-    accuracy on the test set.
-    """
     def __init__(self, data_path, target_domains, shared_label_map, is_train=True):
         self.samples      = []
-        self.hand_id_map  = shared_label_map          # shared — same integers everywhere
+        self.hand_id_map  = shared_label_map
         self.domain_map   = {d: i for i, d in enumerate(target_domains)}
         self.is_train     = is_train
         self.to_tensor    = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
@@ -141,7 +129,7 @@ class CASIA_MS_Dataset(Dataset):
                 subject_id, hand, spectrum, iteration = parts
                 if spectrum not in target_domains: continue
                 hand_id = f"{subject_id}_{hand}"
-                if hand_id not in self.hand_id_map: continue   # identity not in shared map
+                if hand_id not in self.hand_id_map: continue
                 img_path = os.path.join(root, fname)
                 y_d = self.domain_map[spectrum]
                 self.samples.append((img_path, self.hand_id_map[hand_id], y_d, spectrum))
@@ -263,13 +251,12 @@ print(f"Creating Training Dataset... (Batch Size: {batch_size})")
 train_dataset = CASIA_MS_Dataset(data_path, train_domains, shared_label_map, is_train=True)
 test_dataset  = CASIA_MS_Dataset(data_path, test_domains,  shared_label_map, is_train=False)
 
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,  num_workers=2, pin_memory=True, drop_last=True)
-test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                          num_workers=2, pin_memory=True, drop_last=True)
 
-# ── Gallery / Query split of test set ────────────────────────────────────────
-# Gallery : first image per identity  → registered template
-# Query   : all remaining images      → probe set
-# Sets are disjoint so no self-match issue in split evaluation.
+# ── Registration set = all source-domain images ───────────────────────────────
+# Paper: "The source datasets are used as the registration set"
+# A simple dataset wrapper that serves (img, label) from a list of samples.
 _tf = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
 
 class _ListDataset(Dataset):
@@ -280,21 +267,30 @@ class _ListDataset(Dataset):
         path, label = self.samples[idx]
         return self.transform(Image.open(path).convert("RGB")), label
 
-_gallery_samples, _query_samples = [], []
-_seen_ids = set()
-for path, y_i, y_d, spec in test_dataset.samples:
-    if y_i not in _seen_ids:
-        _seen_ids.add(y_i)
-        _gallery_samples.append((path, y_i))
-    else:
-        _query_samples.append((path, y_i))
+# Collect all source-domain image paths and their identity labels
+registration_samples = [
+    (path, y_i)
+    for path, y_i, y_d, spec
+    in CASIA_MS_Dataset(data_path, train_domains, shared_label_map, is_train=False).samples
+]
 
-gallery_loader = DataLoader(_ListDataset(_gallery_samples, _tf),
-                            batch_size=batch_size, shuffle=False,
-                            num_workers=2, pin_memory=True)
-query_loader   = DataLoader(_ListDataset(_query_samples, _tf),
-                            batch_size=batch_size, shuffle=False,
-                            num_workers=2, pin_memory=True)
+# ── Query set = all target-domain images ─────────────────────────────────────
+# Paper: "the target dataset is used as the query set"
+query_samples = [
+    (path, y_i)
+    for path, y_i, y_d, spec
+    in test_dataset.samples
+]
+
+registration_loader = DataLoader(_ListDataset(registration_samples, _tf),
+                                 batch_size=batch_size, shuffle=False,
+                                 num_workers=2, pin_memory=True)
+query_loader        = DataLoader(_ListDataset(query_samples, _tf),
+                                 batch_size=batch_size, shuffle=False,
+                                 num_workers=2, pin_memory=True)
+
+print(f"  Source (registration): {train_domains}  —  {len(registration_samples)} images")
+print(f"  Target (query)        : {test_domains[0]}  —  {len(query_samples)} images")
 
 # --- MODEL SETUP ---
 print(f"Model Mode: {'MoE + Global Scout' if use_global_scout else 'Normal MoE (Local Routing)'}")
@@ -368,8 +364,6 @@ else:
 # ----------------------------
 # 6. Losses & Optimizer
 # ----------------------------
-# Use num_total_classes (shared map size) so ArcFace W has one row per identity,
-# with the same integer→identity mapping as the test set.
 criterion_arc    = losses.ArcFaceLoss(num_classes=num_total_classes, embedding_size=embedding_dim, margin=margin, scale=scale).to(device)
 criterion_supcon = losses.SupConLoss(temperature=0.1).to(device)
 
@@ -399,12 +393,13 @@ def compute_eer(scores_gen, scores_imp):
 
 @torch.no_grad()
 def _extract_embeddings(loader):
-    """Extract L2-normalised embeddings for an entire loader."""
+    """
+    Extract L2-normalised embeddings for an entire loader.
+    loader yields (img, label) — works for both registration and query loaders.
+    """
     feats, labels = [], []
-    for batch in loader:
-        # test_loader returns (img, y_i, y_d); gallery/query loaders return (img, y_i)
-        imgs = batch[0].to(device)
-        lbl  = batch[1]
+    for imgs, lbl in loader:
+        imgs = imgs.to(device)
         emb  = model(imgs)
         feats.append(F.normalize(emb, p=2, dim=1).cpu())
         labels.append(lbl)
@@ -415,88 +410,59 @@ def evaluate(epoch):
     model.eval()
     criterion_arc.eval()
 
-    # ── 1. Full similarity-based accuracy ────────────────────────────────────
-    # All M test images act as both gallery and query.
-    # Cosine similarity matrix [M, M]; diagonal set to -1 to exclude self-match.
-    # Rank-1: nearest neighbour = predicted identity.
-    # EER  : all unique pairs (i<j) split into genuine / impostor by label.
-    all_feats, all_labels = _extract_embeddings(test_loader)
-    M   = len(all_labels)
-    sim = torch.mm(all_feats, all_feats.t())   # [M, M] cosine similarity
-    sim.fill_diagonal_(-1.0)                   # exclude self-match
+    # ── Extract features ──────────────────────────────────────────────────────
+    # Registration set = all source-domain images  (paper: "registration set")
+    # Query set        = all target-domain images  (paper: "query set")
+    # Both sets are L2-normalised so cosine similarity = dot product.
+    # No self-match issue: the two sets come from different domains entirely.
+    reg_feats, reg_labels = _extract_embeddings(registration_loader)  # [G, d]
+    qry_feats, qry_labels = _extract_embeddings(query_loader)         # [Q, d]
 
-    pred_full = all_labels[sim.argmax(dim=1)]
-    acc_full  = (pred_full == all_labels).float().mean().item() * 100
+    G = len(reg_labels)
+    Q = len(qry_labels)
 
-    sim_np = sim.numpy()
-    gen_full, imp_full = [], []
-    for i in range(M):
-        for j in range(i + 1, M):
-            s = sim_np[i, j]
-            (gen_full if all_labels[i] == all_labels[j] else imp_full).append(s)
-    eer_full = compute_eer(gen_full, imp_full)
-
-    # ── 2. Split similarity-based accuracy ───────────────────────────────────
-    # Gallery: first image per identity (registered template).
-    # Query  : remaining images (probe set). Sets are disjoint.
-    # Rank-1: each query matched to nearest gallery sample.
-    # EER  : all (query_i, gallery_j) pairs split by label equality.
-    if len(_query_samples) > 0:
-        gal_feats, gal_labels = _extract_embeddings(gallery_loader)   # [G, d]
-        qry_feats, qry_labels = _extract_embeddings(query_loader)     # [Q, d]
-
-        sim_split  = torch.mm(qry_feats, gal_feats.t())               # [Q, G]
-        pred_split = gal_labels[sim_split.argmax(dim=1)]
-        acc_split  = (pred_split == qry_labels).float().mean().item() * 100
-
-        sim_split_np = sim_split.numpy()
-        gen_split, imp_split = [], []
-        for i in range(len(qry_labels)):
-            for j in range(len(gal_labels)):
-                s = sim_split_np[i, j]
-                (gen_split if qry_labels[i] == gal_labels[j] else imp_split).append(s)
-        eer_split = compute_eer(gen_split, imp_split)
-    else:
-        acc_split = eer_split = float("nan")
-
-    # ── 3. ArcFace classification accuracy ───────────────────────────────────
-    # ArcFace W: [num_total_classes, embedding_dim] — learned class prototypes.
-    # At inference (no margin): score(class c) = cosine_sim(embedding, W[c])
-    #                                           = L2_norm(emb) @ L2_norm(W[c])
-    # Since embeddings are L2-normalised and W rows are L2-normalised,
-    # this is a pure dot product. argmax → predicted identity integer.
-    # Because shared_label_map is used everywhere, predicted integer directly
-    # matches test label integer — no remapping needed.
+    # ── Palmprint Identification (Rank-1 Accuracy) ────────────────────────────
+    # Paper: "the image in query set is matched with the images in registration
+    #         set to find the closest one. If they are belonging to the same
+    #         subject, the matching is successful and the accuracy is calculated
+    #         as the metric."
     #
-    # get_logits() from pytorch-metric-learning applies scale*cos(theta) without
-    # margin (margin is training-only). argmax is scale-invariant so both
-    # get_logits().argmax() and raw cosine argmax give identical predictions.
-    arc_correct = 0
-    arc_total   = 0
-    for batch in test_loader:
-        imgs = batch[0].to(device)
-        lbl  = batch[1]
-        emb  = model(imgs)
-        # get_logits: scale * cos(theta), no margin — correct for inference
-        preds = criterion_arc.get_logits(emb).argmax(dim=1).cpu()
-        arc_correct += (preds == lbl).sum().item()
-        arc_total   += lbl.size(0)
-    acc_arc = 100.0 * arc_correct / arc_total
+    # sim[q, g] = cosine_similarity(query[q], gallery[g])
+    # For each query, argmax over gallery gives the predicted identity.
+    sim     = torch.mm(qry_feats, reg_feats.t())   # [Q, G]
+    nn_idx  = sim.argmax(dim=1)                     # [Q]
+    pred    = reg_labels[nn_idx]                    # [Q] predicted identity
+    acc     = (pred == qry_labels).float().mean().item() * 100
+
+    # ── Palmprint Verification (EER) ─────────────────────────────────────────
+    # Paper: "the images of target dataset are matched with each other.
+    #         The genuine matching from the same category and the imposter
+    #         matching from the different categories are obtained.
+    #         Then, Equal Error Rate (EER) is obtained as the metric."
+    #
+    # All (query_i, gallery_j) pairs are scored.
+    # Genuine  : qry_labels[i] == reg_labels[j]
+    # Impostor : qry_labels[i] != reg_labels[j]
+    sim_np = sim.numpy()
+    gen_scores, imp_scores = [], []
+    for i in range(Q):
+        for j in range(G):
+            s = sim_np[i, j]
+            if qry_labels[i] == reg_labels[j]:
+                gen_scores.append(s)
+            else:
+                imp_scores.append(s)
+    eer = compute_eer(gen_scores, imp_scores)
 
     # ── Print ─────────────────────────────────────────────────────────────────
-    print(f"\n  ┌─ Evaluation | Epoch {epoch} | Test domain: {test_domains[0]} | M={M}")
-    print(f"  │  [1] Full similarity  │ Rank-1: {acc_full:6.2f}%  EER: {eer_full:5.2f}%"
-          f"  — all {M} images, self excluded")
-    if not np.isnan(acc_split):
-        print(f"  │  [2] Split similarity │ Rank-1: {acc_split:6.2f}%  EER: {eer_split:5.2f}%"
-              f"  — gallery={len(_gallery_samples)}, query={len(_query_samples)}")
-    else:
-        print(f"  │  [2] Split similarity │ N/A — each identity has only 1 image")
-    print(f"  │  [3] ArcFace classify │ Acc:    {acc_arc:6.2f}%"
-          f"  — {num_total_classes} classes, no margin at inference")
+    print(f"\n  ┌─ Evaluation | Epoch {epoch} "
+          f"| registration={train_domains} ({G} imgs) "
+          f"| query={test_domains[0]} ({Q} imgs)")
+    print(f"  │  Rank-1 Accuracy : {acc:6.2f}%")
+    print(f"  │  EER             : {eer:5.2f}%")
     print(f"  └{'─'*65}")
 
-    return acc_full, eer_full, acc_arc
+    return acc, eer
 
 # ----------------------------
 # 8. Training Loop
@@ -591,8 +557,7 @@ for epoch in range(epochs):
     print(f"Epoch [{epoch+1}/{epochs}] Summary:")
     print(f"  -> Train | Loss: {avg_train_loss:.4f} | Acc: {avg_train_acc:.4f}")
 
-    # ── Evaluation (all three modes) ─────────────────────────────────────────
-    acc_full, eer_full, acc_arc = evaluate(epoch + 1)
+    acc, eer = evaluate(epoch + 1)
     print("-" * 50)
 
     scheduler.step()
