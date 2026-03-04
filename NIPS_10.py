@@ -40,7 +40,7 @@ use_grl = not use_mk_mmd    # If using MK-MMD, turn off GRL
 augmentation_expansion_mode = '4x' 
 
 # --- VISIBILITY TOGGLE ---
-use_aug_only_for_supcon = False 
+use_aug_only_for_supcon = False # if False, it uses the augmented images for supervised loss as well. 
 
 # --- AUGMENTATION SETTINGS ---
 use_dynamic_beta = True
