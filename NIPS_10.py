@@ -26,7 +26,7 @@ epochs = 200
 lamb = 0.2           # SupCon Weight
 aux_weight = 0.2     # MoE Balance Weight
 norm_weight = 1.0    # Scout Weight (Only used if Global Scout is ON)
-alpha_con = 0.3      # Consistency Loss Weight
+alpha_con = 0      # Consistency Loss Weight
 beta_ada = 1.0       # MK-MMD (Domain Adaptation) Weight
 
 # --- NEW TOGGLES BASED ON PDFG ---
