@@ -27,3 +27,6 @@ EER evaluation added. for identification accuracy, cross-domain (Reg: training d
 
 NIPS_10.py: 
 L2-norm consitency loss is added. GRL is replaced by MK-MMD loss. 
+
+NIPS_11.py: 
+replace ConvNeXt model with a small custom CNN model. 
