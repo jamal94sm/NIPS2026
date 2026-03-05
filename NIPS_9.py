@@ -36,22 +36,21 @@ use_dynamic_beta = True
 
 # --- ARCHITECTURE TOGGLES ---
 use_global_scout = True     
+use_grl = True
 
 num_experts = 3
 top_k = 2
 
 use_moe_mlp = True          
 use_moe_stage3_norm = False 
-use_moe_final_norm = False
-
-use_grl = True               
+use_moe_final_norm = False               
 
 freeze_base_mlp = True          
 freeze_base_stage3_norm = False 
 freeze_base_final_norm = False  
 
-train_domains = ["460", "700", "WHT"]   
-test_domains  = ["850"]          
+train_domains = ["460", "630"]   
+test_domains  = ["940"]          
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
