@@ -26,7 +26,7 @@ epochs = 200
 lamb = 0.2           # SupCon Weight
 aux_weight = 0.2     # MoE Balance Weight
 norm_weight = 1.0    # Scout Weight (Only used if Global Scout is ON)
-alpha_con = 0.1      # Consistency Loss Weight
+alpha_con = 0.3      # Consistency Loss Weight
 beta_ada = 1.0       # MK-MMD (Domain Adaptation) Weight
 
 # --- NEW TOGGLES BASED ON PDFG ---
@@ -59,8 +59,8 @@ freeze_base_mlp = True
 freeze_base_stage3_norm = False 
 freeze_base_final_norm = False  
 
-train_domains = ["460", "700", "WHT"]   
-test_domains  = ["850"]          
+train_domains = ["460", "630"]   
+test_domains  = ["940"]          
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
