@@ -31,8 +31,8 @@ beta_ada = 1.0       # MK-MMD (Domain Adaptation) Weight
 
 # --- NEW TOGGLES BASED ON PDFG ---
 use_consistency_loss = True   # 1. Use PDFG-style MSE Consistency
-use_pdfg_fft_mixup = True     # 2. Use PDFG continuous amplitude interpolation
-use_mk_mmd = True     # 3. Use MK-MMD instead of GRL for Domain Adaptation
+use_pdfg_fft_mixup = False     # 2. Use PDFG continuous amplitude interpolation
+use_mk_mmd = False     # 3. Use MK-MMD instead of GRL for Domain Adaptation
 
 use_grl = not use_mk_mmd    # If using MK-MMD, turn off GRL
 
@@ -59,8 +59,8 @@ freeze_base_mlp = True
 freeze_base_stage3_norm = False 
 freeze_base_final_norm = False  
 
-train_domains = ["460", "WHT"]   
-test_domains  = ["700"]          
+train_domains = ["460", "630"]   
+test_domains  = ["940"]          
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
