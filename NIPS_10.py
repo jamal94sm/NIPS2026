@@ -31,7 +31,7 @@ beta_ada = 1.0       # MK-MMD (Domain Adaptation) Weight
 
 # --- NEW TOGGLES BASED ON PDFG ---
 use_consistency_loss = False   # 1. Use PDFG-style MSE Consistency
-use_pdfg_fft_mixup = True     # 2. Use PDFG continuous amplitude interpolation
+use_pdfg_fft_mixup = False     # 2. Use PDFG continuous amplitude interpolation
 use_mk_mmd = True     # 3. Use MK-MMD instead of GRL for Domain Adaptation
 
 use_grl = not use_mk_mmd    # If using MK-MMD, turn off GRL
