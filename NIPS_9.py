@@ -2,13 +2,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import timm
 from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import os
 import numpy as np
 import random
-from PIL import Image, ImageFilter, ImageEnhance
+from PIL import Image
 from pytorch_metric_learning import losses
 
 # ----------------------------
@@ -19,43 +20,49 @@ margin = 0.3
 scale = 16
 lr = 1e-3
 weight_decay = 1e-4
-
-pretrain_epochs = 20
 epochs = 200
 
+# --- LOSS WEIGHTS ---
 lamb = 0.2           # SupCon Weight
 aux_weight = 0.2     # MoE Balance Weight
 norm_weight = 1.0    # Scout Weight (Only used if Global Scout is ON)
+alpha_con = 0.3      # Consistency Loss Weight
+beta_ada = 1.0       # MK-MMD (Domain Adaptation) Weight
+
+# --- NEW TOGGLES BASED ON PDFG ---
+use_consistency_loss = True   # 1. Use PDFG-style MSE Consistency
+use_pdfg_fft_mixup = True     # 2. Use PDFG continuous amplitude interpolation
+use_mk_mmd = True     # 3. Use MK-MMD instead of GRL for Domain Adaptation
+
+use_grl = not use_mk_mmd    # If using MK-MMD, turn off GRL
 
 # --- EXPANSION MODE ---
 augmentation_expansion_mode = '4x' 
 
 # --- VISIBILITY TOGGLE ---
-use_aug_only_for_supcon = False 
+use_aug_only_for_supcon = False # if False, it uses the augmented images for supervised loss as well. 
 
 # --- AUGMENTATION SETTINGS ---
 use_dynamic_beta = True
+pdfg_lam = 0.8  # λ parameter for PDFG amplitude mixup
 
 # --- ARCHITECTURE TOGGLES ---
 use_global_scout = True     
-use_grl = True
-
 num_experts = 3
 top_k = 2
 
 use_moe_mlp = True          
 use_moe_stage3_norm = False 
-use_moe_final_norm = False               
+use_moe_final_norm = False
 
 freeze_base_mlp = True          
 freeze_base_stage3_norm = False 
 freeze_base_final_norm = False  
 
-train_domains = ["460", "WHT"]   
-test_domains  = ["700"]          
+train_domains = ["460", "630"]   
+test_domains  = ["940"]          
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-embedding_dim = 128
 
 # ----------------------------
 # 2. Augmentation Logic
@@ -70,6 +77,7 @@ general_aug = transforms.Compose([
 ])
 
 def label_guided_fft_mixup(x, labels):
+    """Original Proposed hard center-crop mixup"""
     B, C, H, W = x.shape
     fft = torch.fft.fft2(x, dim=(-2, -1))
     amp, pha = torch.abs(fft), torch.angle(fft)
@@ -79,11 +87,7 @@ def label_guided_fft_mixup(x, labels):
     target_indices = torch.roll(sorted_idx, shifts=B // 2, dims=0)
     amp_shifted_trg = amp_shifted[target_indices]
     
-    if use_dynamic_beta:
-        beta = np.random.uniform(0.01, 0.20)
-    else:
-        beta = 0.15
-    
+    beta = np.random.uniform(0.01, 0.20) if use_dynamic_beta else 0.15
     b = int(np.floor(np.amin((H, W)) * beta))
     c_h, c_w = int(np.floor(H / 2.0)), int(np.floor(W / 2.0))
     
@@ -93,6 +97,65 @@ def label_guided_fft_mixup(x, labels):
     amp_mixed = torch.fft.ifftshift(amp_shifted, dim=(-2, -1))
     x_aug = torch.fft.ifft2(amp_mixed * torch.exp(1j * pha), dim=(-2, -1)).real
     return torch.clamp(x_aug, 0, 1)
+
+def pdfg_fft_mixup(x, labels, lam=0.8):
+    """PDFG Continuous Global Amplitude Interpolation"""
+    B, C, H, W = x.shape
+    fft1 = torch.fft.fft2(x, dim=(-2, -1))
+    amp1, phase1 = torch.abs(fft1), torch.angle(fft1)
+    
+    sorted_idx = torch.argsort(labels)
+    target_indices = torch.roll(sorted_idx, shifts=B // 2, dims=0)
+    
+    # Extract style from target
+    fft2 = torch.fft.fft2(x[target_indices], dim=(-2, -1))
+    amp2 = torch.abs(fft2)
+    
+    # Continuous interpolation
+    amp_mixed = (1 - lam) * amp1 + lam * amp2
+    fft_new = amp_mixed * torch.exp(1j * phase1)
+    
+    x_aug = torch.real(torch.fft.ifft2(fft_new, dim=(-2, -1)))
+    return torch.clamp(x_aug, 0.0, 1.0)
+
+def apply_fft_mixup(x, labels):
+    if use_pdfg_fft_mixup:
+        return pdfg_fft_mixup(x, labels, lam=pdfg_lam)
+    return label_guided_fft_mixup(x, labels)
+
+# ----------------------------
+# 2.5 New PDFG Specific Losses
+# ----------------------------
+def consistency_loss(orig_feat, aug_feats_list):
+    """Forces original feature to be close to the average of its augmented views."""
+    loss = torch.tensor(0.0, device=orig_feat.device)
+    if not aug_feats_list: return loss
+    
+    avg_aug = torch.stack(aug_feats_list, dim=0).mean(0)
+    sq_l2 = ((orig_feat - avg_aug) ** 2).sum(dim=1)
+    return sq_l2.mean()
+
+def mkmmd_loss(f1, f2, kernels=(1, 5, 10, 20, 50, 100)):
+    """PDFG Multi-Kernel Maximum Mean Discrepancy for Domain Alignment."""
+    if f1.size(0) == 0 or f2.size(0) == 0: return torch.tensor(0.0, device=f1.device)
+    
+    def sq_dists(a, b):
+        aa = (a * a).sum(dim=1, keepdim=True)
+        bb = (b * b).sum(dim=1, keepdim=True)
+        ab = torch.mm(a, b.t())
+        return (aa + bb.t() - 2 * ab).clamp(min=0)
+
+    d_ss = sq_dists(f1, f1)
+    d_st = sq_dists(f1, f2)
+    d_tt = sq_dists(f2, f2)
+
+    loss = 0.0
+    for bw in kernels:
+        k_ss = torch.exp(-d_ss / bw).mean()
+        k_st = torch.exp(-d_st / bw).mean()
+        k_tt = torch.exp(-d_tt / bw).mean()
+        loss += k_ss - 2 * k_st + k_tt
+    return loss / len(kernels)
 
 # ----------------------------
 # 3. Dataset Class
@@ -148,7 +211,7 @@ class CASIA_MS_Dataset(Dataset):
         return img_orig, y_i, y_d
 
 # ----------------------------
-# 4. Modules & Routers (Small CNN + MoE)
+# 4. Modules & Routers
 # ----------------------------
 class GlobalDomainRouter(nn.Module):
     def __init__(self, num_domains=3):
@@ -182,146 +245,71 @@ class ParallelMoELayerNorm(nn.Module):
         return out + moe
 
 class VectorizedLoRAExperts(nn.Module):
-    def __init__(self, dim_in, dim_out, num_experts, r=8, alpha=8):
+    def __init__(self, dim, num_experts, r=8, alpha=8):
         super().__init__()
         self.scaling = alpha/r
-        self.w_down = nn.Parameter(torch.randn(num_experts, dim_in, r)*(1/dim_in**0.5))
-        self.w_up = nn.Parameter(torch.zeros(num_experts, r, dim_out))
+        self.w_down = nn.Parameter(torch.randn(num_experts, dim, r)*(1/dim**0.5))
+        self.w_up = nn.Parameter(torch.zeros(num_experts, r, dim))
         self.act = nn.GELU()
     def forward(self, x, idx):
         return torch.matmul(self.act(torch.matmul(x, self.w_down[idx])), self.w_up[idx]) * self.scaling
 
-class FCParallelMoELoRA(nn.Module):
-    def __init__(self, orig_mlp, dim_in, dim_out, num_experts=3, top_k=2, r=8, alpha=8, freeze_base=True):
+class ConvNeXtParallelMoELoRA(nn.Module):
+    def __init__(self, orig_mlp, dim, num_experts=3, top_k=2, r=8, alpha=8, freeze_base=True, use_global_routing=True):
         super().__init__()
-        self.orig_mlp = orig_mlp
-        self.num_experts = num_experts
-        self.top_k = top_k
+        self.orig_mlp = orig_mlp; self.num_experts = num_experts; self.top_k = top_k
+        self.use_global_routing = use_global_routing
         self.local_aux_loss = 0.0
         if freeze_base: 
             for p in self.orig_mlp.parameters(): p.requires_grad = False
         else:
             for p in self.orig_mlp.parameters(): p.requires_grad = True
-            
-        self.experts = VectorizedLoRAExperts(dim_in, dim_out, num_experts, r, alpha)
+        self.experts = VectorizedLoRAExperts(dim, num_experts, r, alpha)
+        if not self.use_global_routing:
+            self.router = nn.Linear(dim, num_experts) 
 
-    def forward(self, x, info):
-        gate, topk_probs, topk_idx = info
-        orig = self.orig_mlp(x)
-        moe = torch.zeros_like(orig)
+    def forward(self, x, info=None):
+        if self.use_global_routing:
+            gate, topk_probs, topk_idx = info
+        else:
+            B, H, W, C = x.shape
+            x_flat = x.view(B, -1, C).mean(dim=1)
+            logits = self.router(x_flat)
+            gate = F.softmax(logits, dim=-1)
+            topk_probs, topk_idx = torch.topk(gate, self.top_k, dim=-1)
+            topk_probs = topk_probs / (topk_probs.sum(-1, keepdim=True) + 1e-6)
+            frac = torch.zeros_like(gate).scatter_(1, topk_idx, 1.0).mean(0)
+            self.local_aux_loss = self.num_experts * torch.sum(frac * gate.mean(0))
+
+        orig = self.orig_mlp(x); shape = x.shape
+        x_flat = x.view(-1, shape[-1]); moe = torch.zeros_like(x_flat)
         for i in range(self.num_experts):
             idx, k_idx = torch.where(topk_idx == i)
             if len(idx)==0: continue
-            moe[idx] += self.experts(x[idx], i) * topk_probs[idx, k_idx].unsqueeze(-1)
-        return orig + moe
+            moe[idx] += self.experts(x_flat[idx], i) * topk_probs[idx, k_idx].unsqueeze(-1)
+        return orig + moe.view(*shape)
 
-class SmallSharedTrunk(nn.Module):
-    def __init__(self):
+class IntegratedMoEModel(nn.Module):
+    def __init__(self, backbone, scout, num_experts, top_k):
         super().__init__()
-        self.conv1 = nn.Conv2d(3, 16, 3, stride=4, padding=1)
-        self.pool1 = nn.MaxPool2d(2, stride=1)
-        self.conv2 = nn.Conv2d(16, 32, 5, stride=2, padding=2)
-        self.pool2 = nn.MaxPool2d(2, stride=1)
-        self.conv3 = nn.Conv2d(32, 64, 3, stride=1, padding=1)
-        self.conv4 = nn.Conv2d(64, 128, 3, stride=1, padding=1)
-        self.pool3 = nn.MaxPool2d(2, stride=1)
-        self.act   = nn.LeakyReLU(0.2, inplace=True)
-        self.avgpool = nn.AdaptiveAvgPool2d((3, 3)) 
-        
-        self.norm3 = nn.Identity()       
-        self.norm_final = nn.Identity()  
-
-    def forward(self, x, gate=None):
-        x = self.pool1(self.act(self.conv1(x)))
-        x = self.pool2(self.act(self.conv2(x)))
-        x = self.act(self.conv3(x))
-        x = self.pool3(self.act(self.conv4(x)))
-        
-        if isinstance(self.norm3, ParallelMoELayerNorm) and gate is not None:
-            x = x.permute(0, 2, 3, 1)
-            x = self.norm3(x, gate)
-            x = x.permute(0, 3, 1, 2)
-        else:
-            x = self.norm3(x)
-
-        x = self.avgpool(x)
-        flat = x.view(x.size(0), -1)
-        
-        if isinstance(self.norm_final, ParallelMoELayerNorm) and gate is not None:
-            flat = self.norm_final(flat, gate)
-        else:
-            flat = self.norm_final(flat)
-            
-        return flat
-
-class SmallIntegratedMoEModel(nn.Module):
-    def __init__(self, num_experts, top_k, feature_dim):
-        super().__init__()
-        self.num_experts = num_experts
-        self.top_k = top_k
-        self.trunk = SmallSharedTrunk()
-        
-        with torch.no_grad():
-            dummy = torch.zeros(1, 3, 224, 224)
-            flat_dim = self.trunk(dummy).shape[1]
-            
-        if use_moe_stage3_norm:
-            orig_norm3 = nn.LayerNorm(128, eps=1e-6)
-            self.trunk.norm3 = ParallelMoELayerNorm(orig_norm3, 128, num_experts, eps=1e-6, freeze_base=freeze_base_stage3_norm)
-            
-        if use_moe_final_norm:
-            orig_norm_final = nn.LayerNorm(flat_dim, eps=1e-6)
-            self.trunk.norm_final = ParallelMoELayerNorm(orig_norm_final, flat_dim, num_experts, eps=1e-6, freeze_base=freeze_base_final_norm)
-
-        self.base_mlp = nn.Sequential(
-            nn.Linear(flat_dim, 1024), nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(1024, 512),      nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(512, feature_dim),
-        )
-        if use_moe_mlp:
-            self.mlp = FCParallelMoELoRA(self.base_mlp, flat_dim, feature_dim, num_experts, top_k, r=8, alpha=8, freeze_base=freeze_base_mlp)
-        else:
-            self.mlp = self.base_mlp
-
-        self.scout = GlobalDomainRouter(num_experts)
-        self.aux_loss = 0.0
+        self.backbone = backbone; self.scout = scout; self.num_experts = num_experts; self.top_k = top_k
+        self.aux_loss = 0.0; self.scout_logits = None
         
     def forward(self, x):
         self.scout_logits = self.scout(x)
         gate = F.softmax(self.scout_logits, dim=-1)
         topk_p, topk_i = torch.topk(gate, self.top_k, dim=-1)
         topk_p = topk_p / (topk_p.sum(-1, keepdim=True)+1e-6)
-        
         frac = torch.zeros_like(gate).scatter_(1, topk_i, 1.0).mean(0)
         self.aux_loss = self.num_experts * torch.sum(frac * gate.mean(0))
         info = (gate, topk_p, topk_i)
         
-        flat_feats = self.trunk(x, gate=gate)
-        
-        if use_moe_mlp:
-            final_features = self.mlp(flat_feats, info)
-        else:
-            final_features = self.mlp(flat_feats)
-            
-        return final_features
-
-class ProjectionHead(nn.Module):
-    def __init__(self, dim_in, dim_out=128):
-        super().__init__()
-        self.head = nn.Sequential(nn.Linear(dim_in, dim_in), nn.ReLU(True), nn.Linear(dim_in, dim_out))
-    def forward(self, x): return F.normalize(self.head(x), dim=1)
-
-class GradientReversal(torch.autograd.Function):
-    @staticmethod 
-    def forward(ctx, x, alpha): ctx.alpha=alpha; return x.view_as(x)
-    @staticmethod 
-    def backward(ctx, grad_output): return grad_output.neg() * ctx.alpha, None
-
-class DomainClassifier(nn.Module):
-    def __init__(self, dim_in, num_domains):
-        super().__init__()
-        self.net = nn.Sequential(nn.Linear(dim_in, dim_in//2), nn.BatchNorm1d(dim_in//2), nn.ReLU(True), nn.Linear(dim_in//2, num_domains))
-    def forward(self, x, alpha): return self.net(GradientReversal.apply(x, alpha))
+        for w in self.backbone.stages[3].blocks:
+            if hasattr(w.block.mlp, 'forward'): w.block.mlp.current_routing_info = info
+            if hasattr(w.block.norm, 'forward'): w.block.norm.current_routing_weights = gate
+        if hasattr(self.backbone, 'norm') and isinstance(self.backbone.norm, ParallelMoELayerNorm):
+             self.backbone.norm.current_routing_weights = gate
+        return self.backbone(x)
 
 # ----------------------------
 # 5. Data Loading & Setup
@@ -348,6 +336,7 @@ registration_samples = [
     for path, y_i, y_d, spec
     in CASIA_MS_Dataset(data_path, train_domains, shared_label_map, is_train=False).samples
 ]
+
 query_samples = [
     (path, y_i)
     for path, y_i, y_d, spec
@@ -364,10 +353,69 @@ query_loader        = DataLoader(_ListDataset(query_samples, _tf),
 print(f"  Source (registration): {train_domains}  —  {len(registration_samples)} images")
 print(f"  Target (query)        : {test_domains[0]}  —  {len(query_samples)} images")
 
-# --- MODEL INITIALIZATION ---
-model = SmallIntegratedMoEModel(num_experts, top_k, embedding_dim).to(device)
-proj_head = ProjectionHead(embedding_dim).to(device)
+# --- MODEL SETUP ---
+print(f"Model Mode: {'MoE + Global Scout' if use_global_scout else 'Normal MoE (Local Routing)'}")
 
+base_model = timm.create_model('convnextv2_tiny', pretrained=True, num_classes=0).to(device)
+embedding_dim = base_model.num_features
+stage_3_dim = 768
+
+for p in base_model.parameters(): p.requires_grad = False
+for p in base_model.stages[3].parameters(): p.requires_grad = True
+
+class RoutedConvNeXtBlock(nn.Module):
+    def __init__(self, original_block):
+        super().__init__(); self.block = original_block
+    def forward(self, x):
+        shortcut = x; x = self.block.conv_dw(x)
+        if self.block.use_conv_mlp:
+            x = self.block.norm(x, self.block.norm.current_routing_weights) if isinstance(self.block.norm, ParallelMoELayerNorm) else self.block.norm(x)
+            info = getattr(self.block.mlp, 'current_routing_info', None)
+            x = self.block.mlp(x, info) if isinstance(self.block.mlp, ConvNeXtParallelMoELoRA) else self.block.mlp(x)
+        else:
+            x = x.permute(0, 2, 3, 1)
+            x = self.block.norm(x, self.block.norm.current_routing_weights) if isinstance(self.block.norm, ParallelMoELayerNorm) else self.block.norm(x)
+            info = getattr(self.block.mlp, 'current_routing_info', None)
+            x = self.block.mlp(x, info) if isinstance(self.block.mlp, ConvNeXtParallelMoELoRA) else self.block.mlp(x)
+            x = x.permute(0, 3, 1, 2)
+        if self.block.gamma is not None: x = self.block.gamma * x
+        return self.block.drop_path(x) + shortcut
+
+for i, block in enumerate(base_model.stages[3].blocks):
+    if use_moe_mlp: 
+        block.mlp = ConvNeXtParallelMoELoRA(block.mlp, stage_3_dim, num_experts, top_k, 8, 8, freeze_base_mlp, use_global_routing=use_global_scout).to(device)
+    base_model.stages[3].blocks[i] = RoutedConvNeXtBlock(block)
+
+if use_moe_final_norm and hasattr(base_model, 'norm'):
+    orig_shape = getattr(base_model.norm, 'normalized_shape', embedding_dim)
+    eps = getattr(base_model.norm, 'eps', 1e-6)
+    base_model.norm = ParallelMoELayerNorm(base_model.norm, orig_shape, num_experts, eps, freeze_base_final_norm).to(device)
+
+if use_global_scout:
+    scout = GlobalDomainRouter(num_experts).to(device)
+    model = IntegratedMoEModel(base_model, scout, num_experts, top_k).to(device)
+else:
+    model = base_model
+
+class ProjectionHead(nn.Module):
+    def __init__(self, dim_in, dim_out=128):
+        super().__init__()
+        self.head = nn.Sequential(nn.Linear(dim_in, dim_in), nn.ReLU(True), nn.Linear(dim_in, dim_out))
+    def forward(self, x): return F.normalize(self.head(x), dim=1)
+
+class GradientReversal(torch.autograd.Function):
+    @staticmethod 
+    def forward(ctx, x, alpha): ctx.alpha=alpha; return x.view_as(x)
+    @staticmethod 
+    def backward(ctx, grad_output): return grad_output.neg() * ctx.alpha, None
+
+class DomainClassifier(nn.Module):
+    def __init__(self, dim_in, num_domains):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(dim_in, dim_in//2), nn.BatchNorm1d(dim_in//2), nn.ReLU(True), nn.Linear(dim_in//2, num_domains))
+    def forward(self, x, alpha): return self.net(GradientReversal.apply(x, alpha))
+
+proj_head = ProjectionHead(embedding_dim).to(device)
 if use_grl:
     domain_classifier = DomainClassifier(embedding_dim, num_experts).to(device)
     criterion_domain = nn.CrossEntropyLoss().to(device)
@@ -384,7 +432,7 @@ all_params = list(model.parameters()) + list(criterion_arc.parameters()) + list(
 if use_grl: all_params += list(domain_classifier.parameters())
 
 optimizer = optim.AdamW(all_params, lr=lr, weight_decay=weight_decay)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=(pretrain_epochs + epochs), eta_min=1e-4)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
 
 # ----------------------------
 # 7. Evaluation helpers
@@ -411,22 +459,22 @@ def _extract_embeddings(loader):
         emb  = model(imgs)
         feats.append(F.normalize(emb, p=2, dim=1).cpu())
         labels.append(lbl)
-    return torch.cat(feats), torch.cat(labels)
+    return torch.cat(feats), torch.cat(labels)   # [M, d], [M]
 
 @torch.no_grad()
-def evaluate(epoch, phase_name="Train"):
+def evaluate(epoch):
     model.eval()
     criterion_arc.eval()
 
-    reg_feats, reg_labels = _extract_embeddings(registration_loader)
-    qry_feats, qry_labels = _extract_embeddings(query_loader)
+    reg_feats, reg_labels = _extract_embeddings(registration_loader)  # [G, d]
+    qry_feats, qry_labels = _extract_embeddings(query_loader)         # [Q, d]
 
     G = len(reg_labels)
     Q = len(qry_labels)
 
-    sim     = torch.mm(qry_feats, reg_feats.t())
-    nn_idx  = sim.argmax(dim=1)
-    pred    = reg_labels[nn_idx]
+    sim     = torch.mm(qry_feats, reg_feats.t())   # [Q, G]
+    nn_idx  = sim.argmax(dim=1)                    # [Q]
+    pred    = reg_labels[nn_idx]                   # [Q] predicted identity
     acc     = (pred == qry_labels).float().mean().item() * 100
 
     sim_np = sim.numpy()
@@ -440,7 +488,7 @@ def evaluate(epoch, phase_name="Train"):
                 imp_scores.append(s)
     eer = compute_eer(gen_scores, imp_scores)
 
-    print(f"\n  ┌─ Evaluation | {phase_name} Epoch {epoch} "
+    print(f"\n  ┌─ Evaluation | Epoch {epoch} "
           f"| registration={train_domains} ({G} imgs) "
           f"| query={test_domains[0]} ({Q} imgs)")
     print(f"  │  Rank-1 Accuracy : {acc:6.2f}%")
@@ -452,101 +500,28 @@ def evaluate(epoch, phase_name="Train"):
 # ----------------------------
 # 8. Training Loop
 # ----------------------------
-print(f"Starting Training | Mode: {augmentation_expansion_mode} | SupCon Only Aug: {use_aug_only_for_supcon} | Global Scout: {use_global_scout}")
-
-# ==========================================
-# PHASE 1: PRETRAINING (ARCFACE WARMUP ONLY)
-# ==========================================
-print(f"\n{'='*50}\n PHASE 1: PRETRAINING ({pretrain_epochs} Epochs) \n{'='*50}")
-
-for epoch in range(pretrain_epochs):
-    model.train(); proj_head.train(); criterion_arc.train()
-    train_loss = 0.0; train_correct = 0; total_train = 0
-
-    for batch_idx, (img_orig, img_spatial, y_i, y_d) in enumerate(tqdm(train_loader, desc=f"Pretrain Epoch {epoch+1}/{pretrain_epochs}")):
-        img_orig, img_spatial, y_i, y_d = img_orig.to(device), img_spatial.to(device), y_i.to(device), y_d.to(device)
-
-        images_list = [img_orig]; labels_list = [y_i]; domains_list = [y_d]
-
-        if torch.rand(1) < 0.5:
-            img_xor = label_guided_fft_mixup(img_orig, y_d)
-        else:
-            img_xor = img_spatial
-
-        if augmentation_expansion_mode == '2x':
-            images_list.append(img_xor); labels_list.append(y_i); domains_list.append(y_d)
-        elif augmentation_expansion_mode == '4x':
-            img_fft = label_guided_fft_mixup(img_orig, y_d)
-            images_list.extend([img_spatial, img_fft, img_xor])
-            labels_list.extend([y_i, y_i, y_i])
-            domains_list.extend([y_d, y_d, y_d])
-
-        images_all = torch.cat(images_list, dim=0)
-        y_i_all    = torch.cat(labels_list, dim=0)
-
-        optimizer.zero_grad()
-        embeddings_all  = model(images_all)
-
-        batch_curr = img_orig.size(0)
-        emb_orig   = embeddings_all[:batch_curr]
-
-        if use_aug_only_for_supcon:
-            loss_arc = criterion_arc(emb_orig, y_i)
-        else:
-            loss_arc = criterion_arc(embeddings_all, y_i_all)
-
-        loss_aux = model.aux_loss if use_global_scout else 0.0
-
-        loss = loss_arc + (aux_weight * loss_aux)
-        
-        loss.backward()
-        optimizer.step()
-
-        train_loss += loss.item()
-        
-        if use_aug_only_for_supcon:
-            preds = criterion_arc.get_logits(emb_orig).argmax(dim=1)
-            train_correct += (preds == y_i).sum().item()
-            total_train   += img_orig.size(0)
-        else:
-            preds = criterion_arc.get_logits(embeddings_all).argmax(dim=1)
-            train_correct += (preds == y_i_all).sum().item()
-            total_train   += images_all.size(0)
-
-    avg_train_loss = train_loss / len(train_loader)
-    avg_train_acc  = train_correct / total_train
-
-    print(f"Pretrain Epoch [{epoch+1}/{pretrain_epochs}] Summary: Loss: {avg_train_loss:.4f} | Acc: {avg_train_acc:.4f}")
-
-    if (epoch + 1) % 5 == 0:
-        evaluate(epoch + 1, "Pretrain")
-
-    scheduler.step()
-
-# ==========================================
-# PHASE 2: FULL TRAINING (ALL LOSSES ACTIVE)
-# ==========================================
-print(f"\n{'='*50}\n PHASE 2: FULL FINE-TUNING ({epochs} Epochs) \n{'='*50}")
+print(f"Starting Training | Mode: {augmentation_expansion_mode} | PDFG Mixup: {use_pdfg_fft_mixup} | Consistency: {use_consistency_loss} | MK-MMD: {use_mk_mmd}")
 
 for epoch in range(epochs):
     model.train(); proj_head.train(); criterion_arc.train()
     if use_grl: domain_classifier.train()
     train_loss = 0.0; train_correct = 0; total_train = 0
 
-    for batch_idx, (img_orig, img_spatial, y_i, y_d) in enumerate(tqdm(train_loader, desc=f"Full Train Epoch {epoch+1}/{epochs}")):
+    for batch_idx, (img_orig, img_spatial, y_i, y_d) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")):
         img_orig, img_spatial, y_i, y_d = img_orig.to(device), img_spatial.to(device), y_i.to(device), y_d.to(device)
 
+        # === DATA GENERATION ===
         images_list = [img_orig]; labels_list = [y_i]; domains_list = [y_d]
 
         if torch.rand(1) < 0.5:
-            img_xor = label_guided_fft_mixup(img_orig, y_d)
+            img_xor = apply_fft_mixup(img_orig, y_d)
         else:
             img_xor = img_spatial
 
         if augmentation_expansion_mode == '2x':
             images_list.append(img_xor); labels_list.append(y_i); domains_list.append(y_d)
         elif augmentation_expansion_mode == '4x':
-            img_fft = label_guided_fft_mixup(img_orig, y_d)
+            img_fft = apply_fft_mixup(img_orig, y_d)
             images_list.extend([img_spatial, img_fft, img_xor])
             labels_list.extend([y_i, y_i, y_i])
             domains_list.extend([y_d, y_d, y_d])
@@ -555,6 +530,7 @@ for epoch in range(epochs):
         y_i_all    = torch.cat(labels_list, dim=0)
         y_d_all    = torch.cat(domains_list, dim=0)
 
+        # === FORWARD ===
         optimizer.zero_grad()
         embeddings_all  = model(images_all)
         projections_all = proj_head(embeddings_all)
@@ -562,6 +538,7 @@ for epoch in range(epochs):
         batch_curr = img_orig.size(0)
         emb_orig   = embeddings_all[:batch_curr]
 
+        # === LOSSES ===
         norm_routing_loss = 0.0
         if use_aug_only_for_supcon:
             loss_arc = criterion_arc(emb_orig, y_i)
@@ -574,15 +551,41 @@ for epoch in range(epochs):
 
         loss_con = criterion_supcon(projections_all, y_i_all)
         
+        # 1. NEW: PDFG Consistency Loss
+        loss_consistency = 0.0
+        if use_consistency_loss and augmentation_expansion_mode == '4x':
+            # embeddings_all contains: [orig, spatial, fft, xor]
+            emb_spatial = embeddings_all[batch_curr:2*batch_curr]
+            emb_fft = embeddings_all[2*batch_curr:3*batch_curr]
+            emb_xor = embeddings_all[3*batch_curr:]
+            loss_consistency = alpha_con * consistency_loss(emb_orig, [emb_spatial, emb_fft, emb_xor])
+
+        # 2 & 3. Domain Adaptation Loss (GRL vs MK-MMD)
         loss_domain = 0.0
         if use_grl:
             p = float(batch_idx + epoch * len(train_loader)) / (len(train_loader) * epochs)
             alpha_grl = 2. / (1. + np.exp(-10 * p)) - 1
             loss_domain = criterion_domain(domain_classifier(emb_orig, alpha_grl), y_d)
+        elif use_mk_mmd:
+            # Apply MK-MMD on the final routed features since the base backbone is frozen.
+            domains_present = torch.unique(y_d)
+            if len(domains_present) > 1:
+                idx_d1 = (y_d == domains_present[0]).nonzero(as_tuple=True)[0]
+                idx_d2 = (y_d == domains_present[1]).nonzero(as_tuple=True)[0]
+                loss_domain = beta_ada * mkmmd_loss(emb_orig[idx_d1], emb_orig[idx_d2])
         
-        loss_aux = model.aux_loss if use_global_scout else 0.0
+        loss_aux = 0.0
+        if use_global_scout:
+            loss_aux = model.aux_loss
+        else:
+            aux_losses = []
+            for module in model.modules():
+                if isinstance(module, ConvNeXtParallelMoELoRA):
+                    aux_losses.append(module.local_aux_loss)
+            if aux_losses:
+                loss_aux = sum(aux_losses)
 
-        loss = loss_arc + (lamb * loss_con) + loss_domain + (aux_weight * loss_aux) + (norm_weight * norm_routing_loss)
+        loss = loss_arc + (lamb * loss_con) + loss_consistency + loss_domain + (aux_weight * loss_aux) + (norm_weight * norm_routing_loss)
         
         loss.backward()
         optimizer.step()
@@ -601,10 +604,11 @@ for epoch in range(epochs):
     avg_train_loss = train_loss / len(train_loader)
     avg_train_acc  = train_correct / total_train
 
-    print(f"Full Train Epoch [{epoch+1}/{epochs}] Summary: Loss: {avg_train_loss:.4f} | Acc: {avg_train_acc:.4f}")
+    print(f"Epoch [{epoch+1}/{epochs}] Summary:")
+    print(f"  -> Train | Loss: {avg_train_loss:.4f} | Acc: {avg_train_acc:.4f}")
 
     if (epoch + 1) % 5 == 0:
-        acc, eer = evaluate(epoch + 1, "Full Train")
+        acc, eer = evaluate(epoch + 1)
         print("-" * 50)
 
     scheduler.step()
