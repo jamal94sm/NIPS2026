@@ -9,7 +9,7 @@ from tqdm import tqdm
 import os
 import numpy as np
 import random
-from PIL import Image
+from PIL import Image, ImageFilter, ImageEnhance
 from pytorch_metric_learning import losses
 
 # ----------------------------
@@ -21,46 +21,36 @@ scale = 16
 lr = 1e-3
 weight_decay = 1e-4
 epochs = 200
-
-# --- LOSS WEIGHTS ---
 lamb = 0.2           # SupCon Weight
 aux_weight = 0.2     # MoE Balance Weight
 norm_weight = 1.0    # Scout Weight (Only used if Global Scout is ON)
-alpha_con = 0.3      # Consistency Loss Weight
-beta_ada = 1.0       # MK-MMD (Domain Adaptation) Weight
-
-# --- NEW TOGGLES BASED ON PDFG ---
-use_consistency_loss = True   # 1. Use PDFG-style MSE Consistency
-use_pdfg_fft_mixup = True     # 2. Use PDFG continuous amplitude interpolation
-use_mk_mmd = True     # 3. Use MK-MMD instead of GRL for Domain Adaptation
-
-use_grl = not use_mk_mmd    # If using MK-MMD, turn off GRL
 
 # --- EXPANSION MODE ---
 augmentation_expansion_mode = '4x' 
 
 # --- VISIBILITY TOGGLE ---
-use_aug_only_for_supcon = False # if False, it uses the augmented images for supervised loss as well. 
+use_aug_only_for_supcon = False 
 
 # --- AUGMENTATION SETTINGS ---
 use_dynamic_beta = True
-pdfg_lam = 0.8  # λ parameter for PDFG amplitude mixup
 
 # --- ARCHITECTURE TOGGLES ---
 use_global_scout = True     
+use_grl = True
+
 num_experts = 3
 top_k = 2
 
 use_moe_mlp = True          
 use_moe_stage3_norm = False 
-use_moe_final_norm = False
+use_moe_final_norm = False               
 
 freeze_base_mlp = True          
 freeze_base_stage3_norm = False 
 freeze_base_final_norm = False  
 
-train_domains = ["460", "WHT"]   
-test_domains  = ["700"]          
+train_domains = ["460", "630"]   
+test_domains  = ["940"]          
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -77,7 +67,6 @@ general_aug = transforms.Compose([
 ])
 
 def label_guided_fft_mixup(x, labels):
-    """Original Proposed hard center-crop mixup"""
     B, C, H, W = x.shape
     fft = torch.fft.fft2(x, dim=(-2, -1))
     amp, pha = torch.abs(fft), torch.angle(fft)
@@ -87,7 +76,11 @@ def label_guided_fft_mixup(x, labels):
     target_indices = torch.roll(sorted_idx, shifts=B // 2, dims=0)
     amp_shifted_trg = amp_shifted[target_indices]
     
-    beta = np.random.uniform(0.01, 0.20) if use_dynamic_beta else 0.15
+    if use_dynamic_beta:
+        beta = np.random.uniform(0.01, 0.20)
+    else:
+        beta = 0.15
+    
     b = int(np.floor(np.amin((H, W)) * beta))
     c_h, c_w = int(np.floor(H / 2.0)), int(np.floor(W / 2.0))
     
@@ -97,65 +90,6 @@ def label_guided_fft_mixup(x, labels):
     amp_mixed = torch.fft.ifftshift(amp_shifted, dim=(-2, -1))
     x_aug = torch.fft.ifft2(amp_mixed * torch.exp(1j * pha), dim=(-2, -1)).real
     return torch.clamp(x_aug, 0, 1)
-
-def pdfg_fft_mixup(x, labels, lam=0.8):
-    """PDFG Continuous Global Amplitude Interpolation"""
-    B, C, H, W = x.shape
-    fft1 = torch.fft.fft2(x, dim=(-2, -1))
-    amp1, phase1 = torch.abs(fft1), torch.angle(fft1)
-    
-    sorted_idx = torch.argsort(labels)
-    target_indices = torch.roll(sorted_idx, shifts=B // 2, dims=0)
-    
-    # Extract style from target
-    fft2 = torch.fft.fft2(x[target_indices], dim=(-2, -1))
-    amp2 = torch.abs(fft2)
-    
-    # Continuous interpolation
-    amp_mixed = (1 - lam) * amp1 + lam * amp2
-    fft_new = amp_mixed * torch.exp(1j * phase1)
-    
-    x_aug = torch.real(torch.fft.ifft2(fft_new, dim=(-2, -1)))
-    return torch.clamp(x_aug, 0.0, 1.0)
-
-def apply_fft_mixup(x, labels):
-    if use_pdfg_fft_mixup:
-        return pdfg_fft_mixup(x, labels, lam=pdfg_lam)
-    return label_guided_fft_mixup(x, labels)
-
-# ----------------------------
-# 2.5 New PDFG Specific Losses
-# ----------------------------
-def consistency_loss(orig_feat, aug_feats_list):
-    """Forces original feature to be close to the average of its augmented views."""
-    loss = torch.tensor(0.0, device=orig_feat.device)
-    if not aug_feats_list: return loss
-    
-    avg_aug = torch.stack(aug_feats_list, dim=0).mean(0)
-    sq_l2 = ((orig_feat - avg_aug) ** 2).sum(dim=1)
-    return sq_l2.mean()
-
-def mkmmd_loss(f1, f2, kernels=(1, 5, 10, 20, 50, 100)):
-    """PDFG Multi-Kernel Maximum Mean Discrepancy for Domain Alignment."""
-    if f1.size(0) == 0 or f2.size(0) == 0: return torch.tensor(0.0, device=f1.device)
-    
-    def sq_dists(a, b):
-        aa = (a * a).sum(dim=1, keepdim=True)
-        bb = (b * b).sum(dim=1, keepdim=True)
-        ab = torch.mm(a, b.t())
-        return (aa + bb.t() - 2 * ab).clamp(min=0)
-
-    d_ss = sq_dists(f1, f1)
-    d_st = sq_dists(f1, f2)
-    d_tt = sq_dists(f2, f2)
-
-    loss = 0.0
-    for bw in kernels:
-        k_ss = torch.exp(-d_ss / bw).mean()
-        k_st = torch.exp(-d_st / bw).mean()
-        k_tt = torch.exp(-d_tt / bw).mean()
-        loss += k_ss - 2 * k_st + k_tt
-    return loss / len(kernels)
 
 # ----------------------------
 # 3. Dataset Class
@@ -294,7 +228,6 @@ class IntegratedMoEModel(nn.Module):
         super().__init__()
         self.backbone = backbone; self.scout = scout; self.num_experts = num_experts; self.top_k = top_k
         self.aux_loss = 0.0; self.scout_logits = None
-        
     def forward(self, x):
         self.scout_logits = self.scout(x)
         gate = F.softmax(self.scout_logits, dim=-1)
@@ -303,7 +236,6 @@ class IntegratedMoEModel(nn.Module):
         frac = torch.zeros_like(gate).scatter_(1, topk_i, 1.0).mean(0)
         self.aux_loss = self.num_experts * torch.sum(frac * gate.mean(0))
         info = (gate, topk_p, topk_i)
-        
         for w in self.backbone.stages[3].blocks:
             if hasattr(w.block.mlp, 'forward'): w.block.mlp.current_routing_info = info
             if hasattr(w.block.norm, 'forward'): w.block.norm.current_routing_weights = gate
@@ -321,6 +253,9 @@ test_dataset  = CASIA_MS_Dataset(data_path, test_domains,  shared_label_map, is_
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                           num_workers=2, pin_memory=True, drop_last=True)
 
+# ── Registration set = all source-domain images ───────────────────────────────
+# Paper: "The source datasets are used as the registration set"
+# A simple dataset wrapper that serves (img, label) from a list of samples.
 _tf = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
 
 class _ListDataset(Dataset):
@@ -331,12 +266,15 @@ class _ListDataset(Dataset):
         path, label = self.samples[idx]
         return self.transform(Image.open(path).convert("RGB")), label
 
+# Collect all source-domain image paths and their identity labels
 registration_samples = [
     (path, y_i)
     for path, y_i, y_d, spec
     in CASIA_MS_Dataset(data_path, train_domains, shared_label_map, is_train=False).samples
 ]
 
+# ── Query set = all target-domain images ─────────────────────────────────────
+# Paper: "the target dataset is used as the query set"
 query_samples = [
     (path, y_i)
     for path, y_i, y_d, spec
@@ -438,6 +376,7 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, 
 # 7. Evaluation helpers
 # ----------------------------
 def compute_eer(scores_gen, scores_imp):
+    """Compute EER (%) from genuine and impostor score lists."""
     if len(scores_gen) == 0 or len(scores_imp) == 0:
         return float("nan")
     gen  = np.array(scores_gen)
@@ -453,6 +392,10 @@ def compute_eer(scores_gen, scores_imp):
 
 @torch.no_grad()
 def _extract_embeddings(loader):
+    """
+    Extract L2-normalised embeddings for an entire loader.
+    loader yields (img, label) — works for both registration and query loaders.
+    """
     feats, labels = [], []
     for imgs, lbl in loader:
         imgs = imgs.to(device)
@@ -466,17 +409,39 @@ def evaluate(epoch):
     model.eval()
     criterion_arc.eval()
 
+    # ── Extract features ──────────────────────────────────────────────────────
+    # Registration set = all source-domain images  (paper: "registration set")
+    # Query set        = all target-domain images  (paper: "query set")
+    # Both sets are L2-normalised so cosine similarity = dot product.
+    # No self-match issue: the two sets come from different domains entirely.
     reg_feats, reg_labels = _extract_embeddings(registration_loader)  # [G, d]
     qry_feats, qry_labels = _extract_embeddings(query_loader)         # [Q, d]
 
     G = len(reg_labels)
     Q = len(qry_labels)
 
+    # ── Palmprint Identification (Rank-1 Accuracy) ────────────────────────────
+    # Paper: "the image in query set is matched with the images in registration
+    #         set to find the closest one. If they are belonging to the same
+    #         subject, the matching is successful and the accuracy is calculated
+    #         as the metric."
+    #
+    # sim[q, g] = cosine_similarity(query[q], gallery[g])
+    # For each query, argmax over gallery gives the predicted identity.
     sim     = torch.mm(qry_feats, reg_feats.t())   # [Q, G]
     nn_idx  = sim.argmax(dim=1)                    # [Q]
     pred    = reg_labels[nn_idx]                   # [Q] predicted identity
     acc     = (pred == qry_labels).float().mean().item() * 100
 
+    # ── Palmprint Verification (EER) ─────────────────────────────────────────
+    # Paper: "the images of target dataset are matched with each other.
+    #         The genuine matching from the same category and the imposter
+    #         matching from the different categories are obtained.
+    #         Then, Equal Error Rate (EER) is obtained as the metric."
+    #
+    # All (query_i, gallery_j) pairs are scored.
+    # Genuine  : qry_labels[i] == reg_labels[j]
+    # Impostor : qry_labels[i] != reg_labels[j]
     sim_np = sim.numpy()
     gen_scores, imp_scores = [], []
     for i in range(Q):
@@ -488,6 +453,7 @@ def evaluate(epoch):
                 imp_scores.append(s)
     eer = compute_eer(gen_scores, imp_scores)
 
+    # ── Print ─────────────────────────────────────────────────────────────────
     print(f"\n  ┌─ Evaluation | Epoch {epoch} "
           f"| registration={train_domains} ({G} imgs) "
           f"| query={test_domains[0]} ({Q} imgs)")
@@ -500,7 +466,7 @@ def evaluate(epoch):
 # ----------------------------
 # 8. Training Loop
 # ----------------------------
-print(f"Starting Training | Mode: {augmentation_expansion_mode} | PDFG Mixup: {use_pdfg_fft_mixup} | Consistency: {use_consistency_loss} | MK-MMD: {use_mk_mmd}")
+print(f"Starting Training | Mode: {augmentation_expansion_mode} | SupCon Only Aug: {use_aug_only_for_supcon} | Global Scout: {use_global_scout}")
 
 for epoch in range(epochs):
     model.train(); proj_head.train(); criterion_arc.train()
@@ -514,14 +480,14 @@ for epoch in range(epochs):
         images_list = [img_orig]; labels_list = [y_i]; domains_list = [y_d]
 
         if torch.rand(1) < 0.5:
-            img_xor = apply_fft_mixup(img_orig, y_d)
+            img_xor = label_guided_fft_mixup(img_orig, y_d)
         else:
             img_xor = img_spatial
 
         if augmentation_expansion_mode == '2x':
             images_list.append(img_xor); labels_list.append(y_i); domains_list.append(y_d)
         elif augmentation_expansion_mode == '4x':
-            img_fft = apply_fft_mixup(img_orig, y_d)
+            img_fft = label_guided_fft_mixup(img_orig, y_d)
             images_list.extend([img_spatial, img_fft, img_xor])
             labels_list.extend([y_i, y_i, y_i])
             domains_list.extend([y_d, y_d, y_d])
@@ -551,28 +517,11 @@ for epoch in range(epochs):
 
         loss_con = criterion_supcon(projections_all, y_i_all)
         
-        # 1. NEW: PDFG Consistency Loss
-        loss_consistency = 0.0
-        if use_consistency_loss and augmentation_expansion_mode == '4x':
-            # embeddings_all contains: [orig, spatial, fft, xor]
-            emb_spatial = embeddings_all[batch_curr:2*batch_curr]
-            emb_fft = embeddings_all[2*batch_curr:3*batch_curr]
-            emb_xor = embeddings_all[3*batch_curr:]
-            loss_consistency = alpha_con * consistency_loss(emb_orig, [emb_spatial, emb_fft, emb_xor])
-
-        # 2 & 3. Domain Adaptation Loss (GRL vs MK-MMD)
         loss_domain = 0.0
         if use_grl:
             p = float(batch_idx + epoch * len(train_loader)) / (len(train_loader) * epochs)
             alpha_grl = 2. / (1. + np.exp(-10 * p)) - 1
             loss_domain = criterion_domain(domain_classifier(emb_orig, alpha_grl), y_d)
-        elif use_mk_mmd:
-            # Apply MK-MMD on the final routed features since the base backbone is frozen.
-            domains_present = torch.unique(y_d)
-            if len(domains_present) > 1:
-                idx_d1 = (y_d == domains_present[0]).nonzero(as_tuple=True)[0]
-                idx_d2 = (y_d == domains_present[1]).nonzero(as_tuple=True)[0]
-                loss_domain = beta_ada * mkmmd_loss(emb_orig[idx_d1], emb_orig[idx_d2])
         
         loss_aux = 0.0
         if use_global_scout:
@@ -585,7 +534,7 @@ for epoch in range(epochs):
             if aux_losses:
                 loss_aux = sum(aux_losses)
 
-        loss = loss_arc + (lamb * loss_con) + loss_consistency + loss_domain + (aux_weight * loss_aux) + (norm_weight * norm_routing_loss)
+        loss = loss_arc + (lamb * loss_con) + loss_domain + (aux_weight * loss_aux) + (norm_weight * norm_routing_loss)
         
         loss.backward()
         optimizer.step()
