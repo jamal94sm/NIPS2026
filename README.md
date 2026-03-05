@@ -22,3 +22,8 @@ Adding LoRA-MoE to the last stage (stage 3) of ConvNeXt foundation model and fin
 NIPS_8.py: 
 Adding LoRA-MoE to the last stage (stage 3) of ConvNeXt foundation model and fine-tune the model on CASIS-MS-ROI using ArcFace, SupCon (supervised Contrastive), and GRL (cross-entropy) loss functions. We want to use FFT-Swapping technique for augmentation along with general augmentations.  
 
+NIPS_9.py: 
+EER evaluation added. for identification accuracy, cross-domain (Reg: training domains, Qry: target domains) similarity measurement is considered instead of ArcFace recognition. 
+
+NIPS_10.py: 
+L2-norm consitency loss is added. GRL is replaced by MK-MMD loss. 
