@@ -607,7 +607,8 @@ for epoch in range(epochs):
     print(f"Epoch [{epoch+1}/{epochs}] Summary:")
     print(f"  -> Train | Loss: {avg_train_loss:.4f} | Acc: {avg_train_acc:.4f}")
 
-    acc, eer = evaluate(epoch + 1)
-    print("-" * 50)
+    if (epoch + 1) % 5 == 0:
+        acc, eer = evaluate(epoch + 1)
+        print("-" * 50)
 
     scheduler.step()
