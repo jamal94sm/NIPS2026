@@ -9,7 +9,7 @@ from tqdm import tqdm
 import os
 import numpy as np
 import random
-from PIL import Image
+from PIL import Image, ImageFilter, ImageEnhance
 from pytorch_metric_learning import losses
 
 # ----------------------------
@@ -321,6 +321,9 @@ test_dataset  = CASIA_MS_Dataset(data_path, test_domains,  shared_label_map, is_
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                           num_workers=2, pin_memory=True, drop_last=True)
 
+# ── Registration set = all source-domain images ───────────────────────────────
+# Paper: "The source datasets are used as the registration set"
+# A simple dataset wrapper that serves (img, label) from a list of samples.
 _tf = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
 
 class _ListDataset(Dataset):
@@ -331,12 +334,15 @@ class _ListDataset(Dataset):
         path, label = self.samples[idx]
         return self.transform(Image.open(path).convert("RGB")), label
 
+# Collect all source-domain image paths and their identity labels
 registration_samples = [
     (path, y_i)
     for path, y_i, y_d, spec
     in CASIA_MS_Dataset(data_path, train_domains, shared_label_map, is_train=False).samples
 ]
 
+# ── Query set = all target-domain images ─────────────────────────────────────
+# Paper: "the target dataset is used as the query set"
 query_samples = [
     (path, y_i)
     for path, y_i, y_d, spec
@@ -438,6 +444,7 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, 
 # 7. Evaluation helpers
 # ----------------------------
 def compute_eer(scores_gen, scores_imp):
+    """Compute EER (%) from genuine and impostor score lists."""
     if len(scores_gen) == 0 or len(scores_imp) == 0:
         return float("nan")
     gen  = np.array(scores_gen)
@@ -453,6 +460,10 @@ def compute_eer(scores_gen, scores_imp):
 
 @torch.no_grad()
 def _extract_embeddings(loader):
+    """
+    Extract L2-normalised embeddings for an entire loader.
+    loader yields (img, label) — works for both registration and query loaders.
+    """
     feats, labels = [], []
     for imgs, lbl in loader:
         imgs = imgs.to(device)
@@ -466,17 +477,39 @@ def evaluate(epoch):
     model.eval()
     criterion_arc.eval()
 
+    # ── Extract features ──────────────────────────────────────────────────────
+    # Registration set = all source-domain images  (paper: "registration set")
+    # Query set        = all target-domain images  (paper: "query set")
+    # Both sets are L2-normalised so cosine similarity = dot product.
+    # No self-match issue: the two sets come from different domains entirely.
     reg_feats, reg_labels = _extract_embeddings(registration_loader)  # [G, d]
     qry_feats, qry_labels = _extract_embeddings(query_loader)         # [Q, d]
 
     G = len(reg_labels)
     Q = len(qry_labels)
 
+    # ── Palmprint Identification (Rank-1 Accuracy) ────────────────────────────
+    # Paper: "the image in query set is matched with the images in registration
+    #         set to find the closest one. If they are belonging to the same
+    #         subject, the matching is successful and the accuracy is calculated
+    #         as the metric."
+    #
+    # sim[q, g] = cosine_similarity(query[q], gallery[g])
+    # For each query, argmax over gallery gives the predicted identity.
     sim     = torch.mm(qry_feats, reg_feats.t())   # [Q, G]
     nn_idx  = sim.argmax(dim=1)                    # [Q]
     pred    = reg_labels[nn_idx]                   # [Q] predicted identity
     acc     = (pred == qry_labels).float().mean().item() * 100
 
+    # ── Palmprint Verification (EER) ─────────────────────────────────────────
+    # Paper: "the images of target dataset are matched with each other.
+    #         The genuine matching from the same category and the imposter
+    #         matching from the different categories are obtained.
+    #         Then, Equal Error Rate (EER) is obtained as the metric."
+    #
+    # All (query_i, gallery_j) pairs are scored.
+    # Genuine  : qry_labels[i] == reg_labels[j]
+    # Impostor : qry_labels[i] != reg_labels[j]
     sim_np = sim.numpy()
     gen_scores, imp_scores = [], []
     for i in range(Q):
@@ -488,6 +521,7 @@ def evaluate(epoch):
                 imp_scores.append(s)
     eer = compute_eer(gen_scores, imp_scores)
 
+    # ── Print ─────────────────────────────────────────────────────────────────
     print(f"\n  ┌─ Evaluation | Epoch {epoch} "
           f"| registration={train_domains} ({G} imgs) "
           f"| query={test_domains[0]} ({Q} imgs)")
@@ -505,7 +539,17 @@ print(f"Starting Training | Mode: {augmentation_expansion_mode} | PDFG Mixup: {u
 for epoch in range(epochs):
     model.train(); proj_head.train(); criterion_arc.train()
     if use_grl: domain_classifier.train()
-    train_loss = 0.0; train_correct = 0; total_train = 0
+    
+    # Initialize loss accumulators for tracking
+    train_loss = 0.0
+    train_loss_arc = 0.0
+    train_loss_con = 0.0
+    train_loss_domain = 0.0
+    train_loss_aux = 0.0
+    train_loss_routing = 0.0
+    train_loss_consistency = 0.0
+    
+    train_correct = 0; total_train = 0
 
     for batch_idx, (img_orig, img_spatial, y_i, y_d) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")):
         img_orig, img_spatial, y_i, y_d = img_orig.to(device), img_spatial.to(device), y_i.to(device), y_d.to(device)
@@ -585,12 +629,26 @@ for epoch in range(epochs):
             if aux_losses:
                 loss_aux = sum(aux_losses)
 
-        loss = loss_arc + (lamb * loss_con) + loss_consistency + loss_domain + (aux_weight * loss_aux) + (norm_weight * norm_routing_loss)
+        # Apply weights and sum
+        weighted_loss_arc = loss_arc
+        weighted_loss_con = lamb * loss_con
+        weighted_loss_domain = loss_domain # Beta applied inside mkmmd logic above
+        weighted_loss_aux = aux_weight * loss_aux
+        weighted_loss_routing = norm_weight * norm_routing_loss
+
+        loss = weighted_loss_arc + weighted_loss_con + loss_consistency + weighted_loss_domain + weighted_loss_aux + weighted_loss_routing
         
         loss.backward()
         optimizer.step()
 
+        # Accumulate metrics
         train_loss += loss.item()
+        train_loss_arc += weighted_loss_arc.item() if isinstance(weighted_loss_arc, torch.Tensor) else weighted_loss_arc
+        train_loss_con += weighted_loss_con.item() if isinstance(weighted_loss_con, torch.Tensor) else weighted_loss_con
+        train_loss_domain += weighted_loss_domain.item() if isinstance(weighted_loss_domain, torch.Tensor) else weighted_loss_domain
+        train_loss_aux += weighted_loss_aux.item() if isinstance(weighted_loss_aux, torch.Tensor) else weighted_loss_aux
+        train_loss_routing += weighted_loss_routing.item() if isinstance(weighted_loss_routing, torch.Tensor) else weighted_loss_routing
+        train_loss_consistency += loss_consistency.item() if isinstance(loss_consistency, torch.Tensor) else loss_consistency
         
         if use_aug_only_for_supcon:
             preds = criterion_arc.get_logits(emb_orig).argmax(dim=1)
@@ -601,11 +659,22 @@ for epoch in range(epochs):
             train_correct += (preds == y_i_all).sum().item()
             total_train   += images_all.size(0)
 
-    avg_train_loss = train_loss / len(train_loader)
+    # Calculate averages
+    num_batches = len(train_loader)
+    avg_train_loss = train_loss / num_batches
     avg_train_acc  = train_correct / total_train
+    
+    avg_loss_arc = train_loss_arc / num_batches
+    avg_loss_con = train_loss_con / num_batches
+    avg_loss_domain = train_loss_domain / num_batches
+    avg_loss_aux = train_loss_aux / num_batches
+    avg_loss_routing = train_loss_routing / num_batches
+    avg_loss_consistency = train_loss_consistency / num_batches
 
     print(f"Epoch [{epoch+1}/{epochs}] Summary:")
-    print(f"  -> Train | Loss: {avg_train_loss:.4f} | Acc: {avg_train_acc:.4f}")
+    print(f"  -> Train | Total Loss: {avg_train_loss:.4f} | Acc: {avg_train_acc:.4f}")
+    print(f"     Components -> ArcFace: {avg_loss_arc:.4f} | SupCon: {avg_loss_con:.4f} | Domain(MK-MMD/GRL): {avg_loss_domain:.4f}")
+    print(f"                   MoE Aux: {avg_loss_aux:.4f} | Scout Routing: {avg_loss_routing:.4f} | Consistency: {avg_loss_consistency:.4f}")
 
     if (epoch + 1) % 5 == 0:
         acc, eer = evaluate(epoch + 1)
