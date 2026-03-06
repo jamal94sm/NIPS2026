@@ -45,7 +45,7 @@ ALPHA_FINAL   = 15.0
 BETA_FINAL    = 10.0
 
 # FSM noise strength — clamped inside module
-GAMMA         = 0.2     # FIX: was 0.5; lower = less noise explosion early
+GAMMA         = 0.1     # FIX: was 0.5; lower = less noise explosion early
 
 EVAL_EVERY    = 5
 NUM_WORKERS   = 2
