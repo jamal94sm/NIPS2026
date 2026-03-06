@@ -38,12 +38,12 @@ BATCH_SRC      = 32
 BATCH_TGT      = 10
 
 LR             = 1e-4       # paper: RMSprop 0.0001
-ARC_MARGIN     = 0.5        # paper: m = 0.5
+ARC_MARGIN     = 0.3        # paper: m = 0.5
 ARC_SCALE      = 32         # FIX v3: raised 16→32; arc=0.0004 means loss was dead
 
 # Loss weights
 ALPHA          = 1.0        # L_fea_distill weight  (paper: α = 1)
-BETA           = 0.5       # FIX v3: lowered 0.5→0.05; con was dominating (0.37>>arc)
+BETA           = 0.1       # FIX v3: lowered 0.5→0.05; con was dominating (0.37>>arc)
 LAMBDA_MMD     = 1.0        # FIX v3: raised 0.1→1.0; λ×mmd was only 0.0027 — no alignment
 
 # Warmup: train ONLY with ArcFace (no distillation, no MMD)
