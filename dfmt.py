@@ -1,19 +1,13 @@
 """
 DFMT: Distilling From Multi-Teacher  (IEEE TIM 2023, Shao & Zhong)
-Fixed version — v2
+Fixed version — v3
 
-Root causes of v1 not learning:
-  1. MK-MMD ~5-6 units drowning ArcFace signal in teachers
-     FIX: lambda_mmd=0.1 coefficient, ramped up after warmup
-  2. Student distilling from untrained teachers (random→random)
-     FIX: Warmup phase — student + teachers train with ArcFace only
-  3. ArcFace scale=32 too aggressive for untrained features
-     FIX: scale=16, warmup then normal
-
-Configuration:
-  Source  : 630
-  Targets : 460, 700, 850  (N=3)
-  Backbone: Paper's custom CNN  (Fig. 3) — Conv×4 + FC×3 → 128-d
+Fixes from loss analysis (epochs 91-100):
+  1. ArcFace dead (arc=0.0004)      → ARC_SCALE  16  → 32
+  2. MMD negligible (λ×mmd=0.0027)  → LAMBDA_MMD 0.1 → 1.0
+  3. con dominates (con=0.37>>arc)   → BETA        0.5 → 0.05
+  4. Train Acc=1.0 overfit           → dropout(0.3) added to FC layers
+  5. StepLR froze learning at ep60   → CosineAnnealingLR over full run
 """
 
 import os
@@ -45,12 +39,12 @@ BATCH_TGT      = 10
 
 LR             = 1e-4       # paper: RMSprop 0.0001
 ARC_MARGIN     = 0.5        # paper: m = 0.5
-ARC_SCALE      = 16         # FIX: was 32; 16 stable for small datasets
+ARC_SCALE      = 32         # FIX v3: raised 16→32; arc=0.0004 means loss was dead
 
 # Loss weights
 ALPHA          = 1.0        # L_fea_distill weight  (paper: α = 1)
-BETA           = 0.5        # L_con_distill weight  (paper: β = 0.5)
-LAMBDA_MMD     = 0.1        # FIX: scale MK-MMD so it doesn't crush ArcFace
+BETA           = 0.05       # FIX v3: lowered 0.5→0.05; con was dominating (0.37>>arc)
+LAMBDA_MMD     = 1.0        # FIX v3: raised 0.1→1.0; λ×mmd was only 0.0027 — no alignment
 
 # Warmup: train ONLY with ArcFace (no distillation, no MMD)
 # until teachers produce meaningful features
@@ -91,16 +85,16 @@ class CASIADomain(Dataset):
     _tf_base = transforms.Compose([
         transforms.Resize((112, 112)),
         transforms.ToTensor(),
-        #transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             #std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
     ])
     _tf_aug = transforms.Compose([
         transforms.Resize((112, 112)),
         transforms.RandomHorizontalFlip(),
         transforms.ColorJitter(brightness=0.2, contrast=0.2),
         transforms.ToTensor(),
-        #transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             #std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
     ])
 
     def __init__(self, data_path, domain, label_map, augment=False):
@@ -143,11 +137,14 @@ class FeatureExtractor(nn.Module):
         from torchvision import models
         resnet        = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])  # up to avgpool
-        self.fc       = nn.Linear(resnet.fc.in_features, emb_dim)
+        self.head     = nn.Sequential(
+            nn.Dropout(p=0.3),                          # FIX v3: regularise overfit
+            nn.Linear(resnet.fc.in_features, emb_dim),
+        )
 
     def forward(self, x):
-        top_conv = self.backbone(x).flatten(1)      # (B, 512) — σ(f^con) Eq. 7
-        emb      = F.normalize(self.fc(top_conv), p=2, dim=1)
+        top_conv = self.backbone(x).flatten(1)          # (B, 512) — σ(f^con) Eq. 7
+        emb      = F.normalize(self.head(top_conv), p=2, dim=1)
         return emb, top_conv
 
 
@@ -466,13 +463,14 @@ def main():
         list(student.parameters()) + list(arc_criteria[N_TARGETS].parameters()),
         lr=LR, weight_decay=1e-4
     )
-    schedulers = [optim.lr_scheduler.StepLR(o, step_size=30, gamma=0.1)
+    schedulers = [optim.lr_scheduler.CosineAnnealingLR(o, T_max=EPOCHS, eta_min=1e-6)
                   for o in tea_optims + [stu_optim]]
 
     print(f"\n{'='*60}")
-    print(f"  DFMT v2  src={SOURCE_DOMAIN}  →  {TARGET_DOMAINS}")
-    print(f"  Backbone : ResNet-18 pretrained (ImageNet)")
+    print(f"  DFMT v3  src={SOURCE_DOMAIN}  →  {TARGET_DOMAINS}")
+    print(f"  Backbone : ResNet-18 pretrained (ImageNet) + Dropout(0.3)")
     print(f"  α={ALPHA}  β={BETA}  λ_mmd={LAMBDA_MMD}  scale={ARC_SCALE}")
+    print(f"  Scheduler: CosineAnnealingLR  T_max={EPOCHS}  eta_min=1e-6")
     print(f"  Warmup={WARMUP_EPOCHS} epochs  Total={EPOCHS} epochs")
     print(f"{'='*60}\n")
 
@@ -499,7 +497,7 @@ def main():
                     "student":  student.state_dict(),
                     "teachers": [t.state_dict() for t in teachers],
                     "results":  results,
-                }, f"dfmt_v2_best_{SOURCE_DOMAIN}.pth")
+                }, f"dfmt_v3_best_{SOURCE_DOMAIN}.pth")
                 print(f"  ✓ Best saved  (Total Rank-1={total_acc:.2f}%)")
 
         for s in schedulers: s.step()
