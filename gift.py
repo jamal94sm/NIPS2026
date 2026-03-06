@@ -41,8 +41,8 @@ ARC_MARGIN    = 0.3
 ARC_SCALE     = 16      # FIX: was 64; 16 is stable for small datasets
 
 # Loss weights — ramped up after warmup (paper: α=15, β=10 at convergence)
-ALPHA_FINAL   = 15.0
-BETA_FINAL    = 10.0
+ALPHA_FINAL   = 15.0 # weight of L_DE (Diversity Enhancement)
+BETA_FINAL    = 10.0 # weight of L_Con (Consistency Preservation)
 
 # FSM noise strength — clamped inside module
 GAMMA         = 0.2     # FIX: was 0.5; lower = less noise explosion early
