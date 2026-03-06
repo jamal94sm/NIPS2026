@@ -40,8 +40,8 @@ from tqdm import tqdm
 # ─────────────────────────────────────────────────────────
 DATA_PATH      = "/home/pai-ng/Jamal/CASIA-MS-ROI"
 
-SOURCE_DOMAIN  = "630"
-TARGET_DOMAINS = ["460", "700", "850"]   # N = 3
+SOURCE_DOMAIN  = "460"
+TARGET_DOMAINS = ["700", "850"]   # N = 3
 
 EMB_DIM        = 128
 BATCH_SRC      = 32    # n  — source images per iteration
