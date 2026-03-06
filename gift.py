@@ -29,8 +29,8 @@ from tqdm import tqdm
 # 1.  CONFIGURATION
 # ─────────────────────────────────────────────
 DATA_PATH     = "/home/pai-ng/Jamal/CASIA-MS-ROI"
-SOURCE_DOMAIN = "700"
-TARGET_DOMAIN = "460"
+SOURCE_DOMAIN = "940"
+TARGET_DOMAIN = "850"
 
 BATCH_SIZE    = 24
 LR            = 1e-3
