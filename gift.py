@@ -34,11 +34,11 @@ TARGET_DOMAIN = "700"
 
 BATCH_SIZE    = 24
 LR            = 1e-3
-WARMUP_EPOCHS = 10      # train with ArcFace ONLY, FSM disabled → lets backbone stabilise first
+WARMUP_EPOCHS = 5      # train with ArcFace ONLY, FSM disabled → lets backbone stabilise first
 EPOCHS        = 100     # total epochs (warmup + main)
 EMB_DIM       = 128
 ARC_MARGIN    = 0.3
-ARC_SCALE     = 16      # FIX: was 64; 16 is stable for small datasets
+ARC_SCALE     = 64      # FIX: was 64; 16 is stable for small datasets
 
 # Loss weights — ramped up after warmup (paper: α=15, β=10 at convergence)
 ALPHA_FINAL   = 15.0
@@ -49,7 +49,7 @@ GAMMA         = 0.2     # FIX: was 0.5; lower = less noise explosion early
 
 EVAL_EVERY    = 5
 NUM_WORKERS   = 2
-GRAD_CLIP     = 1.0     # FIX: gradient clipping
+#GRAD_CLIP     = 1.0     # FIX: gradient clipping
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
