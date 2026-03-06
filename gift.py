@@ -29,11 +29,11 @@ from tqdm import tqdm
 # 1.  CONFIGURATION
 # ─────────────────────────────────────────────
 DATA_PATH     = "/home/pai-ng/Jamal/CASIA-MS-ROI"
-SOURCE_DOMAIN = "940"
-TARGET_DOMAIN = "700"
+SOURCE_DOMAIN = "460"
+TARGET_DOMAIN = "630"
 
 BATCH_SIZE    = 32
-LR            = 0.5e-3
+LR            = 1e-3
 WARMUP_EPOCHS = 5      # train with ArcFace ONLY, FSM disabled → lets backbone stabilise first
 EPOCHS        = 100     # total epochs (warmup + main)
 EMB_DIM       = 128
