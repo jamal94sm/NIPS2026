@@ -48,7 +48,7 @@ LAMBDA_MMD     = 1.0        # FIX v3: raised 0.1→1.0; λ×mmd was only 0.0027 
 
 # Warmup: train ONLY with ArcFace (no distillation, no MMD)
 # until teachers produce meaningful features
-WARMUP_EPOCHS  = 20         # FIX: was 0
+WARMUP_EPOCHS  = 10         # FIX: was 0
 
 EPOCHS         = 100
 EVAL_EVERY     = 5
