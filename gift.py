@@ -30,7 +30,7 @@ from tqdm import tqdm
 # ─────────────────────────────────────────────
 DATA_PATH     = "/home/pai-ng/Jamal/CASIA-MS-ROI"
 SOURCE_DOMAIN = "940"
-TARGET_DOMAIN = "850"
+TARGET_DOMAIN = "700"
 
 BATCH_SIZE    = 24
 LR            = 1e-3
