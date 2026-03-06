@@ -35,8 +35,8 @@ from tqdm import tqdm
 # ─────────────────────────────────────────────────────────
 DATA_PATH      = "/home/pai-ng/Jamal/CASIA-MS-ROI"
 
-SOURCE_DOMAIN  = "460"
-TARGET_DOMAINS = ["630", "850"]
+SOURCE_DOMAIN  = "630"
+TARGET_DOMAINS = ["460", "700", "850"]
 N_TARGETS      = len(TARGET_DOMAINS)
 
 EMB_DIM        = 128
@@ -44,7 +44,7 @@ BATCH_SRC      = 32
 BATCH_TGT      = 10
 
 LR             = 1e-4       # paper: RMSprop 0.0001
-ARC_MARGIN     = 0.3        # paper: m = 0.5
+ARC_MARGIN     = 0.5        # paper: m = 0.5
 ARC_SCALE      = 16         # FIX: was 32; 16 stable for small datasets
 
 # Loss weights
@@ -131,53 +131,23 @@ class CASIADomain(Dataset):
 
 
 # ─────────────────────────────────────────────────────────
-# 3.  BACKBONE — Paper's custom CNN  (Fig. 3)
-#     Conv1: 3×3×16  stride 4  LeakyReLU + MaxPool 2×2 stride 1
-#     Conv2: 5×5×32  stride 2  LeakyReLU + MaxPool 2×2 stride 1
-#     Conv3: 3×3×64  stride 1  LeakyReLU
-#     Conv4: 3×3×128 stride 1  LeakyReLU + MaxPool 2×2 stride 1
-#     FC1: 1024  LeakyReLU
-#     FC2: 512   LeakyReLU
-#     FC3: 128   (no activation)
+# 3.  BACKBONE — ResNet-18 pretrained on ImageNet
 #
 #     Returns (embedding, top_conv_feat):
 #       embedding     — 128-d L2-normed  (ArcFace + distillation)
-#       top_conv_feat — σ(Conv4 output)  (L_con_distill Eq. 7)
+#       top_conv_feat — pooled layer4 output  (L_con_distill Eq. 7)
 # ─────────────────────────────────────────────────────────
 class FeatureExtractor(nn.Module):
     def __init__(self, emb_dim=EMB_DIM):
         super().__init__()
-        self.conv1  = nn.Conv2d(3,  16,  3, stride=4, padding=1)
-        self.pool1  = nn.MaxPool2d(2, stride=1)
-        self.conv2  = nn.Conv2d(16, 32,  5, stride=2, padding=2)
-        self.pool2  = nn.MaxPool2d(2, stride=1)
-        self.conv3  = nn.Conv2d(32, 64,  3, stride=1, padding=1)
-        self.conv4  = nn.Conv2d(64, 128, 3, stride=1, padding=1)
-        self.pool3  = nn.MaxPool2d(2, stride=1)
-        self.act    = nn.LeakyReLU(0.2, inplace=True)
-        self.gap    = nn.AdaptiveAvgPool2d(1)   # σ(·) in Eq. 7
-
-        # Compute flat dim after conv stack
-        with torch.no_grad():
-            dummy    = torch.zeros(1, 3, 112, 112)
-            flat_dim = self._conv_out(dummy).shape[1]
-
-        self.fc1 = nn.Linear(flat_dim, 1024)
-        self.fc2 = nn.Linear(1024, 512)
-        self.fc3 = nn.Linear(512, emb_dim)
-
-    def _conv_out(self, x):
-        x = self.pool1(self.act(self.conv1(x)))
-        x = self.pool2(self.act(self.conv2(x)))
-        x = self.act(self.conv3(x))
-        x = self.pool3(self.act(self.conv4(x)))
-        return self.gap(x).flatten(1)
+        from torchvision import models
+        resnet        = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        self.backbone = nn.Sequential(*list(resnet.children())[:-1])  # up to avgpool
+        self.fc       = nn.Linear(resnet.fc.in_features, emb_dim)
 
     def forward(self, x):
-        top_conv = self._conv_out(x)                        # σ(f^con) — Eq. 7
-        h        = self.act(self.fc1(top_conv))
-        h        = self.act(self.fc2(h))
-        emb      = F.normalize(self.fc3(h), p=2, dim=1)
+        top_conv = self.backbone(x).flatten(1)      # (B, 512) — σ(f^con) Eq. 7
+        emb      = F.normalize(self.fc(top_conv), p=2, dim=1)
         return emb, top_conv
 
 
@@ -345,8 +315,18 @@ def train_one_epoch(teachers, student, tea_optims, stu_optim,
     warmup = (epoch < WARMUP_EPOCHS)
     phase  = "WARMUP" if warmup else f"DFMT (λ={lmd_mmd:.3f} α={alpha:.1f} β={beta:.2f})"
 
-    tot_tea = tot_stu = 0.0
-    correct = total   = 0
+    # ── Per-component loss accumulators ──────────────────────────────────
+    tot_tea        = 0.0   # total teacher loss
+    tot_tea_arc    = 0.0   # teacher ArcFace component
+    tot_tea_mmd    = 0.0   # teacher MK-MMD component (0 during warmup)
+
+    tot_stu        = 0.0   # total student loss
+    tot_stu_arc    = 0.0   # student ArcFace component
+    tot_stu_dis    = 0.0   # student L_dis_fea  (averaged over teachers)
+    tot_stu_ang    = 0.0   # student L_angle_fea (averaged over teachers)
+    tot_stu_con    = 0.0   # student L_con_distill (averaged over teachers)
+
+    correct = total = 0
 
     for _ in tqdm(range(n_batches), desc=f"Epoch {epoch+1}/{EPOCHS} [{phase}]"):
 
@@ -364,24 +344,32 @@ def train_one_epoch(teachers, student, tea_optims, stu_optim,
 
             t_opt.zero_grad()
             src_emb, _ = teacher(src_imgs)
-            loss_tea   = t_arc(src_emb, src_lbl)
+            arc_val    = t_arc(src_emb, src_lbl)
+            mmd_val    = src_imgs.new_zeros(1).squeeze()
+            loss_tea   = arc_val
 
             if not warmup:
                 tgt_emb, _ = teacher(tgt_imgs[j])
-                loss_tea   = loss_tea + lmd_mmd * mk_mmd(src_emb, tgt_emb)
+                mmd_val    = mk_mmd(src_emb, tgt_emb)
+                loss_tea   = arc_val + lmd_mmd * mmd_val
 
             if torch.isfinite(loss_tea):
                 loss_tea.backward()
                 nn.utils.clip_grad_norm_(teacher.parameters(), 5.0)
                 t_opt.step()
-                tot_tea += loss_tea.item()
+                tot_tea     += loss_tea.item()
+                tot_tea_arc += arc_val.item()
+                tot_tea_mmd += mmd_val.item()
 
         # ══════════════════════════════════════════════════════════════════
         # STEP 3 — Student: ArcFace + distillation from each teacher in turn
         # ══════════════════════════════════════════════════════════════════
         stu_optim.zero_grad()
         stu_emb_src, stu_conv_src = student(src_imgs)
-        loss_stu = stu_arc(stu_emb_src, src_lbl)
+        arc_stu  = stu_arc(stu_emb_src, src_lbl)
+        loss_stu = arc_stu
+
+        batch_dis = batch_ang = batch_con = 0.0
 
         if not warmup:
             loss_distill = src_imgs.new_zeros(1).squeeze()
@@ -397,14 +385,22 @@ def train_one_epoch(teachers, student, tea_optims, stu_optim,
                 lc = l_con_distill(tea_conv_tgt, stu_conv_tgt)
 
                 loss_distill = loss_distill + alpha*(ld+la) + beta*lc
+                batch_dis   += ld.item()
+                batch_ang   += la.item()
+                batch_con   += lc.item()
 
-            loss_stu = loss_stu + loss_distill / N_TARGETS
+            loss_distill = loss_distill / N_TARGETS
+            loss_stu     = arc_stu + loss_distill
+            tot_stu_dis += batch_dis / N_TARGETS
+            tot_stu_ang += batch_ang / N_TARGETS
+            tot_stu_con += batch_con / N_TARGETS
 
         if torch.isfinite(loss_stu):
             loss_stu.backward()
             nn.utils.clip_grad_norm_(student.parameters(), 5.0)
             stu_optim.step()
-            tot_stu += loss_stu.item()
+            tot_stu     += loss_stu.item()
+            tot_stu_arc += arc_stu.item()
 
         with torch.no_grad():
             preds    = stu_arc.get_logits(stu_emb_src).argmax(1)
@@ -412,8 +408,15 @@ def train_one_epoch(teachers, student, tea_optims, stu_optim,
             total   += src_lbl.size(0)
 
     n = max(n_batches, 1)
-    print(f"  Tea={tot_tea/n:.4f}  Stu={tot_stu/n:.4f}  "
-          f"Train-Acc={correct/max(total,1):.4f}")
+    print(f"  [Teacher]  total={tot_tea/n:.4f}  "
+          f"arc={tot_tea_arc/(n*N_TARGETS):.4f}  "
+          f"mmd={tot_tea_mmd/(n*N_TARGETS):.4f}")
+    print(f"  [Student]  total={tot_stu/n:.4f}  "
+          f"arc={tot_stu_arc/n:.4f}  "
+          f"dis={tot_stu_dis/n:.4f}  "
+          f"ang={tot_stu_ang/n:.4f}  "
+          f"con={tot_stu_con/n:.4f}")
+    print(f"  [Train]    Acc={correct/max(total,1):.4f}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -468,7 +471,7 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"  DFMT v2  src={SOURCE_DOMAIN}  →  {TARGET_DOMAINS}")
-    print(f"  Backbone : Paper CNN (Conv×4 + FC×3, scratch)")
+    print(f"  Backbone : ResNet-18 pretrained (ImageNet)")
     print(f"  α={ALPHA}  β={BETA}  λ_mmd={LAMBDA_MMD}  scale={ARC_SCALE}")
     print(f"  Warmup={WARMUP_EPOCHS} epochs  Total={EPOCHS} epochs")
     print(f"{'='*60}\n")
