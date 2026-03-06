@@ -29,8 +29,8 @@ from tqdm import tqdm
 # ─────────────────────────────────────────────────────────
 DATA_PATH      = "/home/pai-ng/Jamal/CASIA-MS-ROI"
 
-SOURCE_DOMAIN  = "460"
-TARGET_DOMAINS = ["630", "850", "940"]
+SOURCE_DOMAIN  = "630"
+TARGET_DOMAINS = ["460", "700", "850"]
 N_TARGETS      = len(TARGET_DOMAINS)
 
 EMB_DIM        = 128
@@ -39,7 +39,7 @@ BATCH_TGT      = 10
 
 LR             = 1e-4       # paper: RMSprop 0.0001
 ARC_MARGIN     = 0.5        # paper: m = 0.5
-ARC_SCALE      = 16         # FIX v3: raised 16→32; arc=0.0004 means loss was dead
+ARC_SCALE      = 32         # FIX v3: raised 16→32; arc=0.0004 means loss was dead
 
 # Loss weights
 ALPHA          = 1.0        # L_fea_distill weight  (paper: α = 1)
@@ -127,6 +127,15 @@ class CASIADomain(Dataset):
 # ─────────────────────────────────────────────────────────
 # 3.  BACKBONE — ResNet-18 pretrained on ImageNet
 #
+#     Frozen  (pretrained weights kept fixed, no grad):
+#       conv1, bn1, layer1, layer2
+#     Trainable (finetuned):
+#       layer3, layer4, avgpool, head
+#
+#     Rationale: early layers detect generic low-level features
+#     (edges, textures) shared across all spectra — no need to
+#     retrain. layer3/4 capture domain-specific semantics → adapt.
+#
 #     Returns (embedding, top_conv_feat):
 #       embedding     — 128-d L2-normed  (ArcFace + distillation)
 #       top_conv_feat — pooled layer4 output  (L_con_distill Eq. 7)
@@ -135,15 +144,46 @@ class FeatureExtractor(nn.Module):
     def __init__(self, emb_dim=EMB_DIM):
         super().__init__()
         from torchvision import models
-        resnet        = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        self.backbone = nn.Sequential(*list(resnet.children())[:-1])  # up to avgpool
-        self.head     = nn.Sequential(
-            nn.Dropout(p=0.3),                          # FIX v3: regularise overfit
+        resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+
+        # ── Frozen layers (conv1, bn1, layer1, layer2) ───────────────────
+        self.conv1   = resnet.conv1
+        self.bn1     = resnet.bn1
+        self.relu    = resnet.relu
+        self.maxpool = resnet.maxpool
+        self.layer1  = resnet.layer1
+        self.layer2  = resnet.layer2
+
+        # ── Trainable layers (layer3, layer4, head) ──────────────────────
+        self.layer3  = resnet.layer3
+        self.layer4  = resnet.layer4
+        self.avgpool = resnet.avgpool
+        self.head    = nn.Sequential(
+            nn.Dropout(p=0.3),
             nn.Linear(resnet.fc.in_features, emb_dim),
         )
 
+        self._freeze_layers()
+
+    def _freeze_layers(self):
+        for module in [self.conv1, self.bn1, self.layer1, self.layer2]:
+            for param in module.parameters():
+                param.requires_grad = False
+
+    def trainable_params(self):
+        return [p for p in self.parameters() if p.requires_grad]
+
     def forward(self, x):
-        top_conv = self.backbone(x).flatten(1)          # (B, 512) — σ(f^con) Eq. 7
+        # Frozen path — wrapped in no_grad for memory + speed
+        with torch.no_grad():
+            x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
+            x = self.layer1(x)
+            x = self.layer2(x)
+
+        # Trainable path
+        x        = self.layer3(x)
+        x        = self.layer4(x)
+        top_conv = self.avgpool(x).flatten(1)   # (B, 512) — σ(f^con) Eq. 7
         emb      = F.normalize(self.head(top_conv), p=2, dim=1)
         return emb, top_conv
 
@@ -452,23 +492,30 @@ def main():
         for _ in range(N_TARGETS + 1)
     ])
 
-    # ── Optimizers ───────────────────────────────────────────────────────
+    # ── Optimizers — only trainable params (layer3, layer4, head) ──────
     tea_optims = [
-        optim.RMSprop(list(teachers[j].parameters()) +
+        optim.RMSprop(teachers[j].trainable_params() +
                       list(arc_criteria[j].parameters()),
                       lr=LR, weight_decay=1e-4)
         for j in range(N_TARGETS)
     ]
     stu_optim = optim.RMSprop(
-        list(student.parameters()) + list(arc_criteria[N_TARGETS].parameters()),
+        student.trainable_params() + list(arc_criteria[N_TARGETS].parameters()),
         lr=LR, weight_decay=1e-4
     )
     schedulers = [optim.lr_scheduler.CosineAnnealingLR(o, T_max=EPOCHS, eta_min=1e-6)
                   for o in tea_optims + [stu_optim]]
 
+    # ── Parameter counts ─────────────────────────────────────────────────
+    total_p     = sum(p.numel() for p in student.parameters())
+    trainable_p = sum(p.numel() for p in student.parameters() if p.requires_grad)
+    frozen_p    = total_p - trainable_p
+
     print(f"\n{'='*60}")
     print(f"  DFMT v3  src={SOURCE_DOMAIN}  →  {TARGET_DOMAINS}")
-    print(f"  Backbone : ResNet-18 pretrained (ImageNet) + Dropout(0.3)")
+    print(f"  Backbone : ResNet-18 pretrained, partial finetune")
+    print(f"  Frozen   : conv1, bn1, layer1, layer2  ({frozen_p:,} params)")
+    print(f"  Trainable: layer3, layer4, head         ({trainable_p:,} params)")
     print(f"  α={ALPHA}  β={BETA}  λ_mmd={LAMBDA_MMD}  scale={ARC_SCALE}")
     print(f"  Scheduler: CosineAnnealingLR  T_max={EPOCHS}  eta_min=1e-6")
     print(f"  Warmup={WARMUP_EPOCHS} epochs  Total={EPOCHS} epochs")
