@@ -3,19 +3,17 @@ DFMT: Distilling From Multi-Teacher  (IEEE TIM 2023, Shao & Zhong)
 Fixed version — v2
 
 Root causes of v1 not learning:
-  1. Custom CNN from scratch + only 6 imgs/class → features never converge
-     FIX: ResNet-18 pretrained on ImageNet (paper allows "other networks")
-  2. MK-MMD ~5-6 units drowning ArcFace signal in teachers
-     FIX: lambda_mmd coefficient starting at 0.01, ramped up
-  3. Student distilling from untrained teachers (random→random)
+  1. MK-MMD ~5-6 units drowning ArcFace signal in teachers
+     FIX: lambda_mmd=0.1 coefficient, ramped up after warmup
+  2. Student distilling from untrained teachers (random→random)
      FIX: Warmup phase — student + teachers train with ArcFace only
-  4. ArcFace scale=32 too aggressive for untrained features
+  3. ArcFace scale=32 too aggressive for untrained features
      FIX: scale=16, warmup then normal
 
 Configuration:
   Source  : 630
   Targets : 460, 700, 850  (N=3)
-  Backbone: ResNet-18 pretrained (paper: "other networks can also be selected")
+  Backbone: Paper's custom CNN  (Fig. 3) — Conv×4 + FC×3 → 128-d
 """
 
 import os
@@ -28,7 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, models
+from torchvision import transforms
 from pytorch_metric_learning import losses
 from tqdm import tqdm
 
@@ -133,21 +131,53 @@ class CASIADomain(Dataset):
 
 
 # ─────────────────────────────────────────────────────────
-# 3.  BACKBONE — ResNet-18 pretrained
-#     Returns (embedding, top_conv_feat) to match paper interface:
+# 3.  BACKBONE — Paper's custom CNN  (Fig. 3)
+#     Conv1: 3×3×16  stride 4  LeakyReLU + MaxPool 2×2 stride 1
+#     Conv2: 5×5×32  stride 2  LeakyReLU + MaxPool 2×2 stride 1
+#     Conv3: 3×3×64  stride 1  LeakyReLU
+#     Conv4: 3×3×128 stride 1  LeakyReLU + MaxPool 2×2 stride 1
+#     FC1: 1024  LeakyReLU
+#     FC2: 512   LeakyReLU
+#     FC3: 128   (no activation)
+#
+#     Returns (embedding, top_conv_feat):
 #       embedding     — 128-d L2-normed  (ArcFace + distillation)
-#       top_conv_feat — pooled layer4 output  (L_con_distill Eq. 7)
+#       top_conv_feat — σ(Conv4 output)  (L_con_distill Eq. 7)
 # ─────────────────────────────────────────────────────────
 class FeatureExtractor(nn.Module):
     def __init__(self, emb_dim=EMB_DIM):
         super().__init__()
-        resnet         = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        self.backbone  = nn.Sequential(*list(resnet.children())[:-1])  # up to avgpool
-        self.fc        = nn.Linear(resnet.fc.in_features, emb_dim)
+        self.conv1  = nn.Conv2d(3,  16,  3, stride=4, padding=1)
+        self.pool1  = nn.MaxPool2d(2, stride=1)
+        self.conv2  = nn.Conv2d(16, 32,  5, stride=2, padding=2)
+        self.pool2  = nn.MaxPool2d(2, stride=1)
+        self.conv3  = nn.Conv2d(32, 64,  3, stride=1, padding=1)
+        self.conv4  = nn.Conv2d(64, 128, 3, stride=1, padding=1)
+        self.pool3  = nn.MaxPool2d(2, stride=1)
+        self.act    = nn.LeakyReLU(0.2, inplace=True)
+        self.gap    = nn.AdaptiveAvgPool2d(1)   # σ(·) in Eq. 7
+
+        # Compute flat dim after conv stack
+        with torch.no_grad():
+            dummy    = torch.zeros(1, 3, 112, 112)
+            flat_dim = self._conv_out(dummy).shape[1]
+
+        self.fc1 = nn.Linear(flat_dim, 1024)
+        self.fc2 = nn.Linear(1024, 512)
+        self.fc3 = nn.Linear(512, emb_dim)
+
+    def _conv_out(self, x):
+        x = self.pool1(self.act(self.conv1(x)))
+        x = self.pool2(self.act(self.conv2(x)))
+        x = self.act(self.conv3(x))
+        x = self.pool3(self.act(self.conv4(x)))
+        return self.gap(x).flatten(1)
 
     def forward(self, x):
-        top_conv = self.backbone(x).flatten(1)   # (B, 512) — σ(f^con) in Eq. 7
-        emb      = F.normalize(self.fc(top_conv), p=2, dim=1)
+        top_conv = self._conv_out(x)                        # σ(f^con) — Eq. 7
+        h        = self.act(self.fc1(top_conv))
+        h        = self.act(self.fc2(h))
+        emb      = F.normalize(self.fc3(h), p=2, dim=1)
         return emb, top_conv
 
 
@@ -233,10 +263,15 @@ def evaluate(student, reg_loader, qry_loaders, epoch):
         return torch.cat(fs), torch.cat(ls)
 
     rf, rl = extract(reg_loader)
-    print(f"\n  ┌─ Epoch {epoch}  src={SOURCE_DOMAIN} ({len(rl)} imgs)")
+    print(f"\n  ┌─ Epoch {epoch}  src={SOURCE_DOMAIN}  reg={len(rl)} imgs")
+
     results = {}
+    all_qf, all_ql = [], []   # pooled across all target domains
+
     for dom, qry_loader in qry_loaders.items():
         qf, ql = extract(qry_loader)
+        all_qf.append(qf); all_ql.append(ql)
+
         sim = torch.mm(qf, rf.t())
         acc = (rl[sim.argmax(1)] == ql).float().mean().item() * 100
         s   = sim.numpy()
@@ -247,7 +282,25 @@ def evaluate(student, reg_loader, qry_loaders, epoch):
         eer = compute_eer(gen_s, imp_s)
         print(f"  │  [{dom}]  Rank-1={acc:6.2f}%  EER={eer:5.2f}%")
         results[dom] = (acc, eer)
+
+    # ── Total accuracy across ALL target domains pooled ───────────────────
+    all_qf = torch.cat(all_qf)   # (total_queries, D)
+    all_ql = torch.cat(all_ql)   # (total_queries,)
+    sim_all = torch.mm(all_qf, rf.t())
+    total_acc = (rl[sim_all.argmax(1)] == all_ql).float().mean().item() * 100
+    s_all     = sim_all.numpy()
+    gen_all, imp_all = [], []
+    for i in range(len(all_ql)):
+        for j in range(len(rl)):
+            (gen_all if all_ql[i]==rl[j] else imp_all).append(s_all[i,j])
+    total_eer = compute_eer(gen_all, imp_all)
+
+    print(f"  ├─ {'─'*53}")
+    print(f"  │  [TOTAL]  Rank-1={total_acc:6.2f}%  EER={total_eer:5.2f}%"
+          f"  ({len(all_ql)} query imgs across {len(qry_loaders)} domains)")
     print(f"  └{'─'*55}")
+
+    results["TOTAL"] = (total_acc, total_eer)
     return results
 
 
@@ -415,7 +468,7 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"  DFMT v2  src={SOURCE_DOMAIN}  →  {TARGET_DOMAINS}")
-    print(f"  Backbone : ResNet-18 pretrained")
+    print(f"  Backbone : Paper CNN (Conv×4 + FC×3, scratch)")
     print(f"  α={ALPHA}  β={BETA}  λ_mmd={LAMBDA_MMD}  scale={ARC_SCALE}")
     print(f"  Warmup={WARMUP_EPOCHS} epochs  Total={EPOCHS} epochs")
     print(f"{'='*60}\n")
@@ -429,19 +482,22 @@ def main():
 
         if (epoch + 1) % EVAL_EVERY == 0:
             results      = evaluate(student, reg_loader, qry_loaders, epoch+1)
-            mean_acc     = np.mean([v[0] for v in results.values()])
-            mean_eer     = np.mean([v[1] for v in results.values()])
-            print(f"  Mean Rank-1={mean_acc:.2f}%  Mean EER={mean_eer:.2f}%")
+            total_acc    = results["TOTAL"][0]
+            total_eer    = results["TOTAL"][1]
+            domain_accs  = [v[0] for k, v in results.items() if k != "TOTAL"]
+            mean_acc     = np.mean(domain_accs)
+            print(f"  Mean domain Rank-1={mean_acc:.2f}%  "
+                  f"Total Rank-1={total_acc:.2f}%  Total EER={total_eer:.2f}%")
 
-            if mean_acc > best_mean_acc:
-                best_mean_acc = mean_acc
+            if total_acc > best_mean_acc:
+                best_mean_acc = total_acc
                 torch.save({
                     "epoch":    epoch + 1,
                     "student":  student.state_dict(),
                     "teachers": [t.state_dict() for t in teachers],
                     "results":  results,
                 }, f"dfmt_v2_best_{SOURCE_DOMAIN}.pth")
-                print(f"  ✓ Best saved  (mean Rank-1={mean_acc:.2f}%)")
+                print(f"  ✓ Best saved  (Total Rank-1={total_acc:.2f}%)")
 
         for s in schedulers: s.step()
 
