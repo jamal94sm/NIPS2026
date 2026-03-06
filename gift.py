@@ -49,7 +49,7 @@ GAMMA         = 0.2     # FIX: was 0.5; lower = less noise explosion early
 
 EVAL_EVERY    = 5
 NUM_WORKERS   = 2
-#GRAD_CLIP     = 1.0     # FIX: gradient clipping
+GRAD_CLIP     = 1.0     # FIX: gradient clipping
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
