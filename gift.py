@@ -34,8 +34,8 @@ TARGET_DOMAIN = "460"
 
 BATCH_SIZE    = 32
 LR            = 1e-4
-WARMUP_EPOCHS = 5      # train with ArcFace ONLY, FSM disabled → lets backbone stabilise first
-EPOCHS        = 100     # total epochs (warmup + main)
+WARMUP_EPOCHS = 30      # train with ArcFace ONLY, FSM disabled → lets backbone stabilise first
+EPOCHS        = 200     # total epochs (warmup + main)
 EMB_DIM       = 128
 ARC_MARGIN    = 0.3
 ARC_SCALE     = 16      # FIX: was 64; 16 is stable for small datasets
