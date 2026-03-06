@@ -80,16 +80,16 @@ class CASIAMultiSpectral(Dataset):
         self.to_tensor = transforms.Compose([
             transforms.Resize((112, 112)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5],
-                                 std=[0.5, 0.5, 0.5]),  # FIX: normalise input
+            #transforms.Normalize(mean=[0.5, 0.5, 0.5],
+                                 #std=[0.5, 0.5, 0.5]),  # FIX: normalise input
         ])
         self.aug = transforms.Compose([
             transforms.Resize((112, 112)),
             transforms.RandomHorizontalFlip(),
             transforms.ColorJitter(brightness=0.2, contrast=0.2),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5],
-                                 std=[0.5, 0.5, 0.5]),
+            #transforms.Normalize(mean=[0.5, 0.5, 0.5],
+                                 #std=[0.5, 0.5, 0.5]),
         ])
         self.augment = augment
 
