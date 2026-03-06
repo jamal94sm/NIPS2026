@@ -29,8 +29,8 @@ from tqdm import tqdm
 # ─────────────────────────────────────────────────────────
 DATA_PATH      = "/home/pai-ng/Jamal/CASIA-MS-ROI"
 
-SOURCE_DOMAIN  = "630"
-TARGET_DOMAINS = ["460", "700", "850"]
+SOURCE_DOMAIN  = "940"
+TARGET_DOMAINS = ["460", "700", "630"]
 N_TARGETS      = len(TARGET_DOMAINS)
 
 EMB_DIM        = 128
