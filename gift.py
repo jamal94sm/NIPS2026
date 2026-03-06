@@ -32,8 +32,8 @@ DATA_PATH     = "/home/pai-ng/Jamal/CASIA-MS-ROI"
 SOURCE_DOMAIN = "940"
 TARGET_DOMAIN = "700"
 
-BATCH_SIZE    = 24
-LR            = 1e-3
+BATCH_SIZE    = 32
+LR            = 1e-4
 WARMUP_EPOCHS = 5      # train with ArcFace ONLY, FSM disabled → lets backbone stabilise first
 EPOCHS        = 100     # total epochs (warmup + main)
 EMB_DIM       = 128
