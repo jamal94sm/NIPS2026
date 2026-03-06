@@ -33,7 +33,7 @@ SOURCE_DOMAIN = "460"
 TARGET_DOMAIN = "630"
 
 BATCH_SIZE    = 32
-LR            = 1e-3
+LR            = 1e-4
 WARMUP_EPOCHS = 5      # train with ArcFace ONLY, FSM disabled → lets backbone stabilise first
 EPOCHS        = 100     # total epochs (warmup + main)
 EMB_DIM       = 128
