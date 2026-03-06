@@ -378,8 +378,8 @@ def train_one_epoch(model, discriminators, criterion_arc,
 
         loss.backward()
         # FIX: clip gradients before step
-        #torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-        #torch.nn.utils.clip_grad_norm_(discriminators.parameters(), GRAD_CLIP)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        torch.nn.utils.clip_grad_norm_(discriminators.parameters(), GRAD_CLIP)
 
         optimizer.step()
         opt_disc.step()
