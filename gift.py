@@ -38,7 +38,7 @@ WARMUP_EPOCHS = 5      # train with ArcFace ONLY, FSM disabled → lets backbone
 EPOCHS        = 100     # total epochs (warmup + main)
 EMB_DIM       = 128
 ARC_MARGIN    = 0.3
-ARC_SCALE     = 64      # FIX: was 64; 16 is stable for small datasets
+ARC_SCALE     = 32      # FIX: was 64; 16 is stable for small datasets
 
 # Loss weights — ramped up after warmup (paper: α=15, β=10 at convergence)
 ALPHA_FINAL   = 15.0
