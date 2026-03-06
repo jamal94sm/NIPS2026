@@ -49,8 +49,8 @@ BATCH_TGT      = 10    # m  — target images per target domain per iteration
                         #      total batch ≈ 32 + 3×10 = 62
 
 LR             = 1e-4  # paper: 0.0001
-ARC_MARGIN     = 0.5   # paper: m = 0.5
-ARC_SCALE      = 32    # not stated; 32 is safe for 200 classes
+ARC_MARGIN     = 0.3   # paper: m = 0.5
+ARC_SCALE      = 16    # not stated; 32 is safe for 200 classes
 ALPHA          = 1.0   # weight for L_fea_distill  (paper: α = 1)
 BETA           = 0.5   # weight for L_con_distill  (paper: β = 0.5)
 EPOCHS         = 100
@@ -90,16 +90,16 @@ class CASIADomain(Dataset):
     _tf_base = transforms.Compose([
         transforms.Resize((112, 112)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
+        #transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             #std=[0.229, 0.224, 0.225]),
     ])
     _tf_aug = transforms.Compose([
         transforms.Resize((112, 112)),
         transforms.RandomHorizontalFlip(),
         transforms.ColorJitter(brightness=0.2, contrast=0.2),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
+        #transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             #std=[0.229, 0.224, 0.225]),
     ])
 
     def __init__(self, data_path, domain, label_map, augment=False):
