@@ -35,7 +35,7 @@ from tqdm import tqdm
 # ─────────────────────────────────────────────────────────
 DATA_PATH      = "/home/pai-ng/Jamal/CASIA-MS-ROI"
 
-SOURCE_DOMAIN  = "630"
+SOURCE_DOMAIN  = "460"
 TARGET_DOMAINS = ["630", "850", "940"]
 N_TARGETS      = len(TARGET_DOMAINS)
 
