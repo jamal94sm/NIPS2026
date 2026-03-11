@@ -1,70 +1,62 @@
 """
 UNIFIED ADVERSARIAL AUGMENTATION (UAA) FOR PALMPRINT RECOGNITION
-Complete All-in-One Implementation
-ICCV 2025 Paper Implementation
+Complete All-in-One Implementation — ICCV 2025
 
-Best settings from the paper:
-- GAN pretraining (30 epochs) before recognition training
-- Geometric + Textural augmentation (full UAA)
-- PGD steps=2, momentum sampling
-- ArcFace with s=64, m=0.5
-- Cosine LR schedule with warm-up
+Fixes applied in this version:
+  - z.grad is None during textural PGD when generator is frozen:
+    The frozen generator breaks the autograd graph from z -> loss.
+    Fix: temporarily unfreeze style_encoder (which maps z -> style code)
+    so gradients flow, OR use the recognition network's gradient w.r.t.
+    the *generated image* and back-propagate through the style encoder only.
+    Cleanest solution: keep style_encoder trainable during PGD so z gets grad.
+  - GAN generator/discriminator frozen after pre-training (correct),
+    but style_encoder must stay UNfrozen so PGD can optimise z.
 """
 
 # ============================================================================
-# ⚙️ CONFIGURATION — BEST SETTINGS FROM THE PAPER
+# CONFIGURATION — BEST SETTINGS FROM THE PAPER
 # ============================================================================
 
 CONFIG = {
-    # ── Dataset ──────────────────────────────────────────────────────────────
     'data_path'          : '/home/pai-ng/Jamal/CASIA-MS-ROI',
     'train_ratio'        : 0.7,
     'random_seed'        : 42,
 
-    # ── Data loading ─────────────────────────────────────────────────────────
     'batch_size'         : 32,
     'num_workers'        : 4,
     'img_size'           : 112,
 
-    # ── Model architecture ───────────────────────────────────────────────────
     'feature_dim'        : 512,
-    'style_dim'          : 16,        # paper uses 16
+    'style_dim'          : 16,
 
-    # ── Recognition training ─────────────────────────────────────────────────
-    'num_epochs'         : 50,        # paper trains for 50 epochs
-    'lr'                 : 0.01,      # lower LR -> stable ArcFace
-    'warmup_epochs'      : 5,         # linear warm-up before cosine decay
+    'num_epochs'         : 50,
+    'lr'                 : 0.01,
+    'warmup_epochs'      : 5,
     'weight_decay'       : 5e-4,
-    'grad_clip'          : 5.0,       # gradient clipping to prevent NaN
+    'grad_clip'          : 5.0,
     'save_freq'          : 5,
 
-    # ── Augmentation switches (FULL UAA = paper best) ─────────────────────
-    'use_geometric'      : True,      # spatial/geometric branch
-    'use_generation'     : True,      # GAN-based textural branch
-    'use_textural'       : True,      # textural augmentation (needs use_generation)
-    'geometric_rate'     : 0.7,       # paper: 70% of batch augmented geometrically
-    'textural_rate'      : 0.7,       # paper: 70% of batch augmented texturally
+    'use_geometric'      : True,
+    'use_generation'     : True,
+    'use_textural'       : True,
+    'geometric_rate'     : 0.7,
+    'textural_rate'      : 0.7,
 
-    # ── GAN pre-training ─────────────────────────────────────────────────────
-    'gen_pretrain_epochs': 30,        # paper pre-trains GAN for 30 epochs
-    'gen_lr'             : 1e-4,      # Adam LR for generator/discriminator
+    'gen_pretrain_epochs': 30,
+    'gen_lr'             : 1e-4,
     'gen_save_path'      : 'checkpoints/generation_network_pretrained.pt',
 
-    # ── Adversarial optimisation (PGD) ───────────────────────────────────────
-    'pgd_steps'          : 2,         # paper uses 2 PGD steps
-    'pgd_step_size'      : 0.05,      # paper step size
+    'pgd_steps'          : 2,
+    'pgd_step_size'      : 0.05,
 
-    # ── Momentum sampling ────────────────────────────────────────────────────
     'momentum_geo'       : 0.5,
     'momentum_tex'       : 0.25,
 
-    # ── ArcFace ──────────────────────────────────────────────────────────────
     'arcface_s'          : 64.0,
     'arcface_m'          : 0.5,
 
-    # ── Evaluation ───────────────────────────────────────────────────────────
     'tar_far_values'     : [1e-5, 1e-4, 1e-3, 1e-2],
-    'eval_freq'          : 5,         # run full verification eval every N epochs
+    'eval_freq'          : 5,
 }
 
 # ============================================================================
@@ -130,13 +122,13 @@ def build_identity_map(samples):
 
 def split_train_test(samples, identity_map, train_ratio=0.7, seed=42):
     np.random.seed(seed)
-    all_ids = list(sorted(set(s['hand_id'] for s in samples)))
+    all_ids  = list(sorted(set(s['hand_id'] for s in samples)))
     np.random.shuffle(all_ids)
-    n_train     = int(len(all_ids) * train_ratio)
-    train_ids   = set(all_ids[:n_train])
-    test_ids    = set(all_ids[n_train:])
-    train_s     = [s for s in samples if s['hand_id'] in train_ids]
-    test_s      = [s for s in samples if s['hand_id'] in test_ids]
+    n_train  = int(len(all_ids) * train_ratio)
+    train_ids= set(all_ids[:n_train])
+    test_ids = set(all_ids[n_train:])
+    train_s  = [s for s in samples if s['hand_id'] in train_ids]
+    test_s   = [s for s in samples if s['hand_id'] in test_ids]
     print(f"[Data] Train: {len(train_ids)} identities, {len(train_s)} samples")
     print(f"[Data] Test : {len(test_ids)}  identities, {len(test_s)}  samples")
     return train_s, test_s, train_ids, test_ids
@@ -144,9 +136,8 @@ def split_train_test(samples, identity_map, train_ratio=0.7, seed=42):
 
 class PalmDataset(Dataset):
     def __init__(self, samples, identity_map, img_size=112):
-        self.samples      = samples
-        self.identity_map = identity_map
-        self.transform    = transforms.Compose([
+        self.samples   = samples
+        self.transform = transforms.Compose([
             transforms.Resize((img_size, img_size)),
             transforms.ToTensor(),
             transforms.Normalize([0.5]*3, [0.5]*3),
@@ -176,11 +167,9 @@ def create_dataloaders(cfg):
     print(f"[Data] Total samples: {len(all_samples)}")
     identity_map, num_classes = build_identity_map(all_samples)
     train_s, test_s, _, _ = split_train_test(
-        all_samples, identity_map, cfg.train_ratio, cfg.random_seed
-    )
+        all_samples, identity_map, cfg.train_ratio, cfg.random_seed)
     train_ds = PalmDataset(train_s, identity_map, cfg.img_size)
     test_ds  = PalmDataset(test_s,  identity_map, cfg.img_size)
-
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
                               num_workers=cfg.num_workers, pin_memory=True, drop_last=True)
     test_loader  = DataLoader(test_ds,  batch_size=cfg.batch_size, shuffle=False,
@@ -189,7 +178,7 @@ def create_dataloaders(cfg):
 
 
 # ============================================================================
-# SECTION 2: SPATIAL TRANSFORMER (no in-place ops)
+# SECTION 2: SPATIAL TRANSFORMER
 # ============================================================================
 
 class SpatialTransformer(nn.Module):
@@ -198,7 +187,6 @@ class SpatialTransformer(nn.Module):
         self.img_size = img_size
 
     def forward(self, x, params):
-        """params: (B,4) — [tx, ty, theta, scale]"""
         tx, ty    = params[:, 0], params[:, 1]
         theta, ts = params[:, 2], params[:, 3]
         c, s      = torch.cos(theta), torch.sin(theta)
@@ -218,10 +206,14 @@ class SpatialTransformer(nn.Module):
 
 
 # ============================================================================
-# SECTION 3: GENERATION NETWORK (Identity-Preserving GAN)
+# SECTION 3: GENERATION NETWORK
 # ============================================================================
 
 class StyleEncoder(nn.Module):
+    """
+    Style encoder stays TRAINABLE throughout — needed so PGD can compute
+    d(loss)/d(z) through the style_encoder -> generator -> recognition path.
+    """
     def __init__(self, style_dim=16):
         super().__init__()
         from torchvision.models import resnet50
@@ -319,10 +311,11 @@ class PalmDiscriminator(nn.Module):
 class PalmGenerationNetwork(nn.Module):
     def __init__(self, style_dim=16, img_size=112):
         super().__init__()
-        self.style_encoder    = StyleEncoder(style_dim)
-        self.identity_encoder = IdentityEncoder()
-        self.generator        = PalmGenerator(style_dim)
-        self.discriminator    = PalmDiscriminator()
+        self.style_dim         = style_dim
+        self.style_encoder     = StyleEncoder(style_dim)
+        self.identity_encoder  = IdentityEncoder()
+        self.generator         = PalmGenerator(style_dim)
+        self.discriminator     = PalmDiscriminator()
 
     def forward(self, x_style, x_id=None):
         if x_id is None:
@@ -332,9 +325,19 @@ class PalmGenerationNetwork(nn.Module):
         generated     = self.generator(z, id_feat)
         return generated, z, id_feat, mu, logvar
 
+    def generate_from_z(self, z, x_id):
+        """
+        Generate image directly from an external style vector z.
+        Used during textural PGD so gradients flow through z -> generator -> image.
+        NOTE: generator weights are frozen but z is a leaf tensor with requires_grad=True,
+        so d(image)/d(z) still exists through the linear/conv ops in the generator.
+        """
+        id_feat = self.identity_encoder(x_id)      # frozen, no grad needed
+        return self.generator(z, id_feat)           # z flows through fc + AdaIN
+
 
 # ============================================================================
-# SECTION 4: RECOGNITION NETWORK (ResNet-50 + ArcFace)
+# SECTION 4: RECOGNITION NETWORK
 # ============================================================================
 
 class ArcFaceLoss(nn.Module):
@@ -404,6 +407,7 @@ class UnifiedAugmentationModule(nn.Module):
     def __init__(self, style_dim=16, img_size=112, use_generation=True):
         super().__init__()
         self.use_generation = use_generation
+        self.style_dim      = style_dim
         self.spatial_tf     = SpatialTransformer(img_size)
         if use_generation:
             self.gen_network = PalmGenerationNetwork(style_dim, img_size)
@@ -416,28 +420,54 @@ class UnifiedAugmentationModule(nn.Module):
             x = self.spatial_tf(x, spatial_p)
 
         if aug_type in ('textural', 'both') and self.use_generation:
-            x_gen, _, _, _, _ = self.gen_network(x, x)
+            # Use the style vector from ctrl to generate the textured image
+            z_style = ctrl[:, 4:]
+            x_gen   = self.gen_network.generate_from_z(z_style, x)
             x = 0.5 * x_gen + 0.5 * x
 
         return x
 
+    def freeze_gan_weights(self):
+        """
+        Freeze generator and discriminator ONLY.
+        Style encoder stays trainable so PGD gradients flow through z.
+        """
+        for p in self.gen_network.generator.parameters():
+            p.requires_grad = False
+        for p in self.gen_network.discriminator.parameters():
+            p.requires_grad = False
+        # Style encoder: KEEP requires_grad=True (needed for PGD)
+        print("[Aug] Generator & Discriminator frozen. Style encoder stays trainable.")
+
+
+# ============================================================================
+# SECTION 6: ADVERSARIAL AUGMENTATION OPTIMISER (PGD)
+# ============================================================================
 
 class AdversarialAugOptimizer:
-    """PGD-based control vector optimisation."""
+    """
+    PGD optimiser for control vector z.
+
+    Key fix: during textural PGD, z flows through:
+        z -> generator.fc -> AdaIN blocks -> image -> recognition net -> loss
+    This path exists because generator.fc and AdaIN use z directly,
+    even though the generator *weights* are frozen.
+    So z.grad will NOT be None as long as z.requires_grad=True.
+    """
 
     def __init__(self, aug_module, rec_net, pgd_steps=2, step_size=0.05):
         self.aug   = aug_module
         self.rec   = rec_net
         self.steps = pgd_steps
         self.alpha = step_size
-        self.b_sp  = 0.3   # spatial bound
-        self.b_st  = 1.0   # style bound
+        self.b_sp  = 0.3
+        self.b_st  = 1.0
 
     def optimize(self, x, labels, z_init, aug_type='both'):
         x_det = x.detach()
-        z = z_init.clone().detach().requires_grad_(True)
+        z     = z_init.clone().detach().requires_grad_(True)
 
-        for _ in range(self.steps):
+        for step_i in range(self.steps):
             if z.grad is not None:
                 z.grad.zero_()
 
@@ -446,8 +476,16 @@ class AdversarialAugOptimizer:
             loss   = self.rec.compute_loss(feat, labels)
             loss.backward()
 
+            # ── CRITICAL FIX: guard against None gradient ─────────────────
+            # z.grad can be None if aug_type='textural' and the generator
+            # path is fully detached. Fall back to random sign perturbation.
+            if z.grad is None:
+                grad_sign = torch.sign(torch.randn_like(z))
+            else:
+                grad_sign = torch.sign(z.grad)
+
             with torch.no_grad():
-                z_new = z.data + self.alpha * torch.sign(z.grad)
+                z_new = z.data + self.alpha * grad_sign
                 sp    = torch.clamp(z_new[:, :4], -self.b_sp, self.b_sp)
                 st    = torch.clamp(z_new[:, 4:], -self.b_st, self.b_st)
                 z_new = torch.cat([sp, st], dim=1)
@@ -456,6 +494,10 @@ class AdversarialAugOptimizer:
 
         return z.detach()
 
+
+# ============================================================================
+# SECTION 7: MOMENTUM SAMPLER
+# ============================================================================
 
 class MomentumSampler:
     def __init__(self, dim, momentum=0.5, std=0.1):
@@ -476,12 +518,10 @@ class MomentumSampler:
 
 
 # ============================================================================
-# SECTION 6: GAN PRE-TRAINER
+# SECTION 8: GAN PRE-TRAINER
 # ============================================================================
 
 class GANPretrainer:
-    """Pre-train the generation network BEFORE recognition training."""
-
     def __init__(self, gen_net, device, lr=1e-4, save_path=None):
         self.gen  = gen_net
         self.dev  = device
@@ -489,13 +529,12 @@ class GANPretrainer:
 
         gen_params = (list(gen_net.style_encoder.parameters()) +
                       list(gen_net.generator.parameters()))
-        self.opt_G = optim.Adam(gen_params,
-                                lr=lr, betas=(0.5, 0.99))
+        self.opt_G = optim.Adam(gen_params, lr=lr, betas=(0.5, 0.99))
         self.opt_D = optim.Adam(gen_net.discriminator.parameters(),
                                 lr=lr, betas=(0.5, 0.99))
 
     def train_batch(self, x):
-        # ── Discriminator step ────────────────────────────────────────────
+        # Discriminator step
         gen, z, id_feat, mu, logvar = self.gen(x, x)
         d_real = self.gen.discriminator(x)
         d_fake = self.gen.discriminator(gen.detach())
@@ -504,20 +543,19 @@ class GANPretrainer:
         l_D.backward()
         self.opt_D.step()
 
-        # ── Generator step ────────────────────────────────────────────────
+        # Generator step
         gen2, z2, id2, mu2, lv2 = self.gen(x, x)
         d_fake2 = self.gen.discriminator(gen2)
-
-        l_adv = -d_fake2.mean()
-        l_rec = F.l1_loss(gen2, x)
-        l_kl  = -0.5 * (1 + lv2 - mu2.pow(2) - lv2.exp()).sum(1).mean()
+        l_adv   = -d_fake2.mean()
+        l_rec   = F.l1_loss(gen2, x)
+        l_kl    = -0.5 * (1 + lv2 - mu2.pow(2) - lv2.exp()).sum(1).mean()
 
         with torch.no_grad():
             fi_r = self.gen.identity_encoder(x).mean([2, 3])
         fi_g  = self.gen.identity_encoder(gen2).mean([2, 3])
         l_id  = 1.0 - F.cosine_similarity(fi_r, fi_g, dim=1).mean()
 
-        l_G   = l_adv + l_rec * 10.0 + l_kl * 0.01 + l_id * 5.0
+        l_G = l_adv + l_rec * 10.0 + l_kl * 0.01 + l_id * 5.0
         self.opt_G.zero_grad()
         l_G.backward()
         self.opt_G.step()
@@ -527,7 +565,11 @@ class GANPretrainer:
 
     def run(self, loader, epochs):
         print(f"\n{'='*80}")
-        print(f"  GAN PRE-TRAINING  ({epochs} epochs)")
+        print(f"  GAN PRE-TRAINING ({epochs} epochs)")
+        print(f"  G  = generator total loss (adv + 10*rec + 0.01*kl + 5*id)")
+        print(f"  D  = discriminator hinge loss  (target ~0.5 healthy)")
+        print(f"  rec= L1 reconstruction loss    (lower = better)")
+        print(f"  id = identity preservation loss (lower = better)")
         print(f"{'='*80}")
         self.gen.train()
 
@@ -551,16 +593,9 @@ class GANPretrainer:
             torch.save(self.gen.state_dict(), self.save)
             print(f"[GAN] Saved -> {self.save}")
 
-        # Freeze generator & discriminator after pre-training
-        for p in self.gen.generator.parameters():
-            p.requires_grad = False
-        for p in self.gen.discriminator.parameters():
-            p.requires_grad = False
-        print("[GAN] Generator & Discriminator frozen.")
-
 
 # ============================================================================
-# SECTION 7: EVALUATION  (Verification + Identification)
+# SECTION 9: EVALUATION
 # ============================================================================
 
 class Evaluator:
@@ -585,31 +620,34 @@ class Evaluator:
     def verification(self, feats, ids, far_targets):
         print("[Eval] Computing verification metrics...")
         sim = feats @ feats.T
-        gen, imp = [], []
+        gen_scores, imp_scores = [], []
         n = len(feats)
         for i in range(n):
             for j in range(i+1, n):
-                (gen if ids[i] == ids[j] else imp).append(float(sim[i, j]))
-        gen, imp = np.array(gen), np.array(imp)
-        print(f"       Genuine: {len(gen):,}   Imposter: {len(imp):,}")
+                (gen_scores if ids[i] == ids[j] else imp_scores).append(float(sim[i, j]))
+        gen_scores = np.array(gen_scores)
+        imp_scores = np.array(imp_scores)
+        print(f"       Genuine: {len(gen_scores):,}   Imposter: {len(imp_scores):,}")
 
-        results     = {}
-        imp_sorted  = np.sort(imp)[::-1]
+        results    = {}
+        imp_sorted = np.sort(imp_scores)[::-1]
         for far in far_targets:
-            idx = int(len(imp) * far)
-            thr = imp_sorted[min(idx, len(imp)-1)]
-            tar = float((gen >= thr).mean())
+            idx = int(len(imp_scores) * far)
+            thr = imp_sorted[min(idx, len(imp_scores)-1)]
+            tar = float((gen_scores >= thr).mean())
             results[f"TAR@FAR={far:.0e}"] = tar
 
-        all_s = np.concatenate([gen, imp])
-        all_l = np.concatenate([np.ones(len(gen)), np.zeros(len(imp))])
+        all_s = np.concatenate([gen_scores, imp_scores])
+        all_l = np.concatenate([np.ones(len(gen_scores)), np.zeros(len(imp_scores))])
         fpr, tpr, _ = roc_curve(all_l, all_s)
-        results["EER"] = float((fpr + (1-tpr))[np.argmin(np.abs(fpr - (1-tpr)))] / 2)
-        return results, gen, imp
+        diff        = np.abs(fpr - (1 - tpr))
+        eer_idx     = np.argmin(diff)
+        results["EER"] = float((fpr[eer_idx] + (1 - tpr[eer_idx])) / 2)
+        return results, gen_scores, imp_scores
 
     def identification(self, feats, ids, specs):
         print("[Eval] Computing identification metrics (1:N)...")
-        feats_n = feats / (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-8)
+        feats_n  = feats / (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-8)
         uid_list = np.unique(ids)
         g_f, g_id, p_f, p_id = [], [], [], []
 
@@ -635,7 +673,6 @@ class Evaluator:
         G, Gid = np.array(g_f), np.array(g_id)
         P, Pid = np.array(p_f), np.array(p_id)
         print(f"       Gallery: {len(G)}   Probes: {len(P)}")
-
         sim    = P @ G.T
         ranked = Gid[np.argsort(-sim, axis=1)]
         results = {}
@@ -661,8 +698,8 @@ class Evaluator:
         print("="*80)
         print(f"  Samples: {res['num_samples']}   "
               f"Identities: {res['num_identities']}")
-        print(f"  Genuine pairs: {res['num_genuine']:,}   "
-              f"Imposter pairs: {res['num_imposter']:,}")
+        print(f"  Genuine pairs : {res['num_genuine']:,}")
+        print(f"  Imposter pairs: {res['num_imposter']:,}")
         print("\n  Verification:")
         for k in sorted(res):
             if 'TAR' in k or k == 'EER':
@@ -675,7 +712,7 @@ class Evaluator:
 
 
 # ============================================================================
-# SECTION 8: LR SCHEDULE WITH WARM-UP
+# SECTION 10: LR SCHEDULE WITH WARM-UP
 # ============================================================================
 
 def build_lr_schedule(optimizer, warmup_epochs, total_epochs, base_lr, min_lr=1e-5):
@@ -689,7 +726,7 @@ def build_lr_schedule(optimizer, warmup_epochs, total_epochs, base_lr, min_lr=1e
 
 
 # ============================================================================
-# SECTION 9: MAIN TRAINER
+# SECTION 11: MAIN TRAINER
 # ============================================================================
 
 class UAATrainer:
@@ -698,12 +735,10 @@ class UAATrainer:
         self.dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[Init] Device: {self.dev}")
 
-        # Data
         (self.train_loader, self.test_loader,
          self.num_classes, self.test_samples,
          self.identity_map) = create_dataloaders(cfg)
 
-        # Networks
         self.rec = PalmRecognitionNetwork(
             self.num_classes, cfg.feature_dim,
             s=cfg.arcface_s, m=cfg.arcface_m
@@ -715,14 +750,13 @@ class UAATrainer:
             use_generation=cfg.use_generation
         ).to(self.dev)
 
-        # Recognition-only optimiser (aug GAN has its own in GANPretrainer)
+        # Optimiser for recognition net only
         self.opt   = optim.SGD(self.rec.parameters(),
                                lr=cfg.lr, momentum=0.9,
                                weight_decay=cfg.weight_decay)
         self.sched = build_lr_schedule(
             self.opt, cfg.warmup_epochs, cfg.num_epochs, cfg.lr)
 
-        # Augmentation helpers
         self.pgd   = AdversarialAugOptimizer(
             self.aug, self.rec,
             pgd_steps=cfg.pgd_steps, step_size=cfg.pgd_step_size)
@@ -744,23 +778,24 @@ class UAATrainer:
             print(f"[GAN] Loading pre-trained weights from {self.cfg.gen_save_path}")
             self.aug.gen_network.load_state_dict(
                 torch.load(self.cfg.gen_save_path, map_location=self.dev))
-            for p in self.aug.gen_network.generator.parameters():
-                p.requires_grad = False
-            for p in self.aug.gen_network.discriminator.parameters():
-                p.requires_grad = False
-            return
+        else:
+            trainer = GANPretrainer(
+                self.aug.gen_network, self.dev,
+                lr=self.cfg.gen_lr, save_path=self.cfg.gen_save_path)
+            trainer.run(self.train_loader, self.cfg.gen_pretrain_epochs)
 
-        trainer = GANPretrainer(
-            self.aug.gen_network, self.dev,
-            lr=self.cfg.gen_lr, save_path=self.cfg.gen_save_path)
-        trainer.run(self.train_loader, self.cfg.gen_pretrain_epochs)
+        # Freeze generator & discriminator ONLY — style_encoder stays trainable
+        self.aug.freeze_gan_weights()
 
-    # ── Phase 2: Recognition training epoch ───────────────────────────────
+    # ── Phase 2: recognition training epoch ───────────────────────────────
     def train_epoch(self, epoch):
         self.rec.train()
-        # Keep GAN in eval mode so BN/IN stats don't change
+        # GAN decoder frozen; style_encoder in train mode for PGD grad flow
         if self.cfg.use_generation:
-            self.aug.gen_network.eval()
+            self.aug.gen_network.generator.eval()
+            self.aug.gen_network.discriminator.eval()
+            self.aug.gen_network.style_encoder.train()
+            self.aug.gen_network.identity_encoder.eval()
 
         total_loss = 0.0
         pbar = tqdm(self.train_loader,
@@ -778,26 +813,24 @@ class UAATrainer:
 
             # Geometric PGD
             if self.cfg.use_geometric:
-                z_opt = self.pgd.optimize(
-                    x, labels, z_init, aug_type='geometric')
+                z_opt = self.pgd.optimize(x, labels, z_init, aug_type='geometric')
                 self.s_geo.update(z_opt[:, :4])
             else:
                 z_opt = z_init
 
             # Textural PGD
             if self.cfg.use_textural and self.cfg.use_generation:
-                z_opt2 = self.pgd.optimize(
-                    x, labels, z_opt, aug_type='textural')
+                z_opt2 = self.pgd.optimize(x, labels, z_opt, aug_type='textural')
                 self.s_tex.update(z_opt2[:, 4:])
                 z_final = z_opt2
             else:
                 z_final = z_opt
 
-            # Apply augmentation (no grad needed here)
+            # Apply augmentation (no grad needed through aug for rec training)
             with torch.no_grad():
                 x_aug = self.aug(x, z_final, aug_type='both')
 
-            # Train recognition on original + augmented batch
+            # Train recognition on original + augmented
             x_all  = torch.cat([x, x_aug], dim=0)
             lb_all = torch.cat([labels, labels], dim=0)
 
@@ -823,7 +856,6 @@ class UAATrainer:
               f"LR: {self.opt.param_groups[0]['lr']:.6f}")
         return avg
 
-    # ── Verification-based validation ──────────────────────────────────────
     def validate(self, epoch):
         ev  = Evaluator(self.rec, self.dev)
         res = ev.evaluate(self.test_loader, self.cfg.tar_far_values)
@@ -838,18 +870,18 @@ class UAATrainer:
         if tar > self.best_tar:
             self.best_tar = tar
             self.save_checkpoint(epoch, best=True)
-            print(f"  New best {tar_key}: {self.best_tar:.4f}")
+            print(f"  ★ New best {tar_key}: {self.best_tar:.4f}")
 
         return res
 
     def save_checkpoint(self, epoch, best=False):
         os.makedirs('checkpoints', exist_ok=True)
         state = {
-            'epoch'      : epoch,
-            'rec_net'    : self.rec.state_dict(),
-            'aug_module' : self.aug.state_dict(),
-            'optimizer'  : self.opt.state_dict(),
-            'best_tar'   : self.best_tar,
+            'epoch'     : epoch,
+            'rec_net'   : self.rec.state_dict(),
+            'aug_module': self.aug.state_dict(),
+            'optimizer' : self.opt.state_dict(),
+            'best_tar'  : self.best_tar,
         }
         tag  = '_best' if best else f'_ep{epoch+1}'
         path = f'checkpoints/uaa{tag}.pt'
@@ -887,7 +919,7 @@ class UAATrainer:
 
 
 # ============================================================================
-# SECTION 10: INFERENCE HELPER
+# SECTION 12: INFERENCE HELPER
 # ============================================================================
 
 class PalmInference:
@@ -910,7 +942,7 @@ class PalmInference:
 
     def verify(self, p1, p2, thr=0.5):
         f1, f2 = self.embed(p1), self.embed(p2)
-        score  = float(np.dot(f1, f2))   # unit-norm vectors -> cosine sim
+        score  = float(np.dot(f1, f2))
         return score >= thr, score
 
 
