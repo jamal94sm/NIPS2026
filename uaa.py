@@ -3,128 +3,75 @@ UNIFIED ADVERSARIAL AUGMENTATION (UAA) FOR PALMPRINT RECOGNITION
 Complete All-in-One Implementation
 ICCV 2025 Paper Implementation
 
-All components combined into a single self-contained script.
-Author: Claude (Implementation)
-Based on: "Unified Adversarial Augmentation for Improving Palmprint Recognition"
+Best settings from the paper:
+- GAN pretraining (30 epochs) before recognition training
+- Geometric + Textural augmentation (full UAA)
+- PGD steps=2, momentum sampling
+- ArcFace with s=64, m=0.5
+- Cosine LR schedule with warm-up
 """
 
 # ============================================================================
-# ⚙️ CONFIGURATION - SET ALL PARAMETERS HERE AT THE TOP
+# ⚙️ CONFIGURATION — BEST SETTINGS FROM THE PAPER
 # ============================================================================
 
 CONFIG = {
-    # ========== Dataset Configuration ==========
-    'data_path': '/home/pai-ng/Jamal/CASIA-MS-ROI',  # Path to CASIA-MS dataset
-    'train_ratio': 0.7,                              # Proportion of identities for training
-    'random_seed': 42,                               # Random seed for reproducibility
+    # ── Dataset ──────────────────────────────────────────────────────────────
+    'data_path'          : '/home/pai-ng/Jamal/CASIA-MS-ROI',
+    'train_ratio'        : 0.7,
+    'random_seed'        : 42,
 
-    # ========== Data Loading ==========
-    'batch_size': 32,                                 # Reduce if OOM (try 16, 8)
-    'num_workers': 4,                                 # Number of data loading workers
-    'img_size': 112,                                  # Input image resolution
+    # ── Data loading ─────────────────────────────────────────────────────────
+    'batch_size'         : 32,
+    'num_workers'        : 4,
+    'img_size'           : 112,
 
-    # ========== Model Architecture ==========
-    'feature_dim': 512,                               # Recognition feature dimension
-    'style_dim': 16,                                  # Style code dimension (8, 16, 32)
+    # ── Model architecture ───────────────────────────────────────────────────
+    'feature_dim'        : 512,
+    'style_dim'          : 16,        # paper uses 16
 
-    # ========== Training ==========
-    'num_epochs': 30,                                 # Number of training epochs
-    'lr': 0.1,                                        # Learning rate
-    'save_freq': 5,                                   # Save checkpoint every N epochs
+    # ── Recognition training ─────────────────────────────────────────────────
+    'num_epochs'         : 50,        # paper trains for 50 epochs
+    'lr'                 : 0.01,      # lower LR -> stable ArcFace
+    'warmup_epochs'      : 5,         # linear warm-up before cosine decay
+    'weight_decay'       : 5e-4,
+    'grad_clip'          : 5.0,       # gradient clipping to prevent NaN
+    'save_freq'          : 5,
 
-    # ========== Augmentation Module ==========
-    'use_geometric': True,                            # Enable spatial/geometric augmentation
-    'use_generation': False,                          # Enable GAN-based generation
-    'use_textural': False,                            # Enable textural augmentation (requires use_generation=True)
-    'geometric_rate': 0.5,                            # Proportion of samples to augment geometrically
-    'textural_rate': 0.5,                             # Proportion of samples to augment texturally
+    # ── Augmentation switches (FULL UAA = paper best) ─────────────────────
+    'use_geometric'      : True,      # spatial/geometric branch
+    'use_generation'     : True,      # GAN-based textural branch
+    'use_textural'       : True,      # textural augmentation (needs use_generation)
+    'geometric_rate'     : 0.7,       # paper: 70% of batch augmented geometrically
+    'textural_rate'      : 0.7,       # paper: 70% of batch augmented texturally
 
-    # ========== Generation Network (if use_generation=True) ==========
-    'gen_pretrain_epochs': 10,                        # GAN pretraining epochs
-    'gen_lr': 1e-3,                                   # Generator learning rate
+    # ── GAN pre-training ─────────────────────────────────────────────────────
+    'gen_pretrain_epochs': 30,        # paper pre-trains GAN for 30 epochs
+    'gen_lr'             : 1e-4,      # Adam LR for generator/discriminator
+    'gen_save_path'      : 'checkpoints/generation_network_pretrained.pt',
 
-    # ========== Adversarial Augmentation ==========
-    'pgd_steps': 1,                                   # Number of PGD optimization steps (1-3, more = harder samples, slower)
-    'pgd_step_size': 0.01,                            # Step size for PGD updates
+    # ── Adversarial optimisation (PGD) ───────────────────────────────────────
+    'pgd_steps'          : 2,         # paper uses 2 PGD steps
+    'pgd_step_size'      : 0.05,      # paper step size
 
-    # ========== Momentum Sampling ==========
-    'momentum_geo': 0.5,                              # Momentum for geometric sampling
-    'momentum_tex': 0.25,                             # Momentum for textural sampling
+    # ── Momentum sampling ────────────────────────────────────────────────────
+    'momentum_geo'       : 0.5,
+    'momentum_tex'       : 0.25,
 
-    # ========== Evaluation ==========
-    'tar_far_values': [1e-5, 1e-4, 1e-3, 1e-2],      # FAR thresholds for TAR@FAR computation
+    # ── ArcFace ──────────────────────────────────────────────────────────────
+    'arcface_s'          : 64.0,
+    'arcface_m'          : 0.5,
+
+    # ── Evaluation ───────────────────────────────────────────────────────────
+    'tar_far_values'     : [1e-5, 1e-4, 1e-3, 1e-2],
+    'eval_freq'          : 5,         # run full verification eval every N epochs
 }
 
 # ============================================================================
-# 📋 CONFIGURATION PRESETS (Uncomment one below to override CONFIG above)
+# Imports
 # ============================================================================
 
-"""
-# PRESET 1: Quick Test (Validate everything works, ~2-5 min on GPU)
-CONFIG.update({
-    'batch_size': 8,
-    'num_epochs': 1,
-    'use_geometric': True,
-    'use_generation': False,
-})
-
-# PRESET 2: Geometric Only - FAST (Spatial augmentation only, ~30 min on GPU)
-CONFIG.update({
-    'batch_size': 32,
-    'num_epochs': 30,
-    'use_geometric': True,
-    'use_generation': False,
-})
-
-# PRESET 3: Full UAA - COMPREHENSIVE (Geometric + Textural, ~2-3 hours on GPU)
-CONFIG.update({
-    'batch_size': 32,
-    'num_epochs': 30,
-    'use_generation': True,
-    'use_geometric': True,
-    'use_textural': True,
-    'gen_pretrain_epochs': 10,
-})
-
-# PRESET 4: Advanced - BEST RESULTS (More iterations, ~5-6 hours on GPU)
-CONFIG.update({
-    'batch_size': 32,
-    'num_epochs': 50,
-    'use_generation': True,
-    'use_geometric': True,
-    'use_textural': True,
-    'gen_pretrain_epochs': 30,
-    'pgd_steps': 2,
-    'pgd_step_size': 0.05,
-    'style_dim': 32,
-    'geometric_rate': 0.7,
-    'textural_rate': 0.7,
-})
-
-# PRESET 5: Low Memory (For machines with limited GPU memory)
-CONFIG.update({
-    'batch_size': 8,
-    'num_epochs': 30,
-    'use_geometric': True,
-    'use_generation': False,
-    'num_workers': 2,
-})
-
-# PRESET 6: CPU Only (Much slower, but works without GPU)
-CONFIG.update({
-    'batch_size': 4,
-    'num_epochs': 5,
-    'use_geometric': True,
-    'use_generation': False,
-    'num_workers': 0,
-})
-"""
-
-# ============================================================================
-# Import Required Libraries
-# ============================================================================
-
-import os
+import os, math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -133,23 +80,19 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 import numpy as np
-from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
 import argparse
 from datetime import datetime
-import math
 from sklearn.metrics import roc_curve
 
-# ============================================================================
-# Convert CONFIG to args object for code compatibility
-# ============================================================================
 args = argparse.Namespace(**CONFIG)
+
 print("=" * 80)
-print("⚙️  CONFIGURATION LOADED:")
+print("  CONFIGURATION (Paper Best Settings):")
 print("=" * 80)
-for key, value in CONFIG.items():
-    print(f"  {key:<30} = {value}")
+for k, v in CONFIG.items():
+    print(f"  {k:<28} = {v}")
 print("=" * 80 + "\n")
 
 
@@ -158,1143 +101,841 @@ print("=" * 80 + "\n")
 # ============================================================================
 
 def load_all_samples(data_path):
-    """Load all samples from dataset"""
     samples = []
-
     for root, _, files in os.walk(data_path):
-        files.sort()
-        for fname in files:
+        for fname in sorted(files):
             if not fname.lower().endswith(".jpg"):
                 continue
             parts = fname[:-4].split("_")
             if len(parts) != 4:
                 continue
             subject_id, hand, spectrum, iteration = parts
-            img_path = os.path.join(root, fname)
-            hand_id = f"{subject_id}_{hand}"
-
             samples.append({
-                'path': img_path,
-                'subject': subject_id,
-                'hand': hand,
-                'spectrum': spectrum,
+                'path'     : os.path.join(root, fname),
+                'subject'  : subject_id,
+                'hand'     : hand,
+                'spectrum' : spectrum,
                 'iteration': iteration,
-                'hand_id': hand_id
+                'hand_id'  : f"{subject_id}_{hand}",
             })
-
     return samples
 
 
 def build_identity_map(samples):
-    """Build identity label mapping from all samples"""
     all_hand_ids = sorted(set(s['hand_id'] for s in samples))
     identity_map = {h: i for i, h in enumerate(all_hand_ids)}
-    num_classes = len(identity_map)
-    print(f"[Data] Total identities: {num_classes}")
-    return identity_map, num_classes
+    print(f"[Data] Total identities: {len(identity_map)}")
+    return identity_map, len(identity_map)
 
 
 def split_train_test(samples, identity_map, train_ratio=0.7, seed=42):
-    """
-    Split data into train and test sets.
-    Ensures identities are not mixed between train and test.
-    """
     np.random.seed(seed)
-
-    identity_samples = {}
-    for sample in samples:
-        hand_id = sample['hand_id']
-        if hand_id not in identity_samples:
-            identity_samples[hand_id] = []
-        identity_samples[hand_id].append(sample)
-
-    all_identities = list(identity_samples.keys())
-    num_train = int(len(all_identities) * train_ratio)
-
-    np.random.shuffle(all_identities)
-    train_identities = set(all_identities[:num_train])
-    test_identities = set(all_identities[num_train:])
-
-    train_samples = []
-    test_samples = []
-
-    for sample in samples:
-        if sample['hand_id'] in train_identities:
-            train_samples.append(sample)
-        else:
-            test_samples.append(sample)
-
-    print(f"[Data] Train identities: {len(train_identities)}, Train samples: {len(train_samples)}")
-    print(f"[Data] Test identities: {len(test_identities)}, Test samples: {len(test_samples)}")
-
-    return train_samples, test_samples, train_identities, test_identities
+    all_ids = list(sorted(set(s['hand_id'] for s in samples)))
+    np.random.shuffle(all_ids)
+    n_train     = int(len(all_ids) * train_ratio)
+    train_ids   = set(all_ids[:n_train])
+    test_ids    = set(all_ids[n_train:])
+    train_s     = [s for s in samples if s['hand_id'] in train_ids]
+    test_s      = [s for s in samples if s['hand_id'] in test_ids]
+    print(f"[Data] Train: {len(train_ids)} identities, {len(train_s)} samples")
+    print(f"[Data] Test : {len(test_ids)}  identities, {len(test_s)}  samples")
+    return train_s, test_s, train_ids, test_ids
 
 
 class PalmDataset(Dataset):
-    """CASIA-MS Palmprint Dataset"""
-
-    def __init__(self, samples, identity_map, img_size=112, is_test=False):
-        self.samples = samples
+    def __init__(self, samples, identity_map, img_size=112):
+        self.samples      = samples
         self.identity_map = identity_map
-        self.img_size = img_size
-        self.is_test = is_test
-
-        for sample in self.samples:
-            sample['identity'] = identity_map[sample['hand_id']]
-
-        self.transform = transforms.Compose([
+        self.transform    = transforms.Compose([
             transforms.Resize((img_size, img_size)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5],
-                                 std=[0.5, 0.5, 0.5])
+            transforms.Normalize([0.5]*3, [0.5]*3),
         ])
+        for s in self.samples:
+            s['identity'] = identity_map[s['hand_id']]
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        sample = self.samples[idx]
-        img = Image.open(sample['path']).convert("RGB")
-        img_tensor = self.transform(img)
-
+        s   = self.samples[idx]
+        img = Image.open(s['path']).convert("RGB")
         return {
-            'img': img_tensor,
-            'identity': sample['identity'],
-            'path': sample['path'],
-            'hand_id': sample['hand_id'],
-            'spectrum': sample['spectrum'],
-            'subject': sample['subject'],
-            'hand': sample['hand']
+            'img'     : self.transform(img),
+            'identity': s['identity'],
+            'path'    : s['path'],
+            'hand_id' : s['hand_id'],
+            'spectrum': s['spectrum'],
+            'subject' : s['subject'],
+            'hand'    : s['hand'],
         }
 
 
-def create_dataloaders(data_path, batch_size=32, num_workers=4, img_size=112,
-                       train_ratio=0.7, seed=42):
-    all_samples = load_all_samples(data_path)
-    print(f"[Data] Total samples loaded: {len(all_samples)}")
-
+def create_dataloaders(cfg):
+    all_samples = load_all_samples(cfg.data_path)
+    print(f"[Data] Total samples: {len(all_samples)}")
     identity_map, num_classes = build_identity_map(all_samples)
-
-    train_samples, test_samples, train_ids, test_ids = split_train_test(
-        all_samples, identity_map, train_ratio, seed
+    train_s, test_s, _, _ = split_train_test(
+        all_samples, identity_map, cfg.train_ratio, cfg.random_seed
     )
+    train_ds = PalmDataset(train_s, identity_map, cfg.img_size)
+    test_ds  = PalmDataset(test_s,  identity_map, cfg.img_size)
 
-    train_dataset = PalmDataset(train_samples, identity_map, img_size, is_test=False)
-    test_dataset = PalmDataset(test_samples, identity_map, img_size, is_test=True)
-
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True, drop_last=True
-    )
-
-    test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True, drop_last=False
-    )
-
-    return train_loader, test_loader, num_classes, test_samples
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
+                              num_workers=cfg.num_workers, pin_memory=True, drop_last=True)
+    test_loader  = DataLoader(test_ds,  batch_size=cfg.batch_size, shuffle=False,
+                              num_workers=cfg.num_workers, pin_memory=True, drop_last=False)
+    return train_loader, test_loader, num_classes, test_s, identity_map
 
 
 # ============================================================================
-# SECTION 2: SPATIAL TRANSFORMER MODULE
+# SECTION 2: SPATIAL TRANSFORMER (no in-place ops)
 # ============================================================================
 
 class SpatialTransformer(nn.Module):
-    """Differentiable Spatial Transformer for geometric augmentation"""
-
     def __init__(self, img_size=112):
-        super(SpatialTransformer, self).__init__()
+        super().__init__()
         self.img_size = img_size
 
-    def forward(self, x, transform_params):
-        """Apply geometric transformation to images — no in-place ops"""
-        batch_size = x.size(0)
-        device = x.device
+    def forward(self, x, params):
+        """params: (B,4) — [tx, ty, theta, scale]"""
+        tx, ty    = params[:, 0], params[:, 1]
+        theta, ts = params[:, 2], params[:, 3]
+        c, s      = torch.cos(theta), torch.sin(theta)
+        row1 = torch.stack([ ts*c, -ts*s, tx], dim=1)
+        row2 = torch.stack([ ts*s,  ts*c, ty], dim=1)
+        M    = torch.stack([row1, row2], dim=1)
+        grid = F.affine_grid(M, x.size(), align_corners=False)
+        return F.grid_sample(x, grid, align_corners=False, padding_mode='reflection')
 
-        tx      = transform_params[:, 0]
-        ty      = transform_params[:, 1]
-        ttheta  = transform_params[:, 2]
-        ts      = transform_params[:, 3]
-
-        cos_theta = torch.cos(ttheta)
-        sin_theta = torch.sin(ttheta)
-
-        # Build affine matrix using stack (avoids in-place assignment)
-        row1 = torch.stack([ ts * cos_theta, -ts * sin_theta, tx], dim=1)  # (B, 3)
-        row2 = torch.stack([ ts * sin_theta,  ts * cos_theta, ty], dim=1)  # (B, 3)
-        affine_matrix = torch.stack([row1, row2], dim=1)                    # (B, 2, 3)
-
-        grid = F.affine_grid(affine_matrix, x.size(), align_corners=False)
-        transformed = F.grid_sample(x, grid, align_corners=False,
-                                    padding_mode='reflection')
-        return transformed
-
-    def get_constraint_params(self, unconstrained_params):
-        """Apply constraints to transformation parameters — no in-place ops"""
-        tx      = torch.clamp(unconstrained_params[:, 0:1], -0.2,  0.2)
-        ty      = torch.clamp(unconstrained_params[:, 1:2], -0.2,  0.2)
-        ttheta  = torch.clamp(unconstrained_params[:, 2:3], -0.25, 0.25)
-        ts_raw  = unconstrained_params[:, 3:4]
-        ts      = 1.0 + torch.clamp(ts_raw - 1.0, -0.2, 0.2)
-        return torch.cat([tx, ty, ttheta, ts], dim=1)
+    @staticmethod
+    def constrain(params):
+        tx    = torch.clamp(params[:, 0:1], -0.2,  0.2)
+        ty    = torch.clamp(params[:, 1:2], -0.2,  0.2)
+        theta = torch.clamp(params[:, 2:3], -0.25, 0.25)
+        scale = 1.0 + torch.clamp(params[:, 3:4] - 1.0, -0.2, 0.2)
+        return torch.cat([tx, ty, theta, scale], dim=1)
 
 
 # ============================================================================
-# SECTION 3: IDENTITY-PRESERVING GENERATION NETWORK
+# SECTION 3: GENERATION NETWORK (Identity-Preserving GAN)
 # ============================================================================
 
 class StyleEncoder(nn.Module):
-    """Style encoder to extract style code from palmprint images"""
-
     def __init__(self, style_dim=16):
-        super(StyleEncoder, self).__init__()
-        self.style_dim = style_dim
-
+        super().__init__()
         from torchvision.models import resnet50
         resnet = resnet50(pretrained=True)
-        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
-        self.fc_mu = nn.Linear(2048, style_dim)
+        self.backbone  = nn.Sequential(*list(resnet.children())[:-1])
+        self.fc_mu     = nn.Linear(2048, style_dim)
         self.fc_logvar = nn.Linear(2048, style_dim)
 
     def forward(self, x):
-        features = self.backbone(x)
-        features = features.view(features.size(0), -1)
-        mu = self.fc_mu(features)
-        logvar = self.fc_logvar(features)
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        style_code = mu + eps * std
-        return mu, logvar, style_code
+        f      = self.backbone(x).flatten(1)
+        mu     = self.fc_mu(f)
+        logvar = self.fc_logvar(f)
+        z      = mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
+        return mu, logvar, z
 
 
 class IdentityEncoder(nn.Module):
-    """Identity encoder (frozen pre-trained network)"""
-
     def __init__(self):
-        super(IdentityEncoder, self).__init__()
+        super().__init__()
         from torchvision.models import resnet50
-        resnet = resnet50(pretrained=True)
-        self.layer1 = nn.Sequential(*list(resnet.children())[:5])
-        self.layer2 = nn.Sequential(*list(resnet.children())[5:6])
-        self.layer3 = nn.Sequential(*list(resnet.children())[6:7])
-        self.layer4 = nn.Sequential(*list(resnet.children())[7:8])
-
-        for param in self.parameters():
-            param.requires_grad = False
+        r = resnet50(pretrained=True)
+        self.layers = nn.Sequential(*list(r.children())[:8])
+        for p in self.parameters():
+            p.requires_grad = False
 
     def forward(self, x):
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        feat_high = self.layer4(x)
-        return feat_high
+        return self.layers(x)
 
 
-class AdaptiveInstanceNorm(nn.Module):
-    """Adaptive Instance Normalization (AdaIN)"""
+class AdaIN(nn.Module):
+    def __init__(self, channels, style_dim):
+        super().__init__()
+        self.norm  = nn.InstanceNorm2d(channels)
+        self.gamma = nn.Linear(style_dim, channels)
+        self.beta  = nn.Linear(style_dim, channels)
 
-    def __init__(self, num_features, style_dim):
-        super(AdaptiveInstanceNorm, self).__init__()
-        self.instance_norm = nn.InstanceNorm2d(num_features)
-        self.fc_gamma = nn.Linear(style_dim, num_features)
-        self.fc_beta = nn.Linear(style_dim, num_features)
-
-    def forward(self, x, style_code):
-        normalized = self.instance_norm(x)
-        gamma = self.fc_gamma(style_code).unsqueeze(-1).unsqueeze(-1)
-        beta = self.fc_beta(style_code).unsqueeze(-1).unsqueeze(-1)
-        return gamma * normalized + beta
+    def forward(self, x, z):
+        g = self.gamma(z).unsqueeze(-1).unsqueeze(-1)
+        b = self.beta(z).unsqueeze(-1).unsqueeze(-1)
+        return g * self.norm(x) + b
 
 
 class AdaINBlock(nn.Module):
-    """Adaptive Instance Normalization Block"""
+    def __init__(self, in_c, out_c, style_dim):
+        super().__init__()
+        self.up    = nn.Upsample(scale_factor=2, mode='nearest')
+        self.conv  = nn.Conv2d(in_c, out_c, 3, padding=1)
+        self.adain = AdaIN(out_c, style_dim)
+        self.act   = nn.ReLU(inplace=False)
 
-    def __init__(self, in_channels, out_channels, style_dim):
-        super(AdaINBlock, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.adain = AdaptiveInstanceNorm(out_channels, style_dim)
-        self.relu = nn.ReLU(inplace=True)
-        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
-
-    def forward(self, x, style_code):
-        x = self.upsample(x)
-        x = self.conv(x)
-        x = self.adain(x, style_code)
-        x = self.relu(x)
-        return x
+    def forward(self, x, z):
+        return self.act(self.adain(self.conv(self.up(x)), z))
 
 
 class PalmGenerator(nn.Module):
-    """Generator network for palmprint synthesis"""
+    def __init__(self, style_dim=16):
+        super().__init__()
+        self.fc  = nn.Linear(style_dim, 512*7*7)
+        self.b1  = AdaINBlock(512, 256, style_dim)
+        self.b2  = AdaINBlock(256, 128, style_dim)
+        self.b3  = AdaINBlock(128,  64, style_dim)
+        self.b4  = AdaINBlock( 64,  32, style_dim)
+        self.out = nn.Conv2d(32, 3, 3, padding=1)
 
-    def __init__(self, style_dim=16, img_size=112):
-        super(PalmGenerator, self).__init__()
-        self.style_dim = style_dim
-        self.img_size = img_size
-        self.fc = nn.Linear(style_dim, 512 * 7 * 7)
-        self.block1 = AdaINBlock(512, 256, style_dim)
-        self.block2 = AdaINBlock(256, 128, style_dim)
-        self.block3 = AdaINBlock(128, 64, style_dim)
-        self.block4 = AdaINBlock(64, 32, style_dim)
-        self.to_rgb = nn.Conv2d(32, 3, kernel_size=3, padding=1)
-
-    def forward(self, style_code, identity_feat):
-        batch_size = style_code.size(0)
-        x = self.fc(style_code)
-        x = x.view(batch_size, 512, 7, 7)
-        x = self.block1(x, style_code)
-        x = self.block2(x, style_code)
-        x = self.block3(x, style_code)
-        x = self.block4(x, style_code)
-        img = self.to_rgb(x)
-        img = torch.tanh(img)
-        return img
+    def forward(self, z, _id_feat=None):
+        x = self.fc(z).view(z.size(0), 512, 7, 7)
+        x = self.b1(x, z)
+        x = self.b2(x, z)
+        x = self.b3(x, z)
+        x = self.b4(x, z)
+        return torch.tanh(self.out(x))
 
 
 class PalmDiscriminator(nn.Module):
-    """Discriminator network for palmprint generation"""
-
     def __init__(self):
-        super(PalmDiscriminator, self).__init__()
-        self.main = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=4, stride=2, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(512, 1, kernel_size=4, stride=1, padding=0),
+        super().__init__()
+        def block(in_c, out_c, bn=True):
+            layers = [nn.Conv2d(in_c, out_c, 4, 2, 1)]
+            if bn:
+                layers.append(nn.BatchNorm2d(out_c))
+            layers.append(nn.LeakyReLU(0.2, inplace=False))
+            return layers
+        self.net = nn.Sequential(
+            *block(  3,  64, bn=False),
+            *block( 64, 128),
+            *block(128, 256),
+            *block(256, 512),
+            nn.Conv2d(512, 1, 4, 1, 0),
         )
 
     def forward(self, x):
-        return self.main(x).view(x.size(0), -1)
+        return self.net(x).flatten(1)
 
 
 class PalmGenerationNetwork(nn.Module):
-    """Complete identity-preserving palmprint generation network"""
-
     def __init__(self, style_dim=16, img_size=112):
-        super(PalmGenerationNetwork, self).__init__()
-        self.style_encoder = StyleEncoder(style_dim=style_dim)
+        super().__init__()
+        self.style_encoder    = StyleEncoder(style_dim)
         self.identity_encoder = IdentityEncoder()
-        self.generator = PalmGenerator(style_dim=style_dim, img_size=img_size)
-        self.discriminator = PalmDiscriminator()
+        self.generator        = PalmGenerator(style_dim)
+        self.discriminator    = PalmDiscriminator()
 
-    def forward(self, x_style, x_identity=None):
-        if x_identity is None:
-            x_identity = x_style
-        mu, logvar, style_code = self.style_encoder(x_style)
-        identity_feat = self.identity_encoder(x_identity)
-        generated = self.generator(style_code, identity_feat)
-        return generated, style_code, identity_feat, mu, logvar
+    def forward(self, x_style, x_id=None):
+        if x_id is None:
+            x_id = x_style
+        mu, logvar, z = self.style_encoder(x_style)
+        id_feat       = self.identity_encoder(x_id)
+        generated     = self.generator(z, id_feat)
+        return generated, z, id_feat, mu, logvar
 
 
 # ============================================================================
-# SECTION 4: RECOGNITION NETWORK (ARCFACE)
+# SECTION 4: RECOGNITION NETWORK (ResNet-50 + ArcFace)
 # ============================================================================
-
-class ArcFaceHead(nn.Module):
-    """ArcFace Head for palmprint recognition"""
-
-    def __init__(self, in_features=512, num_classes=1000, s=64.0, m=0.5):
-        super(ArcFaceHead, self).__init__()
-        self.in_features = in_features
-        self.num_classes = num_classes
-        self.s = s
-        self.m = m
-        self.weight = nn.Parameter(torch.Tensor(num_classes, in_features))
-        self.register_parameter('bias', None)
-        nn.init.xavier_uniform_(self.weight)
-
-    def forward(self, x):
-        x = F.normalize(x, dim=1)
-        W = F.normalize(self.weight, dim=1)
-        logits = F.linear(x, W)
-        return logits
-
 
 class ArcFaceLoss(nn.Module):
-    """ArcFace Loss function"""
-
-    def __init__(self, num_classes=1000, s=64.0, m=0.5):
-        super(ArcFaceLoss, self).__init__()
-        self.s = s
-        self.m = m
+    def __init__(self, feat_dim, num_classes, s=64.0, m=0.5):
+        super().__init__()
+        self.s     = s
+        self.m     = m
         self.cos_m = math.cos(m)
         self.sin_m = math.sin(m)
-        self.mm = self.sin_m * m
-        self.threshold = math.cos(math.pi - m)
+        self.th    = math.cos(math.pi - m)
+        self.mm    = math.sin(math.pi - m) * m
+        self.W     = nn.Parameter(torch.empty(num_classes, feat_dim))
+        nn.init.xavier_uniform_(self.W)
 
-    def forward(self, logits, labels):
-        logits = torch.clamp(logits, -1.0, 1.0)
-        theta = torch.acos(logits)
-        target_logit = torch.cos(theta + self.m)
-        # Use scatter instead of in-place index assignment
-        one_hot = torch.zeros_like(logits)
+    def forward(self, feats, labels):
+        feats  = F.normalize(feats,  dim=1)
+        W      = F.normalize(self.W, dim=1)
+        cos_t  = torch.clamp(feats @ W.T, -1.0 + 1e-7, 1.0 - 1e-7)
+        sin_t  = torch.sqrt(torch.clamp(1.0 - cos_t**2, min=1e-8))
+        cos_tm = cos_t * self.cos_m - sin_t * self.sin_m
+        cos_tm = torch.where(cos_t > self.th, cos_tm, cos_t - self.mm)
+        one_hot = torch.zeros_like(cos_t)
         one_hot.scatter_(1, labels.unsqueeze(1), 1.0)
-        output = one_hot * target_logit + (1.0 - one_hot) * logits
-        output = output * self.s
-        loss = F.cross_entropy(output, labels)
-        return loss
+        output = one_hot * cos_tm + (1.0 - one_hot) * cos_t
+        return F.cross_entropy(output * self.s, labels)
+
+    def get_logits(self, feats):
+        feats = F.normalize(feats, dim=1)
+        W     = F.normalize(self.W, dim=1)
+        return feats @ W.T
 
 
 class PalmRecognitionNetwork(nn.Module):
-    """Palmprint Recognition Network with ResNet-50 and ArcFace"""
-
-    def __init__(self, num_classes, feature_dim=512, input_size=112):
-        super(PalmRecognitionNetwork, self).__init__()
-        self.num_classes = num_classes
-        self.feature_dim = feature_dim
-
+    def __init__(self, num_classes, feature_dim=512, s=64.0, m=0.5):
+        super().__init__()
         from torchvision.models import resnet50
-        resnet = resnet50(pretrained=True)
-        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
-        self.feature_bn = nn.BatchNorm1d(2048)
-        self.feature_fc = nn.Linear(2048, feature_dim)
-        self.feature_bn2 = nn.BatchNorm1d(feature_dim)
-        self.arcface_head = ArcFaceHead(in_features=feature_dim, num_classes=num_classes, s=64.0, m=0.5)
-        self.arcface_loss = ArcFaceLoss(num_classes=num_classes, s=64.0, m=0.5)
+        r = resnet50(pretrained=True)
+        self.backbone = nn.Sequential(*list(r.children())[:-1])
+        self.bn1      = nn.BatchNorm1d(2048)
+        self.fc       = nn.Linear(2048, feature_dim)
+        self.bn2      = nn.BatchNorm1d(feature_dim)
+        self.head     = ArcFaceLoss(feature_dim, num_classes, s=s, m=m)
 
-    def extract_features(self, x):
-        x = self.backbone(x)
-        x = x.view(x.size(0), -1)
-        x = self.feature_bn(x)
-        x = self.feature_fc(x)
-        x = self.feature_bn2(x)
-        return x
+    def extract(self, x):
+        f = self.backbone(x).flatten(1)
+        f = self.bn1(f)
+        f = self.fc(f)
+        f = self.bn2(f)
+        return f
 
     def forward(self, x):
-        features = self.extract_features(x)
-        logits = self.arcface_head(features)
-        return logits, features
+        f = self.extract(x)
+        return self.head.get_logits(f), f
 
-    def compute_loss(self, logits, labels):
-        return self.arcface_loss(logits, labels)
+    def compute_loss(self, feats, labels):
+        return self.head(feats, labels)
 
     def get_verification_features(self, x):
-        features = self.extract_features(x)
-        features = F.normalize(features, dim=1)
-        return features
+        return F.normalize(self.extract(x), dim=1)
 
 
 # ============================================================================
-# SECTION 5: AUGMENTATION MODULE (UAA)
+# SECTION 5: UAA AUGMENTATION MODULE
 # ============================================================================
 
 class UnifiedAugmentationModule(nn.Module):
-    """Unified augmentation module combining spatial and generative components"""
-
     def __init__(self, style_dim=16, img_size=112, use_generation=True):
-        super(UnifiedAugmentationModule, self).__init__()
-        self.style_dim = style_dim
-        self.img_size = img_size
+        super().__init__()
         self.use_generation = use_generation
-        self.control_dim = 4 + style_dim
-        self.spatial_transformer = SpatialTransformer(img_size=img_size)
-
+        self.spatial_tf     = SpatialTransformer(img_size)
         if use_generation:
-            self.generation_network = PalmGenerationNetwork(style_dim=style_dim, img_size=img_size)
+            self.gen_network = PalmGenerationNetwork(style_dim, img_size)
 
-    def forward(self, x, control_vector, augmentation_type='both'):
-        spatial_params = control_vector[:, :4]
-        style_code = control_vector[:, 4:]
+    def forward(self, x, ctrl, aug_type='both'):
+        spatial_p = ctrl[:, :4]
 
-        if augmentation_type in ('geometric', 'both'):
-            spatial_params = self.spatial_transformer.get_constraint_params(spatial_params)
-            x = self.spatial_transformer(x, spatial_params)
+        if aug_type in ('geometric', 'both'):
+            spatial_p = SpatialTransformer.constrain(spatial_p)
+            x = self.spatial_tf(x, spatial_p)
 
-        if augmentation_type in ('textural', 'both'):
-            if self.use_generation:
-                x_augmented, _, _, _, _ = self.generation_network(x, x)
-                alpha = 0.5
-                x = alpha * x_augmented + (1 - alpha) * x
+        if aug_type in ('textural', 'both') and self.use_generation:
+            x_gen, _, _, _, _ = self.gen_network(x, x)
+            x = 0.5 * x_gen + 0.5 * x
 
         return x
 
-    def get_frozen_params(self):
-        params = []
-        if self.use_generation:
-            params.extend(self.generation_network.parameters())
-        return params
 
+class AdversarialAugOptimizer:
+    """PGD-based control vector optimisation."""
 
-class AdversarialAugmentationOptimizer(nn.Module):
-    """Optimize control vector to generate challenging samples"""
+    def __init__(self, aug_module, rec_net, pgd_steps=2, step_size=0.05):
+        self.aug   = aug_module
+        self.rec   = rec_net
+        self.steps = pgd_steps
+        self.alpha = step_size
+        self.b_sp  = 0.3   # spatial bound
+        self.b_st  = 1.0   # style bound
 
-    def __init__(self, augmentation_module, recognition_network,
-                 pgd_steps=1, pgd_step_size=0.01, control_dim=20):
-        super(AdversarialAugmentationOptimizer, self).__init__()
-        self.augmentation_module = augmentation_module
-        self.recognition_network = recognition_network
-        self.pgd_steps = pgd_steps
-        self.pgd_step_size = pgd_step_size
-        self.control_dim = control_dim
-        self.perturbation_bounds = {'spatial': 0.3, 'style': 1.0}
-
-    def optimize_control_vector(self, x, labels, z_init, augmentation_type='both'):
-        # Detach input so we don't backprop through the data pipeline
-        x_detached = x.detach()
-
-        # Start from a fresh leaf tensor
+    def optimize(self, x, labels, z_init, aug_type='both'):
+        x_det = x.detach()
         z = z_init.clone().detach().requires_grad_(True)
 
-        for step in range(self.pgd_steps):
-            # Zero grad if it exists
+        for _ in range(self.steps):
             if z.grad is not None:
                 z.grad.zero_()
 
-            # Forward pass
-            x_augmented = self.augmentation_module(x_detached, z,
-                                                   augmentation_type=augmentation_type)
-            logits, features = self.recognition_network(x_augmented)
-            loss = self.recognition_network.compute_loss(logits, labels)
-
-            # Backward pass
+            x_aug  = self.aug(x_det, z, aug_type=aug_type)
+            _, feat = self.rec(x_aug)
+            loss   = self.rec.compute_loss(feat, labels)
             loss.backward()
 
-            # PGD update — all out-of-place
             with torch.no_grad():
-                grad_sign = torch.sign(z.grad)
-                z_new = z.data + self.pgd_step_size * grad_sign
-                z_new = self._project_onto_bounds(z_new)
+                z_new = z.data + self.alpha * torch.sign(z.grad)
+                sp    = torch.clamp(z_new[:, :4], -self.b_sp, self.b_sp)
+                st    = torch.clamp(z_new[:, 4:], -self.b_st, self.b_st)
+                z_new = torch.cat([sp, st], dim=1)
 
-            # Fresh leaf tensor for next iteration
             z = z_new.detach().requires_grad_(True)
 
         return z.detach()
 
-    def _project_onto_bounds(self, z):
-        z_spatial = torch.clamp(z[:, :4],
-                                -self.perturbation_bounds['spatial'],
-                                 self.perturbation_bounds['spatial'])
-        z_style   = torch.clamp(z[:, 4:],
-                                -self.perturbation_bounds['style'],
-                                 self.perturbation_bounds['style'])
-        return torch.cat([z_spatial, z_style], dim=1)
 
-
-class MomentumDynamicSampler(nn.Module):
-    """Momentum-based dynamic sampling strategy"""
-
-    def __init__(self, control_dim, momentum=0.5):
-        super(MomentumDynamicSampler, self).__init__()
-        self.control_dim = control_dim
+class MomentumSampler:
+    def __init__(self, dim, momentum=0.5, std=0.1):
+        self.dim      = dim
         self.momentum = momentum
-        self.register_buffer('mean', torch.zeros(control_dim))
-        self.register_buffer('std', torch.ones(control_dim) * 0.1)
-        self.z_prev = None
+        self.std      = std
+        self.z_prev   = None
 
-    def sample(self, batch_size, device):
-        if self.z_prev is None:
-            z = (torch.randn(batch_size, self.control_dim, device=device)
-                 * self.std.to(device) + self.mean.to(device))
-        else:
-            mean_dynamic = (self.momentum * self.z_prev
-                            + (1 - self.momentum) * self.mean.to(device))
-            z = (torch.randn(batch_size, self.control_dim, device=device)
-                 * self.std.to(device) + mean_dynamic)
-        return z
+    def sample(self, B, device):
+        base = torch.zeros(self.dim, device=device)
+        if self.z_prev is not None:
+            base = (self.momentum * self.z_prev.squeeze(0).to(device)
+                    + (1 - self.momentum) * base)
+        return base.unsqueeze(0) + self.std * torch.randn(B, self.dim, device=device)
 
-    def update_prev(self, z_opt):
-        self.z_prev = z_opt.mean(dim=0, keepdim=True).detach()
-
-
-class AugmentationRateController(nn.Module):
-    """Controls proportion of samples to augment"""
-
-    def __init__(self, geometric_rate=0.5, textural_rate=0.5):
-        super(AugmentationRateController, self).__init__()
-        self.geometric_rate = geometric_rate
-        self.textural_rate = textural_rate
-
-    def get_augmentation_mask(self, batch_size, augmentation_type='both', device='cpu'):
-        if augmentation_type == 'geometric':
-            num_to_augment = int(batch_size * self.geometric_rate)
-        elif augmentation_type == 'textural':
-            num_to_augment = int(batch_size * self.textural_rate)
-        else:
-            num_to_augment = int(batch_size * max(self.geometric_rate, self.textural_rate))
-
-        mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        indices = torch.randperm(batch_size, device=device)[:num_to_augment]
-        mask[indices] = True
-        return mask
+    def update(self, z_opt):
+        self.z_prev = z_opt.mean(0, keepdim=True).detach().cpu()
 
 
 # ============================================================================
-# SECTION 6: EVALUATION METRICS
+# SECTION 6: GAN PRE-TRAINER
 # ============================================================================
 
-class PalmRecognitionEvaluator:
-    """Comprehensive evaluator for palmprint recognition"""
+class GANPretrainer:
+    """Pre-train the generation network BEFORE recognition training."""
 
-    def __init__(self, recognition_network, device):
-        self.recognition_network = recognition_network
-        self.device = device
-        self.recognition_network.eval()
+    def __init__(self, gen_net, device, lr=1e-4, save_path=None):
+        self.gen  = gen_net
+        self.dev  = device
+        self.save = save_path
 
-    def extract_features(self, dataloader):
-        features_list = []
-        identities_list = []
-        paths_list = []
-        spectrums_list = []
-        hand_ids_list = []
+        gen_params = (list(gen_net.style_encoder.parameters()) +
+                      list(gen_net.generator.parameters()))
+        self.opt_G = optim.Adam(gen_params,
+                                lr=lr, betas=(0.5, 0.99))
+        self.opt_D = optim.Adam(gen_net.discriminator.parameters(),
+                                lr=lr, betas=(0.5, 0.99))
+
+    def train_batch(self, x):
+        # ── Discriminator step ────────────────────────────────────────────
+        gen, z, id_feat, mu, logvar = self.gen(x, x)
+        d_real = self.gen.discriminator(x)
+        d_fake = self.gen.discriminator(gen.detach())
+        l_D    = F.relu(1.0 - d_real).mean() + F.relu(1.0 + d_fake).mean()
+        self.opt_D.zero_grad()
+        l_D.backward()
+        self.opt_D.step()
+
+        # ── Generator step ────────────────────────────────────────────────
+        gen2, z2, id2, mu2, lv2 = self.gen(x, x)
+        d_fake2 = self.gen.discriminator(gen2)
+
+        l_adv = -d_fake2.mean()
+        l_rec = F.l1_loss(gen2, x)
+        l_kl  = -0.5 * (1 + lv2 - mu2.pow(2) - lv2.exp()).sum(1).mean()
 
         with torch.no_grad():
-            for batch in tqdm(dataloader, desc="Extracting features"):
-                x = batch['img'].to(self.device)
-                identities = batch['identity'].cpu().numpy()
-                paths = batch['path']
-                spectrums = batch['spectrum']
-                hand_ids = batch['hand_id']
+            fi_r = self.gen.identity_encoder(x).mean([2, 3])
+        fi_g  = self.gen.identity_encoder(gen2).mean([2, 3])
+        l_id  = 1.0 - F.cosine_similarity(fi_r, fi_g, dim=1).mean()
 
-                features = self.recognition_network.get_verification_features(x)
+        l_G   = l_adv + l_rec * 10.0 + l_kl * 0.01 + l_id * 5.0
+        self.opt_G.zero_grad()
+        l_G.backward()
+        self.opt_G.step()
 
-                features_list.append(features.cpu().numpy())
-                identities_list.extend(identities)
-                paths_list.extend(paths)
-                spectrums_list.extend(spectrums)
-                hand_ids_list.extend(hand_ids)
+        return {'G': l_G.item(), 'D': l_D.item(),
+                'rec': l_rec.item(), 'id': l_id.item()}
 
-        features = np.concatenate(features_list, axis=0)
-        identities = np.array(identities_list)
+    def run(self, loader, epochs):
+        print(f"\n{'='*80}")
+        print(f"  GAN PRE-TRAINING  ({epochs} epochs)")
+        print(f"{'='*80}")
+        self.gen.train()
 
-        return features, identities, paths_list, spectrums_list, hand_ids_list
+        for ep in range(epochs):
+            totals = {}
+            pbar   = tqdm(loader, desc=f"[GAN] Epoch {ep+1}/{epochs}")
+            for batch in pbar:
+                x      = batch['img'].to(self.dev)
+                losses = self.train_batch(x)
+                for k, v in losses.items():
+                    totals[k] = totals.get(k, 0) + v
+                pbar.set_postfix({k: f"{v:.3f}" for k, v in losses.items()})
 
-    def compute_verification_metrics(self, features, identities,
-                                     tar_far_values=[1e-5, 1e-4, 1e-3, 1e-2]):
+            n   = len(loader)
+            avg = {k: v/n for k, v in totals.items()}
+            print(f"[GAN] Epoch {ep+1:3d}  " +
+                  "  ".join(f"{k}={v:.4f}" for k, v in avg.items()))
+
+        if self.save:
+            os.makedirs(os.path.dirname(self.save), exist_ok=True)
+            torch.save(self.gen.state_dict(), self.save)
+            print(f"[GAN] Saved -> {self.save}")
+
+        # Freeze generator & discriminator after pre-training
+        for p in self.gen.generator.parameters():
+            p.requires_grad = False
+        for p in self.gen.discriminator.parameters():
+            p.requires_grad = False
+        print("[GAN] Generator & Discriminator frozen.")
+
+
+# ============================================================================
+# SECTION 7: EVALUATION  (Verification + Identification)
+# ============================================================================
+
+class Evaluator:
+    def __init__(self, rec_net, device):
+        self.rec = rec_net
+        self.dev = device
+
+    @torch.no_grad()
+    def extract(self, loader):
+        feats, ids, specs = [], [], []
+        self.rec.eval()
+        for batch in tqdm(loader, desc="[Eval] Extracting features"):
+            x = batch['img'].to(self.dev)
+            f = self.rec.get_verification_features(x)
+            feats.append(f.cpu().numpy())
+            ids.extend(batch['identity'].numpy().tolist())
+            specs.extend(batch['spectrum'])
+        return (np.concatenate(feats),
+                np.array(ids),
+                np.array(specs))
+
+    def verification(self, feats, ids, far_targets):
         print("[Eval] Computing verification metrics...")
+        sim = feats @ feats.T
+        gen, imp = [], []
+        n = len(feats)
+        for i in range(n):
+            for j in range(i+1, n):
+                (gen if ids[i] == ids[j] else imp).append(float(sim[i, j]))
+        gen, imp = np.array(gen), np.array(imp)
+        print(f"       Genuine: {len(gen):,}   Imposter: {len(imp):,}")
 
-        features_norm = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-8)
-        similarities = features_norm @ features_norm.T
+        results     = {}
+        imp_sorted  = np.sort(imp)[::-1]
+        for far in far_targets:
+            idx = int(len(imp) * far)
+            thr = imp_sorted[min(idx, len(imp)-1)]
+            tar = float((gen >= thr).mean())
+            results[f"TAR@FAR={far:.0e}"] = tar
 
-        genuine_scores = []
-        imposter_scores = []
+        all_s = np.concatenate([gen, imp])
+        all_l = np.concatenate([np.ones(len(gen)), np.zeros(len(imp))])
+        fpr, tpr, _ = roc_curve(all_l, all_s)
+        results["EER"] = float((fpr + (1-tpr))[np.argmin(np.abs(fpr - (1-tpr)))] / 2)
+        return results, gen, imp
 
-        for i in range(len(features)):
-            for j in range(i + 1, len(features)):
-                score = similarities[i, j]
-                if identities[i] == identities[j]:
-                    genuine_scores.append(score)
-                else:
-                    imposter_scores.append(score)
+    def identification(self, feats, ids, specs):
+        print("[Eval] Computing identification metrics (1:N)...")
+        feats_n = feats / (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-8)
+        uid_list = np.unique(ids)
+        g_f, g_id, p_f, p_id = [], [], [], []
 
-        genuine_scores = np.array(genuine_scores)
-        imposter_scores = np.array(imposter_scores)
-
-        print(f"  Genuine pairs: {len(genuine_scores)}")
-        print(f"  Imposter pairs: {len(imposter_scores)}")
-
-        results = {}
-
-        for far_threshold in tar_far_values:
-            num_imposter = len(imposter_scores)
-            num_false_accepts = int(num_imposter * far_threshold)
-
-            sorted_imposters = np.sort(imposter_scores)[::-1]
-
-            if num_false_accepts < num_imposter:
-                decision_threshold = sorted_imposters[num_false_accepts]
-            else:
-                decision_threshold = -1.0
-
-            num_genuine = len(genuine_scores)
-            num_genuine_accepts = np.sum(genuine_scores >= decision_threshold)
-            tar = num_genuine_accepts / num_genuine if num_genuine > 0 else 0.0
-
-            results[f'TAR@FAR={far_threshold:.0e}'] = tar
-
-        all_scores = np.concatenate([genuine_scores, imposter_scores])
-        all_labels = np.concatenate([np.ones_like(genuine_scores),
-                                     np.zeros_like(imposter_scores)])
-
-        fpr, tpr, thresholds = roc_curve(all_labels, all_scores)
-        eer = np.min(np.abs(fpr + (1 - tpr)))
-        results['EER'] = eer
-
-        return results, genuine_scores, imposter_scores
-
-    def compute_identification_metrics(self, features, identities, spectrums, hand_ids):
-        print("[Eval] Computing identification metrics...")
-
-        features_norm = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-8)
-
-        unique_ids = np.unique(identities)
-
-        gallery_features = []
-        gallery_identities = []
-
-        probe_features = []
-        probe_identities = []
-
-        for uid in unique_ids:
-            indices = np.where(identities == uid)[0]
-
-            if len(indices) < 2:
+        for uid in uid_list:
+            idx = np.where(ids == uid)[0]
+            if len(idx) < 2:
                 continue
+            gal_set = set()
+            for spec in np.unique(specs[idx]):
+                si = idx[specs[idx] == spec]
+                gal_set.add(si[0])
+                g_f.append(feats_n[si[0]])
+                g_id.append(uid)
+            for i in idx:
+                if i not in gal_set:
+                    p_f.append(feats_n[i])
+                    p_id.append(uid)
 
-            spectrum_indices = {}
-            for idx in indices:
-                spec = spectrums[idx]
-                if spec not in spectrum_indices:
-                    spectrum_indices[spec] = []
-                spectrum_indices[spec].append(idx)
+        if not g_f or not p_f:
+            print("[Eval] Warning: empty gallery or probe set.")
+            return {f"Rank-{k}": 0.0 for k in [1, 5, 10]}
 
-            gallery_selected = set()
-            for spec, spec_idxs in spectrum_indices.items():
-                gallery_idx = spec_idxs[0]
-                gallery_selected.add(gallery_idx)
-                gallery_features.append(features_norm[gallery_idx])
-                gallery_identities.append(uid)
+        G, Gid = np.array(g_f), np.array(g_id)
+        P, Pid = np.array(p_f), np.array(p_id)
+        print(f"       Gallery: {len(G)}   Probes: {len(P)}")
 
-            for idx in indices:
-                if idx not in gallery_selected:
-                    probe_features.append(features_norm[idx])
-                    probe_identities.append(uid)
-
-        if len(gallery_features) == 0 or len(probe_features) == 0:
-            print("[Eval] Warning: No valid gallery or probe samples")
-            return {f'Rank-{k}': 0.0 for k in [1, 5, 10]}
-
-        gallery_features = np.array(gallery_features)
-        gallery_identities = np.array(gallery_identities)
-        probe_features = np.array(probe_features)
-        probe_identities = np.array(probe_identities)
-
-        print(f"  Gallery size: {len(gallery_features)}")
-        print(f"  Probe size: {len(probe_features)}")
-
-        similarities = probe_features @ gallery_features.T
-        ranked_indices = np.argsort(-similarities, axis=1)
-        ranked_gallery_ids = gallery_identities[ranked_indices]
-
+        sim    = P @ G.T
+        ranked = Gid[np.argsort(-sim, axis=1)]
         results = {}
         for k in [1, 5, 10]:
-            if k > len(gallery_identities):
-                results[f'Rank-{k}'] = 0.0
-                continue
-            matches = ranked_gallery_ids[:, :k] == probe_identities.reshape(-1, 1)
-            results[f'Rank-{k}'] = np.any(matches, axis=1).mean()
-
+            kk = min(k, len(Gid))
+            results[f"Rank-{k}"] = float(
+                np.any(ranked[:, :kk] == Pid[:, None], axis=1).mean())
         return results
 
-    def evaluate(self, test_loader, test_samples=None,
-                 tar_far_values=[1e-5, 1e-4, 1e-3, 1e-2]):
-        print("\n" + "=" * 80)
-        print("EVALUATION PHASE")
-        print("=" * 80 + "\n")
+    def evaluate(self, loader, far_targets):
+        feats, ids, specs = self.extract(loader)
+        ver, gen, imp     = self.verification(feats, ids, far_targets)
+        idf               = self.identification(feats, ids, specs)
+        return {**ver, **idf,
+                'num_samples'   : len(feats),
+                'num_identities': int(np.unique(ids).size),
+                'num_genuine'   : len(gen),
+                'num_imposter'  : len(imp)}
 
-        features, identities, paths, spectrums, hand_ids = self.extract_features(test_loader)
-
-        ver_results, genuine_scores, imposter_scores = self.compute_verification_metrics(
-            features, identities, tar_far_values
-        )
-
-        id_results = self.compute_identification_metrics(
-            features, identities, spectrums, hand_ids
-        )
-
-        all_results = {
-            **ver_results,
-            **id_results,
-            'num_samples': len(features),
-            'num_identities': len(np.unique(identities)),
-            'num_genuine_pairs': len(genuine_scores),
-            'num_imposter_pairs': len(imposter_scores),
-        }
-
-        return all_results
-
-    def print_results(self, results):
-        print("\n" + "=" * 80)
-        print("PALMPRINT RECOGNITION EVALUATION RESULTS")
-        print("=" * 80)
-
-        print(f"\nDataset Statistics:")
-        print(f"  Total samples:    {results.get('num_samples', 'N/A')}")
-        print(f"  Total identities: {results.get('num_identities', 'N/A')}")
-        print(f"  Genuine pairs:    {results.get('num_genuine_pairs', 'N/A')}")
-        print(f"  Imposter pairs:   {results.get('num_imposter_pairs', 'N/A')}")
-
-        print(f"\nVerification Metrics (TAR@FAR):")
-        for key in sorted(results.keys()):
-            if 'TAR@FAR' in key:
-                print(f"  {key}: {results[key]:.4f}")
-
-        if 'EER' in results:
-            print(f"  EER: {results['EER']:.4f}")
-
-        print(f"\nIdentification Metrics (1:N Matching):")
-        for key in sorted(results.keys()):
-            if 'Rank-' in key:
-                print(f"  {key} Accuracy: {results[key]:.4f}")
-
-        print("\n" + "=" * 80 + "\n")
+    def print_results(self, res):
+        print("\n" + "="*80)
+        print("  EVALUATION RESULTS")
+        print("="*80)
+        print(f"  Samples: {res['num_samples']}   "
+              f"Identities: {res['num_identities']}")
+        print(f"  Genuine pairs: {res['num_genuine']:,}   "
+              f"Imposter pairs: {res['num_imposter']:,}")
+        print("\n  Verification:")
+        for k in sorted(res):
+            if 'TAR' in k or k == 'EER':
+                print(f"    {k:<28} {res[k]:.4f}")
+        print("\n  Identification:")
+        for k in sorted(res):
+            if 'Rank' in k:
+                print(f"    {k:<28} {res[k]:.4f}")
+        print("="*80 + "\n")
 
 
 # ============================================================================
-# SECTION 7: TRAINING
+# SECTION 8: LR SCHEDULE WITH WARM-UP
 # ============================================================================
 
-class GenerationNetworkTrainer:
-    """Pre-train the generation network"""
+def build_lr_schedule(optimizer, warmup_epochs, total_epochs, base_lr, min_lr=1e-5):
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+        cosine   = 0.5 * (1 + math.cos(math.pi * progress))
+        return min_lr / base_lr + (1 - min_lr / base_lr) * cosine
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    def __init__(self, model, device, lr=1e-3, num_epochs=60):
-        self.model = model
-        self.device = device
-        self.lr = lr
-        self.num_epochs = num_epochs
-        self.optimizer_gen = optim.Adam(
-            list(model.style_encoder.parameters()) + list(model.generator.parameters()),
-            lr=lr, betas=(0.5, 0.99)
-        )
-        self.optimizer_disc = optim.Adam(model.discriminator.parameters(), lr=lr, betas=(0.5, 0.99))
 
-    def compute_losses(self, x_real, x_style, generated, disc_real, disc_fake, mu, logvar):
-        loss_gan = (torch.nn.ReLU()(1.0 - disc_real).mean()
-                    + torch.nn.ReLU()(1.0 + disc_fake).mean())
-        loss_l1 = torch.abs(generated - x_style).mean()
-        loss_kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1).mean()
-
-        with torch.no_grad():
-            identity_feat_real = self.model.identity_encoder(x_real)
-        identity_feat_gen = self.model.identity_encoder(generated)
-        loss_id = 1.0 - F.cosine_similarity(
-            identity_feat_real.mean(dim=[2, 3]),
-            identity_feat_gen.mean(dim=[2, 3]), dim=1
-        ).mean()
-
-        return {'gan': loss_gan, 'l1': loss_l1, 'kl': loss_kl, 'id': loss_id}
-
-    def train_on_batch(self, x_style, x_identity):
-        generated, style_code, identity_feat, mu, logvar = self.model(x_style, x_identity)
-        disc_real = self.model.discriminator(x_identity)
-        disc_fake = self.model.discriminator(generated.detach())
-        losses = self.compute_losses(x_identity, x_style, generated,
-                                     disc_real, disc_fake, mu, logvar)
-
-        self.optimizer_disc.zero_grad()
-        loss_disc = losses['gan']
-        loss_disc.backward()
-        self.optimizer_disc.step()
-
-        generated = self.model.generator(style_code, identity_feat)
-        disc_fake = self.model.discriminator(generated)
-        losses = self.compute_losses(x_identity, x_style, generated,
-                                     disc_real, disc_fake, mu, logvar)
-
-        loss_gen = (losses['gan'] * 1.0 + losses['l1'] * 1.0
-                    + losses['kl'] * 0.01 + losses['id'] * 5.0)
-        self.optimizer_gen.zero_grad()
-        loss_gen.backward()
-        self.optimizer_gen.step()
-
-        return {
-            'loss_gen': loss_gen.item(),
-            'loss_disc': loss_disc.item(),
-            **{f'loss_{k}': v.item() for k, v in losses.items()}
-        }
-
+# ============================================================================
+# SECTION 9: MAIN TRAINER
+# ============================================================================
 
 class UAATrainer:
-    """Main UAA training framework"""
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[Init] Device: {self.dev}")
 
-    def __init__(self, args):
-        self.args = args
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"[Init] Using device: {self.device}")
+        # Data
+        (self.train_loader, self.test_loader,
+         self.num_classes, self.test_samples,
+         self.identity_map) = create_dataloaders(cfg)
 
-        self.train_loader, self.test_loader, self.num_classes, self.test_samples = \
-            create_dataloaders(
-                data_path=args.data_path,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers,
-                img_size=args.img_size,
-                train_ratio=args.train_ratio,
-                seed=args.random_seed
-            )
+        # Networks
+        self.rec = PalmRecognitionNetwork(
+            self.num_classes, cfg.feature_dim,
+            s=cfg.arcface_s, m=cfg.arcface_m
+        ).to(self.dev)
 
-        self._create_networks()
-        self._create_optimizers()
-        self._create_augmentation_components()
-        self.writer = SummaryWriter(f'runs/{datetime.now().strftime("%Y%m%d_%H%M%S")}')
-        self.global_step = 0
+        self.aug = UnifiedAugmentationModule(
+            style_dim=cfg.style_dim,
+            img_size=cfg.img_size,
+            use_generation=cfg.use_generation
+        ).to(self.dev)
 
-    def _create_networks(self):
-        self.recognition_net = PalmRecognitionNetwork(
-            num_classes=self.num_classes,
-            feature_dim=self.args.feature_dim,
-            input_size=self.args.img_size
-        ).to(self.device)
+        # Recognition-only optimiser (aug GAN has its own in GANPretrainer)
+        self.opt   = optim.SGD(self.rec.parameters(),
+                               lr=cfg.lr, momentum=0.9,
+                               weight_decay=cfg.weight_decay)
+        self.sched = build_lr_schedule(
+            self.opt, cfg.warmup_epochs, cfg.num_epochs, cfg.lr)
 
-        self.augmentation_module = UnifiedAugmentationModule(
-            style_dim=self.args.style_dim,
-            img_size=self.args.img_size,
-            use_generation=self.args.use_generation
-        ).to(self.device)
+        # Augmentation helpers
+        self.pgd   = AdversarialAugOptimizer(
+            self.aug, self.rec,
+            pgd_steps=cfg.pgd_steps, step_size=cfg.pgd_step_size)
+        self.s_geo = MomentumSampler(4,             momentum=cfg.momentum_geo)
+        self.s_tex = MomentumSampler(cfg.style_dim, momentum=cfg.momentum_tex)
 
-        if self.args.use_generation:
-            self.generation_network = self.augmentation_module.generation_network
+        self.writer   = SummaryWriter(f'runs/{datetime.now().strftime("%Y%m%d_%H%M%S")}')
+        self.step     = 0
+        self.best_tar = 0.0
 
-        print(f"[Networks] Recognition network created with {self.num_classes} classes")
-
-    def _create_optimizers(self):
-        self.optimizer_rec = optim.SGD(
-            self.recognition_net.parameters(),
-            lr=self.args.lr, momentum=0.9, weight_decay=5e-4
-        )
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer_rec, T_max=self.args.num_epochs, eta_min=1e-4
-        )
-
-    def _create_augmentation_components(self):
-        self.adv_optimizer = AdversarialAugmentationOptimizer(
-            augmentation_module=self.augmentation_module,
-            recognition_network=self.recognition_net,
-            pgd_steps=self.args.pgd_steps,
-            pgd_step_size=self.args.pgd_step_size,
-            control_dim=4 + self.args.style_dim
-        )
-        self.sampler_geo = MomentumDynamicSampler(
-            control_dim=4, momentum=self.args.momentum_geo
-        )
-        self.sampler_tex = MomentumDynamicSampler(
-            control_dim=self.args.style_dim, momentum=self.args.momentum_tex
-        )
-        self.rate_controller = AugmentationRateController(
-            geometric_rate=self.args.geometric_rate,
-            textural_rate=self.args.textural_rate
-        )
-
-    def pretrain_generation_network(self):
-        if not self.args.use_generation:
-            print("[Pretrain] Skipping generation network pretraining")
+    # ── Phase 1: GAN pre-training ──────────────────────────────────────────
+    def pretrain_gan(self):
+        if not self.cfg.use_generation:
+            print("[GAN] Skipping — use_generation=False")
             return
-        print("[Pretrain] Starting generation network pretraining...")
-        trainer = GenerationNetworkTrainer(
-            self.generation_network, self.device,
-            lr=self.args.gen_lr, num_epochs=self.args.gen_pretrain_epochs
-        )
-        for epoch in range(self.args.gen_pretrain_epochs):
-            total_loss = 0
-            pbar = tqdm(self.train_loader,
-                        desc=f"[GenPreTrain] Epoch {epoch + 1}/{self.args.gen_pretrain_epochs}")
-            for batch_idx, batch in enumerate(pbar):
-                x = batch['img'].to(self.device)
-                losses = trainer.train_on_batch(x, x)
-                total_loss += losses['loss_gen']
-                pbar.set_postfix({'loss': total_loss / (batch_idx + 1)})
-            print(f"[Pretrain] Epoch {epoch + 1}: "
-                  f"Loss = {total_loss / len(self.train_loader):.4f}")
 
+        if (self.cfg.gen_save_path and
+                os.path.exists(self.cfg.gen_save_path)):
+            print(f"[GAN] Loading pre-trained weights from {self.cfg.gen_save_path}")
+            self.aug.gen_network.load_state_dict(
+                torch.load(self.cfg.gen_save_path, map_location=self.dev))
+            for p in self.aug.gen_network.generator.parameters():
+                p.requires_grad = False
+            for p in self.aug.gen_network.discriminator.parameters():
+                p.requires_grad = False
+            return
+
+        trainer = GANPretrainer(
+            self.aug.gen_network, self.dev,
+            lr=self.cfg.gen_lr, save_path=self.cfg.gen_save_path)
+        trainer.run(self.train_loader, self.cfg.gen_pretrain_epochs)
+
+    # ── Phase 2: Recognition training epoch ───────────────────────────────
     def train_epoch(self, epoch):
-        self.recognition_net.train()
-        total_loss = 0
+        self.rec.train()
+        # Keep GAN in eval mode so BN/IN stats don't change
+        if self.cfg.use_generation:
+            self.aug.gen_network.eval()
+
+        total_loss = 0.0
         pbar = tqdm(self.train_loader,
-                    desc=f"[Train] Epoch {epoch + 1}/{self.args.num_epochs}")
+                    desc=f"[Train] Epoch {epoch+1}/{self.cfg.num_epochs}")
 
-        for batch_idx, batch in enumerate(pbar):
-            x = batch['img'].to(self.device)
-            labels = batch['identity'].to(self.device)
+        for batch in pbar:
+            x      = batch['img'].to(self.dev)
+            labels = batch['identity'].to(self.dev)
+            B      = x.size(0)
 
-            # ── Sample fresh z vectors every batch ──────────────────────────
-            z_geo = self.sampler_geo.sample(len(x), self.device)   # (B, 4)
-            z_tex = self.sampler_tex.sample(len(x), self.device)   # (B, style_dim)
-            z_init = torch.cat([z_geo, z_tex], dim=1)              # (B, 4+style_dim)
+            # Sample control vectors
+            z_geo  = self.s_geo.sample(B, self.dev)
+            z_tex  = self.s_tex.sample(B, self.dev)
+            z_init = torch.cat([z_geo, z_tex], dim=1)
 
-            # ── Geometric adversarial optimisation ───────────────────────────
-            if self.args.use_geometric:
-                z_opt_geo = self.adv_optimizer.optimize_control_vector(
-                    x, labels, z_init, augmentation_type='geometric'
-                )
-                self.sampler_geo.update_prev(z_opt_geo[:, :4])
+            # Geometric PGD
+            if self.cfg.use_geometric:
+                z_opt = self.pgd.optimize(
+                    x, labels, z_init, aug_type='geometric')
+                self.s_geo.update(z_opt[:, :4])
             else:
-                z_opt_geo = z_init[:, :4]
+                z_opt = z_init
 
-            # ── Textural adversarial optimisation ────────────────────────────
-            z_full = torch.cat([z_opt_geo, z_init[:, 4:]], dim=1)
-            if self.args.use_textural and self.args.use_generation:
-                z_opt_tex = self.adv_optimizer.optimize_control_vector(
-                    x, labels, z_full, augmentation_type='textural'
-                )
-                self.sampler_tex.update_prev(z_opt_tex[:, 4:])
+            # Textural PGD
+            if self.cfg.use_textural and self.cfg.use_generation:
+                z_opt2 = self.pgd.optimize(
+                    x, labels, z_opt, aug_type='textural')
+                self.s_tex.update(z_opt2[:, 4:])
+                z_final = z_opt2
             else:
-                z_opt_tex = z_full
+                z_final = z_opt
 
-            # ── Apply augmentation & train recognition network ───────────────
-            x_aug = self.augmentation_module(x, z_opt_tex, augmentation_type='both')
-            x_combined = torch.cat([x, x_aug], dim=0)
-            labels_combined = torch.cat([labels, labels], dim=0)
+            # Apply augmentation (no grad needed here)
+            with torch.no_grad():
+                x_aug = self.aug(x, z_final, aug_type='both')
 
-            logits, features = self.recognition_net(x_combined)
-            loss = self.recognition_net.compute_loss(logits, labels_combined)
+            # Train recognition on original + augmented batch
+            x_all  = torch.cat([x, x_aug], dim=0)
+            lb_all = torch.cat([labels, labels], dim=0)
 
-            self.optimizer_rec.zero_grad()
+            _, feats = self.rec(x_all)
+            loss     = self.rec.compute_loss(feats, lb_all)
+
+            self.opt.zero_grad()
             loss.backward()
-            self.optimizer_rec.step()
+            nn.utils.clip_grad_norm_(self.rec.parameters(), self.cfg.grad_clip)
+            self.opt.step()
 
             total_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item()})
-            self.global_step += 1
+            self.step  += 1
+            pbar.set_postfix(loss=f"{loss.item():.4f}",
+                             lr=f"{self.opt.param_groups[0]['lr']:.6f}")
 
-            if self.global_step % 100 == 0:
-                self.writer.add_scalar('train/loss', loss.item(), self.global_step)
+            if self.step % 100 == 0:
+                self.writer.add_scalar('train/loss', loss.item(), self.step)
 
-        self.scheduler.step()
-        avg_loss = total_loss / len(self.train_loader)
-        print(f"[Epoch {epoch + 1}] Train Loss: {avg_loss:.4f}")
-        return avg_loss
+        self.sched.step()
+        avg = total_loss / len(self.train_loader)
+        print(f"[Epoch {epoch+1:3d}] Loss: {avg:.4f}  "
+              f"LR: {self.opt.param_groups[0]['lr']:.6f}")
+        return avg
 
+    # ── Verification-based validation ──────────────────────────────────────
     def validate(self, epoch):
-        self.recognition_net.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for batch in tqdm(self.test_loader, desc=f"[Val] Epoch {epoch + 1}"):
-                x = batch['img'].to(self.device)
-                labels = batch['identity'].to(self.device)
-                logits, _ = self.recognition_net(x)
-                predictions = logits.argmax(dim=1)
-                correct += (predictions == labels).sum().item()
-                total += labels.size(0)
+        ev  = Evaluator(self.rec, self.dev)
+        res = ev.evaluate(self.test_loader, self.cfg.tar_far_values)
+        ev.print_results(res)
 
-        accuracy = correct / total
-        print(f"[Epoch {epoch + 1}] Validation Accuracy: {accuracy:.4f}")
-        self.writer.add_scalar('val/accuracy', accuracy, epoch)
-        return accuracy
+        for k, v in res.items():
+            if isinstance(v, float):
+                self.writer.add_scalar(f'val/{k}', v, epoch)
 
-    def evaluate_final(self):
-        print("\n[Eval] Starting comprehensive evaluation...")
-        evaluator = PalmRecognitionEvaluator(self.recognition_net, self.device)
-        results = evaluator.evaluate(
-            self.test_loader, self.test_samples,
-            tar_far_values=self.args.tar_far_values
-        )
-        evaluator.print_results(results)
-        return results
+        tar_key = 'TAR@FAR=1e-03'
+        tar     = res.get(tar_key, 0.0)
+        if tar > self.best_tar:
+            self.best_tar = tar
+            self.save_checkpoint(epoch, best=True)
+            print(f"  New best {tar_key}: {self.best_tar:.4f}")
 
-    def train(self):
-        print("[Train] Starting UAA training...")
-        self.pretrain_generation_network()
-        best_acc = 0
-
-        for epoch in range(self.args.num_epochs):
-            self.train_epoch(epoch)
-            acc = self.validate(epoch)
-
-            if acc > best_acc:
-                best_acc = acc
-                self.save_checkpoint(epoch, best=True)
-
-            if (epoch + 1) % self.args.save_freq == 0:
-                self.save_checkpoint(epoch, best=False)
-
-        print(f"[Train] Training complete! Best validation accuracy: {best_acc:.4f}")
-        self.writer.close()
-
-        print("\n[Train] Running final evaluation with verification and identification metrics...")
-        final_results = self.evaluate_final()
-
-        return final_results
+        return res
 
     def save_checkpoint(self, epoch, best=False):
         os.makedirs('checkpoints', exist_ok=True)
-        checkpoint = {
-            'epoch': epoch,
-            'recognition_net': self.recognition_net.state_dict(),
-            'augmentation_module': self.augmentation_module.state_dict(),
-            'optimizer': self.optimizer_rec.state_dict(),
+        state = {
+            'epoch'      : epoch,
+            'rec_net'    : self.rec.state_dict(),
+            'aug_module' : self.aug.state_dict(),
+            'optimizer'  : self.opt.state_dict(),
+            'best_tar'   : self.best_tar,
         }
-        if self.args.use_generation:
-            checkpoint['generation_network'] = self.generation_network.state_dict()
+        tag  = '_best' if best else f'_ep{epoch+1}'
+        path = f'checkpoints/uaa{tag}.pt'
+        torch.save(state, path)
+        print(f"[Save] {path}")
 
-        suffix = '_best' if best else ''
-        save_path = f'checkpoints/checkpoint_epoch{epoch + 1}{suffix}.pt'
-        torch.save(checkpoint, save_path)
-        print(f"[Save] Checkpoint saved to {save_path}")
+    def train(self):
+        print(f"\n{'='*80}")
+        print("  PHASE 1 — GAN PRE-TRAINING")
+        print(f"{'='*80}")
+        self.pretrain_gan()
+
+        print(f"\n{'='*80}")
+        print("  PHASE 2 — RECOGNITION TRAINING WITH UAA")
+        print(f"{'='*80}")
+
+        for epoch in range(self.cfg.num_epochs):
+            self.train_epoch(epoch)
+
+            if ((epoch + 1) % self.cfg.eval_freq == 0
+                    or epoch == self.cfg.num_epochs - 1):
+                self.validate(epoch)
+
+            if (epoch + 1) % self.cfg.save_freq == 0:
+                self.save_checkpoint(epoch, best=False)
+
+        print(f"\n[Done] Best TAR@FAR=1e-3: {self.best_tar:.4f}")
+        self.writer.close()
+
+        print("\n[Final] Comprehensive evaluation...")
+        ev  = Evaluator(self.rec, self.dev)
+        res = ev.evaluate(self.test_loader, self.cfg.tar_far_values)
+        ev.print_results(res)
+        return res
 
 
 # ============================================================================
-# SECTION 8: INFERENCE
+# SECTION 10: INFERENCE HELPER
 # ============================================================================
 
-class PalmRecognitionInference:
-    """Inference engine for palmprint recognition"""
-
-    def __init__(self, model_path, num_classes, device='cuda'):
-        self.device = torch.device(device)
-        self.model = PalmRecognitionNetwork(
-            num_classes=num_classes, feature_dim=512, input_size=112
-        ).to(self.device)
-        checkpoint = torch.load(model_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['recognition_net'])
-        self.model.eval()
-
-        self.transform = transforms.Compose([
+class PalmInference:
+    def __init__(self, ckpt_path, num_classes, feature_dim=512, device='cuda'):
+        self.dev = torch.device(device)
+        self.rec = PalmRecognitionNetwork(num_classes, feature_dim).to(self.dev)
+        ck = torch.load(ckpt_path, map_location=self.dev)
+        self.rec.load_state_dict(ck['rec_net'])
+        self.rec.eval()
+        self.tf = transforms.Compose([
             transforms.Resize((112, 112)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+            transforms.Normalize([0.5]*3, [0.5]*3),
         ])
-        print(f"[Inference] Model loaded from {model_path}")
 
-    def extract_feature(self, image_path):
-        img = Image.open(image_path).convert('RGB')
-        img_tensor = self.transform(img).unsqueeze(0).to(self.device)
+    def embed(self, path):
+        img = self.tf(Image.open(path).convert('RGB')).unsqueeze(0).to(self.dev)
         with torch.no_grad():
-            feature = self.model.get_verification_features(img_tensor)
-        return feature[0].cpu().numpy()
+            return self.rec.get_verification_features(img)[0].cpu().numpy()
 
-    def compute_similarity(self, feature1, feature2):
-        similarity = np.dot(feature1, feature2) / (
-            np.linalg.norm(feature1) * np.linalg.norm(feature2) + 1e-6
-        )
-        return (similarity + 1) / 2
-
-    def verify_pair(self, image_path1, image_path2, threshold=0.5):
-        feature1 = self.extract_feature(image_path1)
-        feature2 = self.extract_feature(image_path2)
-        similarity = self.compute_similarity(feature1, feature2)
-        match = similarity >= threshold
-        return match, similarity
+    def verify(self, p1, p2, thr=0.5):
+        f1, f2 = self.embed(p1), self.embed(p2)
+        score  = float(np.dot(f1, f2))   # unit-norm vectors -> cosine sim
+        return score >= thr, score
 
 
 # ============================================================================
-# SECTION 9: MAIN ENTRY POINT
+# MAIN
 # ============================================================================
-
-def main():
-    print("\n" + "=" * 80)
-    print("🚀 STARTING UAA TRAINING")
-    print("=" * 80 + "\n")
-
-    trainer = UAATrainer(args)
-    final_results = trainer.train()
-
-    print("\n" + "=" * 80)
-    print("✅ TRAINING & EVALUATION COMPLETE!")
-    print("=" * 80)
-    print(f"Checkpoints saved to: checkpoints/")
-    print(f"TensorBoard logs saved to: runs/")
-    print(f"Best model: checkpoints/checkpoint_*_best.pt")
-    print("\nFinal Evaluation Summary:")
-    print("-" * 80)
-
-    for key, value in sorted(final_results.items()):
-        if isinstance(value, float):
-            print(f"  {key:<30} {value:.4f}")
-        else:
-            print(f"  {key:<30} {value}")
-
-    print("-" * 80)
-    print("\nTo view training curves:")
-    print("  tensorboard --logdir=runs")
-    print("=" * 80 + "\n")
-
 
 if __name__ == '__main__':
-    main()
+    print("\n" + "="*80)
+    print("  UAA PALMPRINT RECOGNITION — PAPER BEST SETTINGS")
+    print("="*80 + "\n")
+
+    trainer = UAATrainer(args)
+    results = trainer.train()
+
+    print("\n" + "="*80)
+    print("  TRAINING COMPLETE")
+    print("="*80)
+    print("  Checkpoints : checkpoints/")
+    print("  Best model  : checkpoints/uaa_best.pt")
+    print("  TensorBoard : tensorboard --logdir=runs")
+    print("\n  Final Metrics:")
+    for k, v in sorted(results.items()):
+        if isinstance(v, float):
+            print(f"    {k:<32} {v:.4f}")
+        else:
+            print(f"    {k:<32} {v}")
+    print("="*80 + "\n")
