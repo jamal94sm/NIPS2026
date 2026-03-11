@@ -15,8 +15,8 @@ Based on: "Unified Adversarial Augmentation for Improving Palmprint Recognition"
 CONFIG = {
     # ========== Dataset Configuration ==========
     'data_path': '/home/pai-ng/Jamal/CASIA-MS-ROI',  # Path to CASIA-MS dataset
-    'train_domains': ['VW', 'MW'],                    # Training domains: VW, MW, LW
-    'test_domains': ['LW'],                           # Test domains
+    'train_ratio': 0.7,                              # Proportion of identities for training
+    'random_seed': 42,                               # Random seed for reproducibility
     
     # ========== Data Loading ==========
     'batch_size': 32,                                 # Reduce if OOM (try 16, 8)
@@ -50,6 +50,9 @@ CONFIG = {
     # ========== Momentum Sampling ==========
     'momentum_geo': 0.5,                              # Momentum for geometric sampling
     'momentum_tex': 0.25,                             # Momentum for textural sampling
+    
+    # ========== Evaluation ==========
+    'tar_far_values': [1e-5, 1e-4, 1e-3, 1e-2],      # FAR thresholds for TAR@FAR computation
 }
 
 # ============================================================================
@@ -153,9 +156,10 @@ print("="*80 + "\n")
 # SECTION 1: DATA LOADING
 # ============================================================================
 
-def build_shared_label_map(data_path, train_domains):
-    """Build shared identity label mapping across all domains"""
-    all_hand_ids = set()
+def load_all_samples(data_path):
+    """Load all samples from dataset"""
+    samples = []
+    
     for root, _, files in os.walk(data_path):
         files.sort()
         for fname in files:
@@ -164,30 +168,89 @@ def build_shared_label_map(data_path, train_domains):
             parts = fname[:-4].split("_")
             if len(parts) != 4:
                 continue
-            subject_id, hand, spectrum, _ = parts
-            if spectrum in set(train_domains):
-                all_hand_ids.add(f"{subject_id}_{hand}")
+            subject_id, hand, spectrum, iteration = parts
+            img_path = os.path.join(root, fname)
+            hand_id = f"{subject_id}_{hand}"
+            
+            samples.append({
+                'path': img_path,
+                'subject': subject_id,
+                'hand': hand,
+                'spectrum': spectrum,
+                'iteration': iteration,
+                'hand_id': hand_id
+            })
     
-    shared_label_map = {h: i for i, h in enumerate(sorted(all_hand_ids))}
-    num_total_classes = len(shared_label_map)
-    print(f"[Data] Shared identity space: {num_total_classes} identities")
-    return shared_label_map, num_total_classes
+    return samples
 
 
-class CASIAMSDataset(Dataset):
-    """CASIA-MS Palmprint Dataset for UAA Framework"""
+def build_identity_map(samples):
+    """Build identity label mapping from all samples"""
+    all_hand_ids = sorted(set(s['hand_id'] for s in samples))
+    identity_map = {h: i for i, h in enumerate(all_hand_ids)}
+    num_classes = len(identity_map)
+    print(f"[Data] Total identities: {num_classes}")
+    return identity_map, num_classes
+
+
+def split_train_test(samples, identity_map, train_ratio=0.7, seed=42):
+    """
+    Split data into train and test sets.
+    Ensures identities are not mixed between train and test.
+    """
+    np.random.seed(seed)
     
-    def __init__(self, data_path, target_domains, shared_label_map, 
-                 is_train=True, img_size=112):
-        self.samples = []
-        self.hand_id_map = shared_label_map
-        self.domain_map = {d: i for i, d in enumerate(target_domains)}
-        self.is_train = is_train
+    # Group samples by identity
+    identity_samples = {}
+    for sample in samples:
+        hand_id = sample['hand_id']
+        if hand_id not in identity_samples:
+            identity_samples[hand_id] = []
+        identity_samples[hand_id].append(sample)
+    
+    # Split identities into train and test
+    all_identities = list(identity_samples.keys())
+    num_train = int(len(all_identities) * train_ratio)
+    
+    np.random.shuffle(all_identities)
+    train_identities = set(all_identities[:num_train])
+    test_identities = set(all_identities[num_train:])
+    
+    # Assign samples to train or test based on identity
+    train_samples = []
+    test_samples = []
+    
+    for sample in samples:
+        if sample['hand_id'] in train_identities:
+            train_samples.append(sample)
+        else:
+            test_samples.append(sample)
+    
+    print(f"[Data] Train identities: {len(train_identities)}, Train samples: {len(train_samples)}")
+    print(f"[Data] Test identities: {len(test_identities)}, Test samples: {len(test_samples)}")
+    
+    return train_samples, test_samples, train_identities, test_identities
+
+
+class PalmDataset(Dataset):
+    """CASIA-MS Palmprint Dataset"""
+    
+    def __init__(self, samples, identity_map, img_size=112, is_test=False):
+        """
+        Args:
+            samples: List of sample dictionaries
+            identity_map: Dictionary mapping hand_id to identity label
+            img_size: Image resolution
+            is_test: Whether this is test set (for gallery/probe selection)
+        """
+        self.samples = samples
+        self.identity_map = identity_map
         self.img_size = img_size
+        self.is_test = is_test
         
-        self.to_tensor = torch.nn.Sequential(
-            torch.nn.Identity()
-        ) if not hasattr(torch.nn, 'Identity') else None
+        # Add identity labels to samples
+        for sample in self.samples:
+            sample['identity'] = identity_map[sample['hand_id']]
         
         self.transform = transforms.Compose([
             transforms.Resize((img_size, img_size)),
@@ -195,36 +258,6 @@ class CASIAMSDataset(Dataset):
             transforms.Normalize(mean=[0.5, 0.5, 0.5], 
                                 std=[0.5, 0.5, 0.5])
         ])
-        
-        self._load_samples(data_path, target_domains)
-        print(f"[Data] Loaded {len(self.samples)} samples (train={is_train})")
-    
-    def _load_samples(self, data_path, target_domains):
-        """Load all sample paths from dataset"""
-        for root, _, files in os.walk(data_path):
-            files.sort()
-            for fname in files:
-                if not fname.lower().endswith(".jpg"):
-                    continue
-                parts = fname[:-4].split("_")
-                if len(parts) != 4:
-                    continue
-                subject_id, hand, spectrum, iteration = parts
-                if spectrum not in target_domains:
-                    continue
-                hand_id = f"{subject_id}_{hand}"
-                if hand_id not in self.hand_id_map:
-                    continue
-                img_path = os.path.join(root, fname)
-                y_identity = self.hand_id_map[hand_id]
-                self.samples.append({
-                    'path': img_path,
-                    'identity': y_identity,
-                    'subject': subject_id,
-                    'hand': hand,
-                    'spectrum': spectrum,
-                    'hand_id': hand_id
-                })
     
     def __len__(self):
         return len(self.samples)
@@ -233,37 +266,53 @@ class CASIAMSDataset(Dataset):
         sample = self.samples[idx]
         img = Image.open(sample['path']).convert("RGB")
         img_tensor = self.transform(img)
+        
         return {
             'img': img_tensor,
             'identity': sample['identity'],
             'path': sample['path'],
-            'hand_id': sample['hand_id']
+            'hand_id': sample['hand_id'],
+            'spectrum': sample['spectrum'],
+            'subject': sample['subject'],
+            'hand': sample['hand']
         }
 
 
-def create_dataloaders(data_path, train_domains, test_domains, 
-                       batch_size=32, num_workers=4, img_size=112):
-    """Create train and test dataloaders"""
+def create_dataloaders(data_path, batch_size=32, num_workers=4, img_size=112, 
+                       train_ratio=0.7, seed=42):
+    """
+    Create train and test dataloaders.
+    
+    Args:
+        data_path: Path to dataset
+        batch_size: Batch size
+        num_workers: Number of data loading workers
+        img_size: Image resolution
+        train_ratio: Proportion of identities for training
+        seed: Random seed for reproducibility
+    
+    Returns:
+        train_loader, test_loader, num_classes, test_samples
+    """
     from torchvision import transforms
     
-    shared_label_map, num_classes = build_shared_label_map(data_path, train_domains)
+    # Load all samples
+    all_samples = load_all_samples(data_path)
+    print(f"[Data] Total samples loaded: {len(all_samples)}")
     
-    train_dataset = CASIAMSDataset(
-        data_path=data_path,
-        target_domains=train_domains,
-        shared_label_map=shared_label_map,
-        is_train=True,
-        img_size=img_size
+    # Build identity map
+    identity_map, num_classes = build_identity_map(all_samples)
+    
+    # Split train/test
+    train_samples, test_samples, train_ids, test_ids = split_train_test(
+        all_samples, identity_map, train_ratio, seed
     )
     
-    test_dataset = CASIAMSDataset(
-        data_path=data_path,
-        target_domains=test_domains,
-        shared_label_map=shared_label_map,
-        is_train=False,
-        img_size=img_size
-    )
+    # Create datasets
+    train_dataset = PalmDataset(train_samples, identity_map, img_size, is_test=False)
+    test_dataset = PalmDataset(test_samples, identity_map, img_size, is_test=True)
     
+    # Create dataloaders
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=True, drop_last=True
@@ -274,7 +323,7 @@ def create_dataloaders(data_path, train_domains, test_domains,
         num_workers=num_workers, pin_memory=True, drop_last=False
     )
     
-    return train_loader, test_loader, num_classes
+    return train_loader, test_loader, num_classes, test_samples
 
 
 # Fix missing transforms import
@@ -703,7 +752,12 @@ class AugmentationRateController(nn.Module):
 # ============================================================================
 
 class PalmRecognitionEvaluator:
-    """Comprehensive evaluator for palmprint recognition"""
+    """Comprehensive evaluator for palmprint recognition
+    
+    Implements evaluation as described in the paper:
+    - Verification: TAR@FAR with genuine/imposter matching scores
+    - Identification: 1:N matching with gallery (first image per spectrum) and probes
+    """
     
     def __init__(self, recognition_network, device):
         self.recognition_network = recognition_network
@@ -711,127 +765,259 @@ class PalmRecognitionEvaluator:
         self.recognition_network.eval()
     
     def extract_features(self, dataloader):
+        """Extract feature vectors for all test samples"""
         features_list = []
         identities_list = []
         paths_list = []
+        spectrums_list = []
+        hand_ids_list = []
         
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Extracting features"):
                 x = batch['img'].to(self.device)
                 identities = batch['identity'].cpu().numpy()
                 paths = batch['path']
+                spectrums = batch['spectrum']
+                hand_ids = batch['hand_id']
+                
                 features = self.recognition_network.get_verification_features(x)
+                
                 features_list.append(features.cpu().numpy())
                 identities_list.extend(identities)
                 paths_list.extend(paths)
+                spectrums_list.extend(spectrums)
+                hand_ids_list.extend(hand_ids)
         
         features = np.concatenate(features_list, axis=0)
         identities = np.array(identities_list)
-        return features, identities, paths_list
+        
+        return features, identities, paths_list, spectrums_list, hand_ids_list
     
-    def compute_verification_metrics(self, features, identities, tar_far_values=[1e-5, 1e-4, 1e-3, 1e-2]):
-        similarities = features @ features.T
+    def compute_verification_metrics(self, features, identities, 
+                                    tar_far_values=[1e-5, 1e-4, 1e-3, 1e-2]):
+        """
+        Compute verification metrics (TAR@FAR).
+        
+        Calculate matching scores for all pairs of genuine and imposter samples.
+        Maintain FAR at fixed values and compute corresponding TAR.
+        """
+        print("[Eval] Computing verification metrics...")
+        
+        # Normalize features for cosine similarity
+        features_norm = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-8)
+        
+        # Compute pairwise similarities
+        similarities = features_norm @ features_norm.T
+        
+        # Collect genuine and imposter scores
         genuine_scores = []
         imposter_scores = []
         
         for i in range(len(features)):
             for j in range(i+1, len(features)):
                 score = similarities[i, j]
+                
                 if identities[i] == identities[j]:
+                    # Genuine pair (same identity)
                     genuine_scores.append(score)
                 else:
+                    # Imposter pair (different identities)
                     imposter_scores.append(score)
         
         genuine_scores = np.array(genuine_scores)
         imposter_scores = np.array(imposter_scores)
+        
+        print(f"  Genuine pairs: {len(genuine_scores)}")
+        print(f"  Imposter pairs: {len(imposter_scores)}")
+        
         results = {}
         
+        # Compute TAR@FAR for different FAR thresholds
         for far_threshold in tar_far_values:
             num_imposter = len(imposter_scores)
             num_false_accepts = int(num_imposter * far_threshold)
-            sorted_imposters = np.sort(imposter_scores)
+            
+            # Find decision threshold that gives this FAR
+            sorted_imposters = np.sort(imposter_scores)[::-1]  # Sort descending
             
             if num_false_accepts < num_imposter:
-                decision_threshold = sorted_imposters[-(num_false_accepts + 1)]
+                decision_threshold = sorted_imposters[num_false_accepts]
             else:
-                decision_threshold = -1.0
+                decision_threshold = -1.0  # Accept all
             
+            # Count genuine accepts at this threshold
             num_genuine = len(genuine_scores)
             num_genuine_accepts = np.sum(genuine_scores >= decision_threshold)
-            tar = num_genuine_accepts / num_genuine if num_genuine > 0 else 0
+            tar = num_genuine_accepts / num_genuine if num_genuine > 0 else 0.0
+            
             results[f'TAR@FAR={far_threshold:.0e}'] = tar
         
+        # Compute EER (Equal Error Rate)
         all_scores = np.concatenate([genuine_scores, imposter_scores])
-        all_labels = np.concatenate([np.ones_like(genuine_scores), np.zeros_like(imposter_scores)])
+        all_labels = np.concatenate([np.ones_like(genuine_scores), 
+                                    np.zeros_like(imposter_scores)])
+        
         fpr, tpr, thresholds = roc_curve(all_labels, all_scores)
         eer = np.min(np.abs(fpr + (1 - tpr)))
         results['EER'] = eer
         
         return results, genuine_scores, imposter_scores
     
-    def compute_identification_metrics(self, features, identities):
+    def compute_identification_metrics(self, features, identities, spectrums, hand_ids):
+        """
+        Compute identification metrics (Rank-1, Rank-5, Rank-10).
+        
+        Uses 1:N matching strategy:
+        - Gallery: First image of each identity with one image per spectrum
+        - Probes: Remaining images
+        """
+        print("[Eval] Computing identification metrics...")
+        
+        # Normalize features
+        features_norm = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-8)
+        
+        # Group samples by identity
         unique_ids = np.unique(identities)
+        
         gallery_features = []
         gallery_identities = []
+        gallery_spectrums = []
+        
         probe_features = []
         probe_identities = []
         
+        # For each identity, select gallery and probe samples
         for uid in unique_ids:
             indices = np.where(identities == uid)[0]
-            if len(indices) > 1:
-                gallery_features.append(features[indices[0]])
+            
+            if len(indices) < 2:
+                # Skip identities with only 1 sample
+                continue
+            
+            # Group by spectrum
+            spectrum_indices = {}
+            for idx in indices:
+                spec = spectrums[idx]
+                if spec not in spectrum_indices:
+                    spectrum_indices[spec] = []
+                spectrum_indices[spec].append(idx)
+            
+            # Select first image of each spectrum for gallery
+            gallery_selected = set()
+            for spec, spec_idxs in spectrum_indices.items():
+                gallery_idx = spec_idxs[0]
+                gallery_selected.add(gallery_idx)
+                gallery_features.append(features_norm[gallery_idx])
                 gallery_identities.append(uid)
-                probe_features.append(features[indices[1:]])
-                probe_identities.extend([uid] * (len(indices) - 1))
+                gallery_spectrums.append(spec)
+            
+            # Rest are probes
+            for idx in indices:
+                if idx not in gallery_selected:
+                    probe_features.append(features_norm[idx])
+                    probe_identities.append(uid)
+        
+        if len(gallery_features) == 0 or len(probe_features) == 0:
+            print("[Eval] Warning: No valid gallery or probe samples")
+            return {f'Rank-{k}': 0.0 for k in [1, 5, 10]}
         
         gallery_features = np.array(gallery_features)
-        probe_features = np.vstack(probe_features)
+        gallery_identities = np.array(gallery_identities)
+        probe_features = np.array(probe_features)
         probe_identities = np.array(probe_identities)
-        similarities = probe_features @ gallery_features.T
-        ranked_ids = np.argsort(-similarities, axis=1)
-        ranked_gallery_ids = np.array(gallery_identities)[ranked_ids]
         
+        print(f"  Gallery size: {len(gallery_features)} (one per spectrum per identity)")
+        print(f"  Probe size: {len(probe_features)}")
+        
+        # Compute similarities between probes and gallery
+        similarities = probe_features @ gallery_features.T  # (num_probes, num_gallery)
+        
+        # Get ranked predictions
+        ranked_indices = np.argsort(-similarities, axis=1)  # Sort descending
+        ranked_gallery_ids = gallery_identities[ranked_indices]
+        
+        # Compute rank-k accuracy
         results = {}
         for k in [1, 5, 10]:
+            if k > len(gallery_identities):
+                results[f'Rank-{k}'] = 0.0
+                continue
+            
+            # Check if true identity is in top-k
             matches = ranked_gallery_ids[:, :k] == probe_identities.reshape(-1, 1)
             rank_k_acc = np.any(matches, axis=1).mean()
             results[f'Rank-{k}'] = rank_k_acc
         
         return results
     
-    def evaluate(self, test_loader, tar_far_values=[1e-5, 1e-4, 1e-3, 1e-2]):
-        print("[Eval] Extracting features...")
-        features, identities, paths = self.extract_features(test_loader)
-        print("[Eval] Computing verification metrics...")
-        ver_results, _, _ = self.compute_verification_metrics(features, identities, tar_far_values)
-        print("[Eval] Computing identification metrics...")
-        id_results = self.compute_identification_metrics(features, identities)
+    def evaluate(self, test_loader, test_samples=None, 
+                tar_far_values=[1e-5, 1e-4, 1e-3, 1e-2]):
+        """
+        Full evaluation pipeline.
         
+        Args:
+            test_loader: DataLoader for test set
+            test_samples: List of test sample metadata
+            tar_far_values: FAR thresholds for TAR computation
+        
+        Returns:
+            Dictionary with all evaluation metrics
+        """
+        print("\n" + "="*80)
+        print("EVALUATION PHASE")
+        print("="*80 + "\n")
+        
+        # Extract features
+        features, identities, paths, spectrums, hand_ids = self.extract_features(test_loader)
+        
+        # Compute verification metrics
+        ver_results, genuine_scores, imposter_scores = self.compute_verification_metrics(
+            features, identities, tar_far_values
+        )
+        
+        # Compute identification metrics
+        id_results = self.compute_identification_metrics(
+            features, identities, spectrums, hand_ids
+        )
+        
+        # Combine results
         all_results = {
-            **ver_results, **id_results,
+            **ver_results,
+            **id_results,
             'num_samples': len(features),
             'num_identities': len(np.unique(identities)),
+            'num_genuine_pairs': len(genuine_scores),
+            'num_imposter_pairs': len(imposter_scores),
         }
+        
         return all_results
     
     def print_results(self, results):
-        print("\n" + "="*60)
+        """Pretty print evaluation results"""
+        print("\n" + "="*80)
         print("PALMPRINT RECOGNITION EVALUATION RESULTS")
-        print("="*60)
+        print("="*80)
+        
         print(f"\nDataset Statistics:")
         print(f"  Total samples: {results.get('num_samples', 'N/A')}")
         print(f"  Total identities: {results.get('num_identities', 'N/A')}")
+        print(f"  Genuine pairs: {results.get('num_genuine_pairs', 'N/A')}")
+        print(f"  Imposter pairs: {results.get('num_imposter_pairs', 'N/A')}")
+        
         print(f"\nVerification Metrics (TAR@FAR):")
         for key in sorted(results.keys()):
             if 'TAR@FAR' in key:
                 print(f"  {key}: {results[key]:.4f}")
+        
         if 'EER' in results:
             print(f"  EER: {results['EER']:.4f}")
-        print(f"\nIdentification Metrics:")
+        
+        print(f"\nIdentification Metrics (1:N Matching):")
         for key in sorted(results.keys()):
             if 'Rank-' in key:
-                print(f"  {key} accuracy: {results[key]:.4f}")
-        print("\n" + "="*60 + "\n")
+                print(f"  {key} Accuracy: {results[key]:.4f}")
+        
+        print("\n" + "="*80 + "\n")
 
 
 # ============================================================================
@@ -897,13 +1083,13 @@ class UAATrainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[Init] Using device: {self.device}")
         
-        self.train_loader, self.test_loader, self.num_classes = create_dataloaders(
+        self.train_loader, self.test_loader, self.num_classes, self.test_samples = create_dataloaders(
             data_path=args.data_path,
-            train_domains=args.train_domains,
-            test_domains=args.test_domains,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            img_size=args.img_size
+            img_size=args.img_size,
+            train_ratio=args.train_ratio,
+            seed=args.random_seed
         )
         
         self._create_networks()
@@ -1011,6 +1197,7 @@ class UAATrainer:
         return avg_loss
     
     def validate(self, epoch):
+        """Validate on test set using basic accuracy metric"""
         self.recognition_net.eval()
         with torch.no_grad():
             correct = 0
@@ -1028,6 +1215,15 @@ class UAATrainer:
         self.writer.add_scalar('val/accuracy', accuracy, epoch)
         return accuracy
     
+    def evaluate_final(self):
+        """Comprehensive evaluation using verification and identification metrics"""
+        print("\n[Eval] Starting comprehensive evaluation...")
+        evaluator = PalmRecognitionEvaluator(self.recognition_net, self.device)
+        results = evaluator.evaluate(self.test_loader, self.test_samples, 
+                                    tar_far_values=self.args.tar_far_values)
+        evaluator.print_results(results)
+        return results
+    
     def train(self):
         print("[Train] Starting UAA training...")
         self.pretrain_generation_network()
@@ -1044,8 +1240,14 @@ class UAATrainer:
             if (epoch + 1) % self.args.save_freq == 0:
                 self.save_checkpoint(epoch, best=False)
         
-        print(f"[Train] Training complete! Best accuracy: {best_acc:.4f}")
+        print(f"[Train] Training complete! Best validation accuracy: {best_acc:.4f}")
         self.writer.close()
+        
+        # Run final comprehensive evaluation
+        print("\n[Train] Running final evaluation with verification and identification metrics...")
+        final_results = self.evaluate_final()
+        
+        return final_results
     
     def save_checkpoint(self, epoch, best=False):
         os.makedirs('checkpoints', exist_ok=True)
@@ -1118,14 +1320,26 @@ def main():
     print("="*80 + "\n")
     
     trainer = UAATrainer(args)
-    trainer.train()
+    final_results = trainer.train()
     
     print("\n" + "="*80)
-    print("✅ TRAINING COMPLETE!")
+    print("✅ TRAINING & EVALUATION COMPLETE!")
     print("="*80)
     print(f"Checkpoints saved to: checkpoints/")
     print(f"TensorBoard logs saved to: runs/")
-    print("\nTo view results:")
+    print(f"Best model: checkpoints/checkpoint_*_best.pt")
+    print("\nFinal Evaluation Summary:")
+    print("-" * 80)
+    
+    # Print key metrics
+    for key, value in sorted(final_results.items()):
+        if isinstance(value, float):
+            print(f"  {key:<30} {value:.4f}")
+        else:
+            print(f"  {key:<30} {value}")
+    
+    print("-" * 80)
+    print("\nTo view training curves:")
     print("  tensorboard --logdir=runs")
     print("="*80 + "\n")
 
