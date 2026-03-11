@@ -673,23 +673,24 @@ class AdversarialAugmentationOptimizer(nn.Module):
     
     def optimize_control_vector(self, x, labels, z_init, augmentation_type='both'):
         z = z_init.clone().detach()
-        z.requires_grad = True
         
         for step in range(self.pgd_steps):
-            if z.grad is not None:
-                z.grad.zero_()
+            # Create new tensor with requires_grad for this iteration
+            z = z.detach().requires_grad_(True)
             
+            # Forward pass
             x_augmented = self.augmentation_module(x, z, augmentation_type=augmentation_type)
             logits, features = self.recognition_network(x_augmented)
             loss = self.recognition_network.compute_loss(logits, labels)
+            
+            # Backward pass
             loss.backward()
             
+            # PGD update
             with torch.no_grad():
                 grad_sign = torch.sign(z.grad)
-                z.data = z.data + self.pgd_step_size * grad_sign
-                z.data = self._project_onto_bounds(z.data)
-            
-            z.requires_grad = True
+                z = z.data + self.pgd_step_size * grad_sign
+                z = self._project_onto_bounds(z)
         
         return z.detach()
     
