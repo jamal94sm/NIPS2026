@@ -8,6 +8,119 @@ Author: Claude (Implementation)
 Based on: "Unified Adversarial Augmentation for Improving Palmprint Recognition"
 """
 
+# ============================================================================
+# ⚙️ CONFIGURATION - SET ALL PARAMETERS HERE AT THE TOP
+# ============================================================================
+
+CONFIG = {
+    # ========== Dataset Configuration ==========
+    'data_path': '/home/pai-ng/Jamal/CASIA-MS-ROI',  # Path to CASIA-MS dataset
+    'train_domains': ['VW', 'MW'],                    # Training domains: VW, MW, LW
+    'test_domains': ['LW'],                           # Test domains
+    
+    # ========== Data Loading ==========
+    'batch_size': 32,                                 # Reduce if OOM (try 16, 8)
+    'num_workers': 4,                                 # Number of data loading workers
+    'img_size': 112,                                  # Input image resolution
+    
+    # ========== Model Architecture ==========
+    'feature_dim': 512,                               # Recognition feature dimension
+    'style_dim': 16,                                  # Style code dimension (8, 16, 32)
+    
+    # ========== Training ==========
+    'num_epochs': 30,                                 # Number of training epochs
+    'lr': 0.1,                                        # Learning rate
+    'save_freq': 5,                                   # Save checkpoint every N epochs
+    
+    # ========== Augmentation Module ==========
+    'use_geometric': True,                            # Enable spatial/geometric augmentation
+    'use_generation': False,                          # Enable GAN-based generation
+    'use_textural': False,                            # Enable textural augmentation (requires use_generation=True)
+    'geometric_rate': 0.5,                            # Proportion of samples to augment geometrically
+    'textural_rate': 0.5,                             # Proportion of samples to augment texturally
+    
+    # ========== Generation Network (if use_generation=True) ==========
+    'gen_pretrain_epochs': 10,                        # GAN pretraining epochs
+    'gen_lr': 1e-3,                                   # Generator learning rate
+    
+    # ========== Adversarial Augmentation ==========
+    'pgd_steps': 1,                                   # Number of PGD optimization steps (1-3, more = harder samples, slower)
+    'pgd_step_size': 0.01,                            # Step size for PGD updates
+    
+    # ========== Momentum Sampling ==========
+    'momentum_geo': 0.5,                              # Momentum for geometric sampling
+    'momentum_tex': 0.25,                             # Momentum for textural sampling
+}
+
+# ============================================================================
+# 📋 CONFIGURATION PRESETS (Uncomment one below to override CONFIG above)
+# ============================================================================
+
+"""
+# PRESET 1: Quick Test (Validate everything works, ~2-5 min on GPU)
+CONFIG.update({
+    'batch_size': 8,
+    'num_epochs': 1,
+    'use_geometric': True,
+    'use_generation': False,
+})
+
+# PRESET 2: Geometric Only - FAST (Spatial augmentation only, ~30 min on GPU)
+CONFIG.update({
+    'batch_size': 32,
+    'num_epochs': 30,
+    'use_geometric': True,
+    'use_generation': False,
+})
+
+# PRESET 3: Full UAA - COMPREHENSIVE (Geometric + Textural, ~2-3 hours on GPU)
+CONFIG.update({
+    'batch_size': 32,
+    'num_epochs': 30,
+    'use_generation': True,
+    'use_geometric': True,
+    'use_textural': True,
+    'gen_pretrain_epochs': 10,
+})
+
+# PRESET 4: Advanced - BEST RESULTS (More iterations, ~5-6 hours on GPU)
+CONFIG.update({
+    'batch_size': 32,
+    'num_epochs': 50,
+    'use_generation': True,
+    'use_geometric': True,
+    'use_textural': True,
+    'gen_pretrain_epochs': 30,
+    'pgd_steps': 2,
+    'pgd_step_size': 0.05,
+    'style_dim': 32,
+    'geometric_rate': 0.7,
+    'textural_rate': 0.7,
+})
+
+# PRESET 5: Low Memory (For machines with limited GPU memory)
+CONFIG.update({
+    'batch_size': 8,
+    'num_epochs': 30,
+    'use_geometric': True,
+    'use_generation': False,
+    'num_workers': 2,
+})
+
+# PRESET 6: CPU Only (Much slower, but works without GPU)
+CONFIG.update({
+    'batch_size': 4,
+    'num_epochs': 5,
+    'use_geometric': True,
+    'use_generation': False,
+    'num_workers': 0,  # CPU doesn't benefit from multiple workers
+})
+"""
+
+# ============================================================================
+# Import Required Libraries
+# ============================================================================
+
 import os
 import torch
 import torch.nn as nn
@@ -24,6 +137,17 @@ from datetime import datetime
 import math
 from scipy import spatial
 from sklearn.metrics import roc_curve
+
+# ============================================================================
+# Convert CONFIG to args object for code compatibility
+# ============================================================================
+args = argparse.Namespace(**CONFIG)
+print("="*80)
+print("⚙️  CONFIGURATION LOADED:")
+print("="*80)
+for key, value in CONFIG.items():
+    print(f"  {key:<30} = {value}")
+print("="*80 + "\n")
 
 # ============================================================================
 # SECTION 1: DATA LOADING
@@ -985,48 +1109,25 @@ class PalmRecognitionInference:
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='UAA Training Script')
-    
-    # Dataset
-    parser.add_argument('--data_path', type=str, default='/home/pai-ng/Jamal/CASIA-MS-ROI')
-    parser.add_argument('--train_domains', nargs='+', default=['VW', 'MW'])
-    parser.add_argument('--test_domains', nargs='+', default=['LW'])
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--img_size', type=int, default=112)
-    
-    # Model
-    parser.add_argument('--feature_dim', type=int, default=512)
-    parser.add_argument('--style_dim', type=int, default=16)
-    
-    # Training
-    parser.add_argument('--num_epochs', type=int, default=30)
-    parser.add_argument('--lr', type=float, default=0.1)
-    parser.add_argument('--save_freq', type=int, default=5)
-    
-    # Generation network
-    parser.add_argument('--use_generation', action='store_true', default=False)
-    parser.add_argument('--gen_pretrain_epochs', type=int, default=10)
-    parser.add_argument('--gen_lr', type=float, default=1e-3)
-    
-    # Augmentation
-    parser.add_argument('--use_geometric', action='store_true', default=True)
-    parser.add_argument('--use_textural', action='store_true', default=False)
-    parser.add_argument('--geometric_rate', type=float, default=0.5)
-    parser.add_argument('--textural_rate', type=float, default=0.5)
-    
-    # PGD optimization
-    parser.add_argument('--pgd_steps', type=int, default=1)
-    parser.add_argument('--pgd_step_size', type=float, default=0.01)
-    
-    # Momentum
-    parser.add_argument('--momentum_geo', type=float, default=0.5)
-    parser.add_argument('--momentum_tex', type=float, default=0.25)
-    
-    args = parser.parse_args()
+    """
+    Main entry point - uses CONFIG from the top of the file
+    No need to pass command-line arguments
+    """
+    print("\n" + "="*80)
+    print("🚀 STARTING UAA TRAINING")
+    print("="*80 + "\n")
     
     trainer = UAATrainer(args)
     trainer.train()
+    
+    print("\n" + "="*80)
+    print("✅ TRAINING COMPLETE!")
+    print("="*80)
+    print(f"Checkpoints saved to: checkpoints/")
+    print(f"TensorBoard logs saved to: runs/")
+    print("\nTo view results:")
+    print("  tensorboard --logdir=runs")
+    print("="*80 + "\n")
 
 
 if __name__ == '__main__':
