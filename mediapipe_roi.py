@@ -28,8 +28,8 @@ from tqdm import tqdm
 # ============================================================
 # PATHS  — edit these two lines
 # ============================================================
-SRC_ROOT = "/mnt/data/FingerprintDatasets/Combined/combineddataset/MPDv2"
-DST_ROOT = "/mnt/data/FingerprintDatasets/Combined/combineddataset/MPDv2-ROI"
+SRC_ROOT = "/home/pai-ng/Jamal/MPDv2"
+DST_ROOT = "/home/pai-ng/Jamal/MPDv2-ROI"
 ROI_SIZE = 160          # output square size in pixels
 
 
