@@ -1,35 +1,6 @@
 """
 UNIFIED ADVERSARIAL AUGMENTATION (UAA) FOR PALMPRINT RECOGNITION
 Complete All-in-One Implementation — ICCV 2025
-
-Alignment fixes applied vs. original version:
-  [1]  CONFIG: train_ratio 0.7→0.5 (paper 1:1 open-set split)
-  [2]  CONFIG: geometric_rate/textural_rate 0.7→0.5 (paper γ=0.5)
-  [3]  CONFIG: separate geo_pgd_steps=1, tex_pgd_steps=2 (paper §4.3)
-  [4]  CONFIG: pgd_step_size removed — α now sampled from N(0.1,0.001) per call
-  [5]  CONFIG: gen_pretrain_epochs 30→60, gen_lr 1e-4→1e-3 (paper §4.3)
-  [7]  CONFIG: tar_far_values now includes 1e-6 (paper Table 2)
-  [8]  PalmGenerator: id_feat injected via channel concatenation (paper §3.4, Fig 3)
-  [9]  PalmGenerator: L2 normalisation of style code before MLP (paper §3.4)
-  [10] PalmGenerator: 2-layer MLP for style code before AdaIN (paper §3.4)
-  [11] PalmGenerator: Dropout regularisation added (paper §3.4)
-  [12] GANPretrainer: x_style ≠ x_id — shuffled pairs within batch (paper Fig 3)
-  [13] GANPretrainer: λ_1=1.0 not 10.0 (paper Eq.7)
-  [14] GANPretrainer: linear LR decay schedule (paper §4.3)
-  [15] AdversarialAugOptimizer: α sampled from N(0.1,0.001) per call (paper §4.3)
-  [16] AdversarialAugOptimizer: separate geo/tex step counts
-  [17] AdversarialAugOptimizer: Fθ explicitly frozen during PGD (paper Fig 2c F*θ)
-  [18] freeze_gan_weights: now also freezes style_encoder (paper intent)
-  [19] train_epoch: augmentation rate γ applied — only γ*B samples augmented
-  [20] train_epoch: augmented loss term weighted to match paper Eq.4 balance
-  [21] UnifiedAugmentationModule: textural aug uses pure generated image (no blend)
-
-Scale adaptation (paper used 4×V100, batch=256, 8 datasets; we use 1 GPU, batch=32):
-  - lr: paper 0.1 → 0.01 (linear batch-size scaling: 0.1×32/256≈0.0125, rounded)
-  - warmup_epochs: paper 0 → 5  (needed at small scale to protect pretrained weights)
-  - num_epochs: paper 30 → 50   (more epochs compensate for lower LR)
-  - train_ratio: 0.5 → 0.7      (more train identities = better ArcFace margin learning)
-  All algorithm-level fixes [2-21] are preserved exactly as per the paper.
 """
 
 # ============================================================================
