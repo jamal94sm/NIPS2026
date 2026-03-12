@@ -24,30 +24,17 @@ CONFIG = {
     'style_dim'          : 16,
 
     # ── Recognition training ──────────────────────────────────────────────
-    'num_epochs'         : 100,          # 50→100: LR decays slower, more time to converge
+    'num_epochs'         : 50,
     'lr'                 : 0.01,
     'warmup_epochs'      : 5,
     'weight_decay'       : 5e-4,
     'grad_clip'          : 5.0,
-    'save_freq'          : 10,
+    'save_freq'          : 5,
 
     # ── UAA augmentation ──────────────────────────────────────────────────
     'use_geometric'      : True,
     'use_generation'     : True,
     'use_textural'       : True,
-    'geometric_rate'     : 0.5,
-    'textural_rate'      : 0.5,
-
-    # ── UAA curriculum — staged introduction of augmentation ──────────────
-    # Rationale: let the model first learn basic recognition, then introduce
-    # progressively harder augmentation. Prevents a poorly-trained GAN from
-    # injecting harmful noise before the backbone has stable features.
-    #
-    #  epochs  0 – aug_start_epoch  : no augmentation (clean training only)
-    #  epochs  aug_start_epoch – tex_start_epoch : geometric UAA only
-    #  epochs  tex_start_epoch – end              : geometric + textural UAA
-    'aug_start_epoch'    : 10,           # start geometric UAA at epoch 10
-    'tex_start_epoch'    : 25,           # add textural UAA at epoch 25
 
     # ── GAN pre-training ──────────────────────────────────────────────────
     'gen_pretrain_epochs': 60,
@@ -55,9 +42,11 @@ CONFIG = {
     'gen_save_path'      : 'checkpoints/generation_network_pretrained.pt',
     'gan_finetune_epochs': 10,
 
-    # ── PGD ───────────────────────────────────────────────────────────────
-    'geo_pgd_steps'      : 1,
-    'tex_pgd_steps'      : 2,
+    # ── PGD — kept identical to working version ───────────────────────────
+    # pgd_steps=2 for both geo and tex (sequential on same z, whole batch)
+    # step_size=0.05 (small, stable) — NOT N(0.1,0.001) which was too large
+    'pgd_steps'          : 2,
+    'pgd_step_size'      : 0.05,
 
     # ── Momentum sampling ─────────────────────────────────────────────────
     'momentum_geo'       : 0.5,
@@ -494,10 +483,6 @@ class UnifiedAugmentationModule(nn.Module):
             self.gen_network = PalmGenerationNetwork(style_dim, img_size)
 
     def forward(self, x, ctrl, aug_type='both'):
-        """
-        x    : (B, 3, H, W)
-        ctrl : (B, 4 + style_dim)  — z := [t, s]
-        """
         spatial_p = ctrl[:, :4]
 
         if aug_type in ('geometric', 'both'):
@@ -506,28 +491,25 @@ class UnifiedAugmentationModule(nn.Module):
 
         if aug_type in ('textural', 'both') and self.use_generation:
             z_style = ctrl[:, 4:]
-            # [FIX 21] Use generated image directly — no blending
-            x = self.gen_network.generate_from_z(z_style, x)
+            x_gen   = self.gen_network.generate_from_z(z_style, x)
+            # Blend 50/50: preserves original structure, smoother transition
+            # Pure replacement was too aggressive and destabilised training
+            x = 0.5 * x_gen + 0.5 * x
 
         return x
 
     def freeze_gan_weights(self):
         """
-        After GAN pre-training freeze G, D, AND Es.                [FIX 18]
-        This is the paper's intent: all generation components frozen
-        during recognition training. Now possible because id_feat is
-        properly injected (gradient path z→StyleMLP→fc→image exists
-        even with G frozen, since z flows through G's linear ops).
+        Freeze generator and discriminator only.
+        Style encoder stays TRAINABLE so PGD gradients flow:
+        z → style_encoder → generator → image → loss → ∇z
         """
         for p in self.gen_network.generator.parameters():
             p.requires_grad = False
         for p in self.gen_network.discriminator.parameters():
             p.requires_grad = False
-        for p in self.gen_network.style_encoder.parameters():
-            p.requires_grad = False                                # [FIX 18]
-        print("[Aug] Generator, Discriminator & StyleEncoder all frozen.")
-        print("[Aug] Gradient path for textural PGD: z → StyleMLP(frozen) → G(frozen) → image")
-        print("[Aug] z.grad is non-None because z flows through linear ops in frozen G.")
+        # Style encoder: keep requires_grad=True for PGD gradient flow
+        print("[Aug] Generator & Discriminator frozen. Style encoder stays trainable.")
 
 
 # ============================================================================
@@ -537,62 +519,48 @@ class UnifiedAugmentationModule(nn.Module):
 class AdversarialAugOptimizer:
     """
     PGD optimiser for control vector z (Eq. 3).
-
-    Key paper details now matched:
-      - α sampled from N(0.1, 0.001) each call             [FIX 15]
-      - Separate step counts for geo (K=1) and tex (K=2)   [FIX 16]
-      - Fθ explicitly frozen during z update (F*θ, Fig 2c) [FIX 17]
+    Uses fixed step_size=0.05 matching the working version — small and stable.
+    Fθ explicitly frozen during z update (F*θ, Fig 2c).
     """
 
-    def __init__(self, aug_module, rec_net):
-        self.aug = aug_module
-        self.rec = rec_net
-        self.b_sp = 0.3   # projection bound for spatial params
-        self.b_st = 1.0   # projection bound for style params
+    def __init__(self, aug_module, rec_net, pgd_steps=2, step_size=0.05):
+        self.aug   = aug_module
+        self.rec   = rec_net
+        self.steps = pgd_steps
+        self.alpha = step_size
+        self.b_sp  = 0.3
+        self.b_st  = 1.0
 
-    def optimize(self, x, labels, z_init, aug_type, pgd_steps):
-        """
-        Eq. 2: z* = argmax_z L(Fθ(A(x,z)), y)
-        Solved via Eq. 3 PGD with K=pgd_steps iterations.
-        """
+    def optimize(self, x, labels, z_init, aug_type='both'):
         x_det = x.detach()
 
-        # [FIX 17] Explicitly freeze Fθ — matches F*θ notation in Figure 2c
+        # Freeze Fθ during z optimisation (F*θ in paper Figure 2c)
         for p in self.rec.parameters():
             p.requires_grad_(False)
 
         z = z_init.clone().detach().requires_grad_(True)
 
-        for _ in range(pgd_steps):
+        for _ in range(self.steps):
             if z.grad is not None:
                 z.grad.zero_()
 
-            x_aug  = self.aug(x_det, z, aug_type=aug_type)
+            x_aug   = self.aug(x_det, z, aug_type=aug_type)
             _, feat = self.rec(x_aug)
-            loss   = self.rec.compute_loss(feat, labels)
+            loss    = self.rec.compute_loss(feat, labels)
             loss.backward()
 
-            # [FIX 15] α ~ N(0.1, 0.001) — sampled fresh each PGD call
-            alpha = 0.1 + math.sqrt(0.001) * torch.randn(1).item()
-            alpha = max(alpha, 1e-4)   # numerical safety floor
-
-            if z.grad is None:
-                # Fallback (should not occur with properly injected id_feat)
-                grad_sign = torch.sign(torch.randn_like(z))
-            else:
-                grad_sign = torch.sign(z.grad)   # sgn(∇_z L)
+            grad_sign = (torch.sign(z.grad) if z.grad is not None
+                         else torch.sign(torch.randn_like(z)))
 
             with torch.no_grad():
-                # Eq. 3: z^{k+1} ← Π_{z+S}(z^k + α·sgn(∇_z L))
-                z_new = z.data + alpha * grad_sign
-                # Projection Π onto allowed set S
+                z_new = z.data + self.alpha * grad_sign
                 sp    = torch.clamp(z_new[:, :4], -self.b_sp, self.b_sp)
                 st    = torch.clamp(z_new[:, 4:], -self.b_st, self.b_st)
                 z_new = torch.cat([sp, st], dim=1)
 
             z = z_new.detach().requires_grad_(True)
 
-        # [FIX 17] Unfreeze Fθ for the recognition training step
+        # Unfreeze Fθ for the recognition training step
         for p in self.rec.parameters():
             p.requires_grad_(True)
 
@@ -910,9 +878,9 @@ class UAATrainer:
         self.sched = build_lr_schedule(
             self.opt, cfg.warmup_epochs, cfg.num_epochs, cfg.lr)
 
-        # [FIX 16] Separate PGD optimisers are not needed — same object,
-        # different pgd_steps passed per call
-        self.pgd   = AdversarialAugOptimizer(self.aug, self.rec)
+        self.pgd   = AdversarialAugOptimizer(
+            self.aug, self.rec,
+            pgd_steps=cfg.pgd_steps, step_size=cfg.pgd_step_size)
         self.s_geo = MomentumSampler(4,             momentum=cfg.momentum_geo)
         self.s_tex = MomentumSampler(cfg.style_dim, momentum=cfg.momentum_tex)
 
@@ -986,88 +954,59 @@ class UAATrainer:
                 save_path=self.cfg.gen_save_path)
             trainer.run(self.train_loader)
 
-        # Freeze G, D, and Es — all generation components frozen  [FIX 18]
+        # Freeze generator & discriminator; style_encoder stays trainable for PGD
         self.aug.freeze_gan_weights()
 
     # ── Phase 2: recognition training epoch ───────────────────────────────
     def train_epoch(self, epoch):
         self.rec.train()
         if self.cfg.use_generation:
-            # All GAN components frozen — eval mode for BN stability
+            # Generator & discriminator frozen; style_encoder stays trainable
+            # so PGD gradients flow: z → style_encoder → generator → image
             self.aug.gen_network.generator.eval()
             self.aug.gen_network.discriminator.eval()
-            self.aug.gen_network.style_encoder.eval()
+            self.aug.gen_network.style_encoder.train()
             self.aug.gen_network.identity_encoder.eval()
-
-        # ── UAA curriculum: staged augmentation introduction ──────────────
-        # Stage 0 (0  .. aug_start_epoch): clean training only
-        # Stage 1 (aug_start_epoch .. tex_start_epoch): geometric UAA only
-        # Stage 2 (tex_start_epoch .. end): geometric + textural UAA
-        do_geo = self.cfg.use_geometric and epoch >= self.cfg.aug_start_epoch
-        do_tex = (self.cfg.use_textural and self.cfg.use_generation
-                  and epoch >= self.cfg.tex_start_epoch)
-
-        stage = 2 if do_tex else (1 if do_geo else 0)
-        stage_label = ['clean', 'geo-only', 'geo+tex'][stage]
-        if epoch in (0, self.cfg.aug_start_epoch, self.cfg.tex_start_epoch):
-            print(f"[Curriculum] Epoch {epoch+1}: switching to [{stage_label}] mode")
 
         total_loss = 0.0
         pbar = tqdm(self.train_loader,
-                    desc=f"[Train] Epoch {epoch+1}/{self.cfg.num_epochs} "
-                         f"[{stage_label}]")
+                    desc=f"[Train] Epoch {epoch+1}/{self.cfg.num_epochs}")
 
         for batch in pbar:
             x      = batch['img'].to(self.dev)
             labels = batch['identity'].to(self.dev)
             B      = x.size(0)
 
-            if not do_geo:
-                # ── Stage 0: clean training — no augmentation ─────────────
-                _, feats = self.rec(x)
-                loss     = self.rec.compute_loss(feats, labels)
+            # Sample initial control vectors via momentum sampler (Eq. 5)
+            z_geo  = self.s_geo.sample(B, self.dev)
+            z_tex  = self.s_tex.sample(B, self.dev)
+            z_init = torch.cat([z_geo, z_tex], dim=1)
 
-            else:
-                # ── Stages 1 & 2: UAA augmentation ───────────────────────
-                z_geo  = self.s_geo.sample(B, self.dev)
-                z_tex  = self.s_tex.sample(B, self.dev)
-                z_init = torch.cat([z_geo, z_tex], dim=1)
-
-                n_geo = max(1, int(B * self.cfg.geometric_rate))
-                n_tex = max(1, int(B * self.cfg.textural_rate)) if do_tex else 0
-
-                # Geometric PGD (K=1)
-                z_opt = self.pgd.optimize(
-                    x[:n_geo], labels[:n_geo],
-                    z_init[:n_geo],
-                    aug_type='geometric',
-                    pgd_steps=self.cfg.geo_pgd_steps)
+            # Geometric PGD on whole batch
+            if self.cfg.use_geometric:
+                z_opt = self.pgd.optimize(x, labels, z_init, aug_type='geometric')
                 self.s_geo.update(z_opt[:, :4])
-                z_opt_full = torch.cat([z_opt, z_init[n_geo:].detach()], dim=0)
+            else:
+                z_opt = z_init
 
-                # Textural PGD (K=2) — only in Stage 2
-                if do_tex:
-                    z_opt2 = self.pgd.optimize(
-                        x[:n_tex], labels[:n_tex],
-                        z_opt_full[:n_tex],
-                        aug_type='textural',
-                        pgd_steps=self.cfg.tex_pgd_steps)
-                    self.s_tex.update(z_opt2[:, 4:])
-                    z_final = torch.cat([z_opt2, z_opt_full[n_tex:].detach()], dim=0)
-                else:
-                    z_final = z_opt_full
+            # Textural PGD on whole batch (sequential on same z)
+            if self.cfg.use_textural and self.cfg.use_generation:
+                z_opt2 = self.pgd.optimize(x, labels, z_opt, aug_type='textural')
+                self.s_tex.update(z_opt2[:, 4:])
+                z_final = z_opt2
+            else:
+                z_final = z_opt
 
-                # Apply augmentation and train
-                aug_type_str = 'both' if do_tex else 'geometric'
-                n_aug = max(n_geo, n_tex) if do_tex else n_geo
-                with torch.no_grad():
-                    x_aug = self.aug(x[:n_aug], z_final[:n_aug],
-                                     aug_type=aug_type_str)
+            # Apply augmentation — no grad needed here
+            with torch.no_grad():
+                x_aug = self.aug(x, z_final, aug_type='both')
 
-                x_all  = torch.cat([x, x_aug], dim=0)
-                lb_all = torch.cat([labels, labels[:n_aug]], dim=0)
-                _, feats = self.rec(x_all)
-                loss     = self.rec.compute_loss(feats, lb_all)
+            # Eq. 4: train on original + augmented (whole batch each)
+            x_all  = torch.cat([x, x_aug], dim=0)
+            lb_all = torch.cat([labels, labels], dim=0)
+
+            _, feats = self.rec(x_all)
+            loss     = self.rec.compute_loss(feats, lb_all)
 
             self.opt.zero_grad()
             loss.backward()
@@ -1085,7 +1024,7 @@ class UAATrainer:
         self.sched.step()
         avg = total_loss / len(self.train_loader)
         print(f"[Epoch {epoch+1:3d}] Loss: {avg:.4f}  "
-              f"LR: {self.opt.param_groups[0]['lr']:.6f}  [{stage_label}]")
+              f"LR: {self.opt.param_groups[0]['lr']:.6f}")
         return avg
 
     def validate(self, epoch):
