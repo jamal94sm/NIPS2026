@@ -247,14 +247,17 @@ class IdentityEncoder(nn.Module):
         super().__init__()
         from torchvision.models import resnet50
         r = resnet50(pretrained=True)
-        # layers[:8] = conv1,bn1,relu,maxpool,layer1,layer2,layer3,layer4
-        # layer4 output: 512 channels, spatial 4×4 for 112×112 input
-        self.layers = nn.Sequential(*list(r.children())[:8])
+        # children() = [conv1,bn1,relu,maxpool,layer1,layer2,layer3,layer4,avgpool,fc]
+        # indices:       0    1   2   3        4      5      6      7      8       9
+        # layers[:7] ends at layer3 → output: 1024ch, 7×7 for 112×112 input
+        # Preferred over layers[:8] (layer4→2048ch,4×4): already at 7×7 so no
+        # interpolation is needed in the generator, and 1024ch is lighter.
+        self.layers = nn.Sequential(*list(r.children())[:7])
         for p in self.parameters():
             p.requires_grad = False   # always frozen
 
     def forward(self, x):
-        return self.layers(x)   # (B, 512, 4, 4)
+        return self.layers(x)   # (B, 1024, 7, 7)
 
 
 class AdaIN(nn.Module):
@@ -310,7 +313,7 @@ class PalmGenerator(nn.Module):
       - style code L2-normalised then processed by MLP               [FIX 9,10]
       - Dropout regularisation added                                 [FIX 11]
     """
-    def __init__(self, style_dim=16, id_feat_channels=512):
+    def __init__(self, style_dim=16, id_feat_channels=1024):
         super().__init__()
         self.style_mlp = StyleMLP(style_dim)
         self.dropout   = nn.Dropout(p=0.5)                         # [FIX 11]
@@ -318,7 +321,8 @@ class PalmGenerator(nn.Module):
         # Initial projection of style code to spatial feature map
         self.fc = nn.Linear(style_dim, 512 * 7 * 7)
 
-        # b1 input = z_feat(512) + id_feat_upsampled(512) = 1024   [FIX 8]
+        # b1 input = z_feat(512) + id_feat(1024) = 1536            [FIX 8]
+        # id_feat from layer3 is already 7×7 — no interpolation needed
         self.b1 = AdaINBlock(512 + id_feat_channels, 256, style_dim)
         self.b2 = AdaINBlock(256, 128, style_dim)
         self.b3 = AdaINBlock(128,  64, style_dim)
@@ -327,22 +331,20 @@ class PalmGenerator(nn.Module):
 
     def forward(self, z, id_feat):
         """
-        z       : (B, style_dim)   — style control vector
-        id_feat : (B, 512, 4, 4)   — spatial identity features from Eid
+        z       : (B, style_dim)    — style control vector
+        id_feat : (B, 1024, 7, 7)   — spatial identity features from Eid (layer3)
         """
         # [FIX 9,10] L2-normalise then MLP
         z_mod = self.style_mlp(z)           # (B, style_dim)
         z_mod = self.dropout(z_mod)         # [FIX 11]
 
-        # Initial spatial feature from style code
-        z_feat = self.fc(z_mod).view(z.size(0), 512, 7, 7)  # (B, 512, 7, 7)
+        # Initial spatial feature from style code: (B, 512, 7, 7)
+        z_feat = self.fc(z_mod).view(z.size(0), 512, 7, 7)
 
-        # [FIX 8] Upsample id_feat (4×4 → 7×7) and inject via channel concat
-        id_up  = F.interpolate(id_feat, size=(7, 7), mode='bilinear',
-                               align_corners=False)           # (B, 512, 7, 7)
-        x      = torch.cat([z_feat, id_up], dim=1)           # (B, 1024, 7, 7)
+        # [FIX 8] id_feat is already 7×7 from layer3 — concat directly
+        x = torch.cat([z_feat, id_feat], dim=1)   # (B, 1536, 7, 7)
 
-        # Decode — style modulation z_mod applied at every block
+        # Decode — style modulation applied at every block
         x = self.b1(x, z_mod)   # (B, 256, 14, 14)
         x = self.b2(x, z_mod)   # (B, 128, 28, 28)
         x = self.b3(x, z_mod)   # (B,  64, 56, 56)
@@ -377,7 +379,7 @@ class PalmGenerationNetwork(nn.Module):
         self.style_dim        = style_dim
         self.style_encoder    = StyleEncoder(style_dim)
         self.identity_encoder = IdentityEncoder()
-        self.generator        = PalmGenerator(style_dim, id_feat_channels=512)
+        self.generator        = PalmGenerator(style_dim, id_feat_channels=1024)
         self.discriminator    = PalmDiscriminator()
 
     def forward(self, x_style, x_id):
