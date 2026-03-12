@@ -11,7 +11,7 @@ Complete All-in-One Implementation — ICCV 2025
 CONFIG = {
     # ── Data ──────────────────────────────────────────────────────────────
     'data_path'          : '/home/pai-ng/Jamal/CASIA-MS-ROI',
-    'train_ratio'        : 0.7,          # 0.7→more train IDs→better ArcFace at small scale
+    'train_ratio'        : 0.7,
     'random_seed'        : 42,
 
     # ── Input ─────────────────────────────────────────────────────────────
@@ -23,42 +23,52 @@ CONFIG = {
     'feature_dim'        : 512,
     'style_dim'          : 16,
 
-    # ── Recognition training (scale-adapted from paper §4.3) ──────────────
-    'num_epochs'         : 50,           # 30→50: more epochs at lower LR
-    'lr'                 : 0.01,         # 0.1→0.01: linear batch-size scaling
-    'warmup_epochs'      : 5,            # 0→5: protects pretrained weights at small scale
+    # ── Recognition training ──────────────────────────────────────────────
+    'num_epochs'         : 100,          # 50→100: LR decays slower, more time to converge
+    'lr'                 : 0.01,
+    'warmup_epochs'      : 5,
     'weight_decay'       : 5e-4,
     'grad_clip'          : 5.0,
-    'save_freq'          : 5,
+    'save_freq'          : 10,
 
-    # ── UAA augmentation (paper §4.3 γ=0.5) ──────────────────────────────
+    # ── UAA augmentation ──────────────────────────────────────────────────
     'use_geometric'      : True,
     'use_generation'     : True,
     'use_textural'       : True,
-    'geometric_rate'     : 0.5,          # paper: γ=0.5                       [FIX 2]
-    'textural_rate'      : 0.5,          # paper: γ=0.5                       [FIX 2]
+    'geometric_rate'     : 0.5,
+    'textural_rate'      : 0.5,
 
-    # ── GAN pre-training (paper §4.3) ─────────────────────────────────────
-    'gen_pretrain_epochs': 60,           # paper: 60 epochs                   [FIX 5]
-    'gen_lr'             : 1e-3,         # paper: 1e-3                        [FIX 5]
+    # ── UAA curriculum — staged introduction of augmentation ──────────────
+    # Rationale: let the model first learn basic recognition, then introduce
+    # progressively harder augmentation. Prevents a poorly-trained GAN from
+    # injecting harmful noise before the backbone has stable features.
+    #
+    #  epochs  0 – aug_start_epoch  : no augmentation (clean training only)
+    #  epochs  aug_start_epoch – tex_start_epoch : geometric UAA only
+    #  epochs  tex_start_epoch – end              : geometric + textural UAA
+    'aug_start_epoch'    : 10,           # start geometric UAA at epoch 10
+    'tex_start_epoch'    : 25,           # add textural UAA at epoch 25
+
+    # ── GAN pre-training ──────────────────────────────────────────────────
+    'gen_pretrain_epochs': 60,
+    'gen_lr'             : 1e-3,
     'gen_save_path'      : 'checkpoints/generation_network_pretrained.pt',
-    'gan_finetune_epochs': 10,           # fine-tune new layers when ckpt arch mismatches
+    'gan_finetune_epochs': 10,
 
-    # ── PGD (paper §4.3) ──────────────────────────────────────────────────
-    'geo_pgd_steps'      : 1,            # paper: K=1 for geometric           [FIX 3]
-    'tex_pgd_steps'      : 2,            # paper: K=2 for textural            [FIX 3]
-    # α ~ N(0.1, 0.001) sampled per call — no fixed step_size config         [FIX 4]
+    # ── PGD ───────────────────────────────────────────────────────────────
+    'geo_pgd_steps'      : 1,
+    'tex_pgd_steps'      : 2,
 
     # ── Momentum sampling ─────────────────────────────────────────────────
-    'momentum_geo'       : 0.5,          # paper β=0.5 for geometric
-    'momentum_tex'       : 0.25,         # paper β=0.25 for textural
+    'momentum_geo'       : 0.5,
+    'momentum_tex'       : 0.25,
 
     # ── ArcFace ───────────────────────────────────────────────────────────
     'arcface_s'          : 64.0,
     'arcface_m'          : 0.5,
 
     # ── Evaluation ────────────────────────────────────────────────────────
-    'tar_far_values'     : [1e-6, 1e-5, 1e-4, 1e-3],  # paper: 1e-6, 1e-5  [FIX 7]
+    'tar_far_values'     : [1e-6, 1e-5, 1e-4, 1e-3],
     'eval_freq'          : 5,
 }
 
@@ -986,72 +996,78 @@ class UAATrainer:
             # All GAN components frozen — eval mode for BN stability
             self.aug.gen_network.generator.eval()
             self.aug.gen_network.discriminator.eval()
-            self.aug.gen_network.style_encoder.eval()     # [FIX 18] now frozen
+            self.aug.gen_network.style_encoder.eval()
             self.aug.gen_network.identity_encoder.eval()
+
+        # ── UAA curriculum: staged augmentation introduction ──────────────
+        # Stage 0 (0  .. aug_start_epoch): clean training only
+        # Stage 1 (aug_start_epoch .. tex_start_epoch): geometric UAA only
+        # Stage 2 (tex_start_epoch .. end): geometric + textural UAA
+        do_geo = self.cfg.use_geometric and epoch >= self.cfg.aug_start_epoch
+        do_tex = (self.cfg.use_textural and self.cfg.use_generation
+                  and epoch >= self.cfg.tex_start_epoch)
+
+        stage = 2 if do_tex else (1 if do_geo else 0)
+        stage_label = ['clean', 'geo-only', 'geo+tex'][stage]
+        if epoch in (0, self.cfg.aug_start_epoch, self.cfg.tex_start_epoch):
+            print(f"[Curriculum] Epoch {epoch+1}: switching to [{stage_label}] mode")
 
         total_loss = 0.0
         pbar = tqdm(self.train_loader,
-                    desc=f"[Train] Epoch {epoch+1}/{self.cfg.num_epochs}")
+                    desc=f"[Train] Epoch {epoch+1}/{self.cfg.num_epochs} "
+                         f"[{stage_label}]")
 
         for batch in pbar:
             x      = batch['img'].to(self.dev)
             labels = batch['identity'].to(self.dev)
             B      = x.size(0)
 
-            # ── Sample initial control vectors (Eq. 5) ───────────────────
-            z_geo  = self.s_geo.sample(B, self.dev)               # (B, 4)
-            z_tex  = self.s_tex.sample(B, self.dev)               # (B, style_dim)
-            z_init = torch.cat([z_geo, z_tex], dim=1)             # (B, 4+style_dim)
+            if not do_geo:
+                # ── Stage 0: clean training — no augmentation ─────────────
+                _, feats = self.rec(x)
+                loss     = self.rec.compute_loss(feats, labels)
 
-            # ── [FIX 19] Select γ-fraction of batch to augment ───────────
-            # Paper §4.3: γ=0.5 — only augment 50% of each batch
-            n_geo = max(1, int(B * self.cfg.geometric_rate))      # γ_geo * B
-            n_tex = max(1, int(B * self.cfg.textural_rate))       # γ_tex * B
-            # Use first n samples (batch is already shuffled by DataLoader)
-            x_geo_in  = x[:n_geo]
-            lab_geo   = labels[:n_geo]
-            x_tex_in  = x[:n_tex]
-            lab_tex   = labels[:n_tex]
+            else:
+                # ── Stages 1 & 2: UAA augmentation ───────────────────────
+                z_geo  = self.s_geo.sample(B, self.dev)
+                z_tex  = self.s_tex.sample(B, self.dev)
+                z_init = torch.cat([z_geo, z_tex], dim=1)
 
-            # ── Geometric PGD  (K=1, paper §4.3) ─────────────────────────
-            if self.cfg.use_geometric:
-                z_opt = self.pgd.optimize(                        # [FIX 3,15,16,17]
-                    x_geo_in, lab_geo,
+                n_geo = max(1, int(B * self.cfg.geometric_rate))
+                n_tex = max(1, int(B * self.cfg.textural_rate)) if do_tex else 0
+
+                # Geometric PGD (K=1)
+                z_opt = self.pgd.optimize(
+                    x[:n_geo], labels[:n_geo],
                     z_init[:n_geo],
                     aug_type='geometric',
-                    pgd_steps=self.cfg.geo_pgd_steps)             # K=1
+                    pgd_steps=self.cfg.geo_pgd_steps)
                 self.s_geo.update(z_opt[:, :4])
-                # Pad back to full batch with original z for unused samples
-                z_opt_full = torch.cat(
-                    [z_opt, z_init[n_geo:].detach()], dim=0)
-            else:
-                z_opt_full = z_init.detach()
+                z_opt_full = torch.cat([z_opt, z_init[n_geo:].detach()], dim=0)
 
-            # ── Textural PGD  (K=2, paper §4.3) ──────────────────────────
-            if self.cfg.use_textural and self.cfg.use_generation:
-                z_opt2 = self.pgd.optimize(                       # [FIX 3,15,16,17]
-                    x_tex_in, lab_tex,
-                    z_opt_full[:n_tex],
-                    aug_type='textural',
-                    pgd_steps=self.cfg.tex_pgd_steps)             # K=2
-                self.s_tex.update(z_opt2[:, 4:])
-                z_final_full = torch.cat(
-                    [z_opt2, z_opt_full[n_tex:].detach()], dim=0)
-            else:
-                z_final_full = z_opt_full
+                # Textural PGD (K=2) — only in Stage 2
+                if do_tex:
+                    z_opt2 = self.pgd.optimize(
+                        x[:n_tex], labels[:n_tex],
+                        z_opt_full[:n_tex],
+                        aug_type='textural',
+                        pgd_steps=self.cfg.tex_pgd_steps)
+                    self.s_tex.update(z_opt2[:, 4:])
+                    z_final = torch.cat([z_opt2, z_opt_full[n_tex:].detach()], dim=0)
+                else:
+                    z_final = z_opt_full
 
-            # ── Apply augmentation to γ-fraction of batch ─────────────────
-            n_aug = max(n_geo, n_tex)
-            with torch.no_grad():
-                x_aug = self.aug(x[:n_aug], z_final_full[:n_aug], aug_type='both')
+                # Apply augmentation and train
+                aug_type_str = 'both' if do_tex else 'geometric'
+                n_aug = max(n_geo, n_tex) if do_tex else n_geo
+                with torch.no_grad():
+                    x_aug = self.aug(x[:n_aug], z_final[:n_aug],
+                                     aug_type=aug_type_str)
 
-            # ── Eq. 4: θ* = argmin_θ [L(Fθ(x),y) + L(Fθ(A(x,z*)),y)] ────
-            # [FIX 20] Concatenate full original batch + augmented γ-fraction
-            x_all  = torch.cat([x, x_aug], dim=0)
-            lb_all = torch.cat([labels, labels[:n_aug]], dim=0)
-
-            _, feats = self.rec(x_all)
-            loss     = self.rec.compute_loss(feats, lb_all)
+                x_all  = torch.cat([x, x_aug], dim=0)
+                lb_all = torch.cat([labels, labels[:n_aug]], dim=0)
+                _, feats = self.rec(x_all)
+                loss     = self.rec.compute_loss(feats, lb_all)
 
             self.opt.zero_grad()
             loss.backward()
@@ -1069,7 +1085,7 @@ class UAATrainer:
         self.sched.step()
         avg = total_loss / len(self.train_loader)
         print(f"[Epoch {epoch+1:3d}] Loss: {avg:.4f}  "
-              f"LR: {self.opt.param_groups[0]['lr']:.6f}")
+              f"LR: {self.opt.param_groups[0]['lr']:.6f}  [{stage_label}]")
         return avg
 
     def validate(self, epoch):
