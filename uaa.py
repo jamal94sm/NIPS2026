@@ -1,58 +1,76 @@
-
-"""
-Unified Adversarial Augmentation (UAA) – Corrected Implementation
-Aligned with: "Unified Adversarial Augmentation for Improving Palmprint Recognition" (ICCV 2025)
-
-Key fixes applied vs original user code:
-1. PGD step size sampled per step: alpha ~ N(0.1, 0.001)
-2. Separate PGD steps: geometric=1, textural=2
-3. Augmentation ratio gamma = 0.5 (only half batch augmented)
-4. Textural augmentation replaces image (no blending)
-5. Entire generation network frozen during recognition training
-6. Identity encoder uses ResNet50 layers[:8] → (B,2048,4,4)
-7. Identity loss uses L2 (MSE) instead of cosine similarity
-"""
+# ============================================================
+# IMPORTS
+# ============================================================
 
 import os
 import math
+import json
+import random
+import argparse
+from dataclasses import dataclass
+from typing import List, Dict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torchvision import transforms
+
 from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torchvision.models import resnet50
+
 from PIL import Image
-import numpy as np
+from tqdm import tqdm
 
-# --------------------------------------------------
-# CONFIG
-# --------------------------------------------------
 
-CONFIG = {
-    "data_path": "DATASET_PATH",
-    "batch_size": 32,
-    "img_size": 112,
-    "feature_dim": 512,
-    "style_dim": 16,
-    "num_epochs": 50,
-    "lr": 0.01,
-    "gamma": 0.5,
-    "geo_pgd_steps": 1,
-    "tex_pgd_steps": 2,
-}
 
-# --------------------------------------------------
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+@dataclass
+class Config:
+
+    dataset_path: str = "DATASET_PATH"
+    img_size: int = 112
+
+    batch_size: int = 32
+    num_workers: int = 4
+
+    feature_dim: int = 512
+    style_dim: int = 16
+
+    lr: float = 0.01
+    momentum: float = 0.9
+    weight_decay: float = 5e-4
+
+    epochs: int = 60
+    warmup_epochs: int = 5
+
+    gamma: float = 0.5
+
+    geo_pgd_steps: int = 1
+    tex_pgd_steps: int = 2
+
+    arcface_s: float = 64.0
+    arcface_m: float = 0.5
+
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+
+# ============================================================
 # DATASET
-# --------------------------------------------------
+# ============================================================
 
-class PalmDataset(Dataset):
+class PalmprintDataset(Dataset):
 
-    def __init__(self, samples, img_size=112):
+    def __init__(self, samples):
 
         self.samples = samples
 
         self.tf = transforms.Compose([
-            transforms.Resize((img_size,img_size)),
+            transforms.Resize((112,112)),
             transforms.ToTensor(),
             transforms.Normalize([0.5]*3,[0.5]*3)
         ])
@@ -60,17 +78,22 @@ class PalmDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self,idx):
+    def __getitem__(self, idx):
 
-        path,label = self.samples[idx]
+        sample = self.samples[idx]
 
-        img = Image.open(path).convert("RGB")
+        img = Image.open(sample["path"]).convert("RGB")
 
-        return self.tf(img),label
+        return {
+            "img": self.tf(img),
+            "label": sample["label"]
+        }
 
-# --------------------------------------------------
+
+
+# ============================================================
 # SPATIAL TRANSFORMER
-# --------------------------------------------------
+# ============================================================
 
 class SpatialTransformer(nn.Module):
 
@@ -90,9 +113,11 @@ class SpatialTransformer(nn.Module):
 
         return F.grid_sample(x,grid,align_corners=False)
 
-# --------------------------------------------------
-# GENERATOR NETWORK
-# --------------------------------------------------
+
+
+# ============================================================
+# IDENTITY ENCODER
+# ============================================================
 
 class IdentityEncoder(nn.Module):
 
@@ -100,19 +125,22 @@ class IdentityEncoder(nn.Module):
 
         super().__init__()
 
-        from torchvision.models import resnet50
+        backbone = resnet50(weights=None)
 
-        r = resnet50(weights="IMAGENET1K_V1")
-
-        self.layers = nn.Sequential(*list(r.children())[:8])
+        self.layers = nn.Sequential(*list(backbone.children())[:8])
 
         for p in self.parameters():
-            p.requires_grad=False
+            p.requires_grad = False
 
     def forward(self,x):
 
         return self.layers(x)
 
+
+
+# ============================================================
+# PALM GENERATOR
+# ============================================================
 
 class PalmGenerator(nn.Module):
 
@@ -147,9 +175,10 @@ class PalmGenerator(nn.Module):
         return torch.tanh(self.out(x))
 
 
-# --------------------------------------------------
-# GENERATION NETWORK WRAPPER
-# --------------------------------------------------
+
+# ============================================================
+# GENERATION NETWORK
+# ============================================================
 
 class PalmGenerationNetwork(nn.Module):
 
@@ -157,36 +186,39 @@ class PalmGenerationNetwork(nn.Module):
 
         super().__init__()
 
-        self.identity_encoder = IdentityEncoder()
-
+        self.encoder = IdentityEncoder()
         self.generator = PalmGenerator(style_dim)
 
-    def generate(self,z,x):
+    def forward(self,z,x):
 
-        id_feat = self.identity_encoder(x)
+        id_feat = self.encoder(x)
 
         return self.generator(z,id_feat)
 
+    def freeze(self):
 
-# --------------------------------------------------
+        for p in self.parameters():
+            p.requires_grad=False
+
+
+
+# ============================================================
 # RECOGNITION NETWORK
-# --------------------------------------------------
+# ============================================================
 
-class PalmRecognitionNetwork(nn.Module):
+class RecognitionNet(nn.Module):
 
-    def __init__(self,num_classes,feature_dim=512):
+    def __init__(self,num_classes,feat_dim):
 
         super().__init__()
 
-        from torchvision.models import resnet50
+        backbone = resnet50(weights=None)
 
-        r = resnet50(weights="IMAGENET1K_V1")
+        self.backbone = nn.Sequential(*list(backbone.children())[:-1])
 
-        self.backbone = nn.Sequential(*list(r.children())[:-1])
+        self.fc = nn.Linear(2048,feat_dim)
 
-        self.fc = nn.Linear(2048,feature_dim)
-
-        self.classifier = nn.Linear(feature_dim,num_classes)
+        self.cls = nn.Linear(feat_dim,num_classes)
 
     def forward(self,x):
 
@@ -194,16 +226,43 @@ class PalmRecognitionNetwork(nn.Module):
 
         f = self.fc(f)
 
-        logits = self.classifier(f)
+        logits = self.cls(f)
 
         return logits,f
 
 
-# --------------------------------------------------
-# ADVERSARIAL OPTIMIZER
-# --------------------------------------------------
 
-class AdversarialAugOptimizer:
+# ============================================================
+# ARCFACE LOSS
+# ============================================================
+
+class ArcFaceLoss(nn.Module):
+
+    def __init__(self,feat_dim,num_classes,s=64.0,m=0.5):
+
+        super().__init__()
+
+        self.s=s
+        self.m=m
+
+        self.W = nn.Parameter(torch.randn(num_classes,feat_dim))
+
+    def forward(self,feat,labels):
+
+        feat = F.normalize(feat)
+        W = F.normalize(self.W)
+
+        logits = feat @ W.T
+
+        return F.cross_entropy(self.s*logits,labels)
+
+
+
+# ============================================================
+# ADVERSARIAL OPTIMIZER
+# ============================================================
+
+class AugPGD:
 
     def __init__(self,aug_net,rec_net,geo_steps,tex_steps):
 
@@ -213,7 +272,7 @@ class AdversarialAugOptimizer:
         self.geo_steps = geo_steps
         self.tex_steps = tex_steps
 
-    def pgd(self,x,labels,z,steps,mode):
+    def optimize(self,x,y,z,mode,steps):
 
         z = z.clone().detach().requires_grad_(True)
 
@@ -222,25 +281,17 @@ class AdversarialAugOptimizer:
             if z.grad is not None:
                 z.grad.zero_()
 
-            if mode=="geo":
-                x_aug = x
-            else:
-                x_aug = self.aug.generate(z[:,4:],x)
+            x_aug = self.aug(x,z,mode)
 
             logits,_ = self.rec(x_aug)
 
-            loss = F.cross_entropy(logits,labels)
+            loss = F.cross_entropy(logits,y)
 
             loss.backward()
 
             grad = torch.sign(z.grad)
 
-            alpha = torch.normal(
-                mean=0.1,
-                std=0.001,
-                size=(1,),
-                device=z.device
-            )
+            alpha = torch.normal(mean=0.1,std=0.001,size=(1,),device=z.device)
 
             with torch.no_grad():
                 z = z + alpha*grad
@@ -248,27 +299,74 @@ class AdversarialAugOptimizer:
         return z.detach()
 
 
-# --------------------------------------------------
-# TRAINING LOOP
-# --------------------------------------------------
+
+# ============================================================
+# UNIFIED AUGMENTATION MODULE
+# ============================================================
+
+class UnifiedAugmentation(nn.Module):
+
+    def __init__(self,style_dim):
+
+        super().__init__()
+
+        self.spatial = SpatialTransformer()
+        self.gen = PalmGenerationNetwork(style_dim)
+
+    def forward(self,x,z,mode):
+
+        if mode=="geo":
+            return self.spatial(x,z[:,:4])
+
+        if mode=="tex":
+            return self.gen(z[:,4:],x)
+
+        if mode=="both":
+            x = self.spatial(x,z[:,:4])
+            return self.gen(z[:,4:],x)
+
+        return x
+
+
+
+# ============================================================
+# TRAINER
+# ============================================================
 
 class Trainer:
 
-    def __init__(self,rec_net,aug_net,loader):
+    def __init__(self,cfg,num_classes):
 
-        self.rec = rec_net
-        self.aug = aug_net
-        self.loader = loader
+        self.cfg = cfg
 
-        self.opt = optim.SGD(rec_net.parameters(),lr=CONFIG["lr"],momentum=0.9)
+        self.rec = RecognitionNet(num_classes,cfg.feature_dim).to(cfg.device)
 
-    def train_epoch(self):
+        self.aug = UnifiedAugmentation(cfg.style_dim).to(cfg.device)
+
+        self.opt = optim.SGD(
+            self.rec.parameters(),
+            lr=cfg.lr,
+            momentum=cfg.momentum,
+            weight_decay=cfg.weight_decay
+        )
+
+        self.pgd = AugPGD(
+            self.aug,
+            self.rec,
+            cfg.geo_pgd_steps,
+            cfg.tex_pgd_steps
+        )
+
+    def train_epoch(self,loader):
 
         self.rec.train()
 
-        gamma = CONFIG["gamma"]
+        gamma = self.cfg.gamma
 
-        for x,y in self.loader:
+        for batch in tqdm(loader):
+
+            x = batch["img"].to(self.cfg.device)
+            y = batch["label"].to(self.cfg.device)
 
             B = x.size(0)
 
@@ -279,12 +377,16 @@ class Trainer:
             x_sub = x[idx]
             y_sub = y[idx]
 
-            z = torch.randn(k,20)
+            z = torch.randn(k,20,device=self.cfg.device)
 
-            x_aug = self.aug.generate(z[:,4:],x_sub)
+            z = self.pgd.optimize(x_sub,y_sub,z,"geo",self.cfg.geo_pgd_steps)
+
+            z = self.pgd.optimize(x_sub,y_sub,z,"tex",self.cfg.tex_pgd_steps)
+
+            with torch.no_grad():
+                x_aug = self.aug(x_sub,z,"both")
 
             x_all = torch.cat([x,x_aug])
-
             y_all = torch.cat([y,y_sub])
 
             logits,_ = self.rec(x_all)
@@ -292,19 +394,20 @@ class Trainer:
             loss = F.cross_entropy(logits,y_all)
 
             self.opt.zero_grad()
-
             loss.backward()
-
             self.opt.step()
 
 
-# --------------------------------------------------
-# ENTRY POINT
-# --------------------------------------------------
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
 
-    print("UAA corrected implementation ready.")
+    cfg = Config()
 
-if __name__=="__main__":
+    print("Unified Adversarial Augmentation training ready.")
+
+if __name__ == "__main__":
     main()
