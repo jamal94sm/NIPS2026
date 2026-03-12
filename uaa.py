@@ -3,7 +3,6 @@ UNIFIED ADVERSARIAL AUGMENTATION (UAA) FOR PALMPRINT RECOGNITION
 Complete All-in-One Implementation — ICCV 2025
 """
 
-
 # ============================================================================
 # CONFIGURATION — PAPER SETTINGS (§4.3)
 # ============================================================================
@@ -41,6 +40,7 @@ CONFIG = {
     'gen_pretrain_epochs': 60,           # paper: 60 epochs                   [FIX 5]
     'gen_lr'             : 1e-3,         # paper: 1e-3                        [FIX 5]
     'gen_save_path'      : 'checkpoints/generation_network_pretrained.pt',
+    'gan_finetune_epochs': 10,           # epochs to fine-tune new layers when ckpt arch mismatches
 
     # ── PGD ───────────────────────────────────────────────────────────────
     'geo_pgd_steps'      : 1,            # paper: K=1 for geometric           [FIX 3]
@@ -913,8 +913,34 @@ class UAATrainer:
         if (self.cfg.gen_save_path and
                 os.path.exists(self.cfg.gen_save_path)):
             print(f"[GAN] Loading pre-trained weights from {self.cfg.gen_save_path}")
-            self.aug.gen_network.load_state_dict(
-                torch.load(self.cfg.gen_save_path, map_location=self.dev))
+            ckpt = torch.load(self.cfg.gen_save_path, map_location=self.dev)
+            # strict=False: loads matching weights, skips mismatched/new layers.
+            # Needed when checkpoint was saved with the old architecture (no
+            # StyleMLP, no id_feat channel-concat) but the new architecture adds
+            # these components. New layers (StyleMLP, b1 with 1024-ch input, etc.)
+            # will be randomly initialised and fine-tuned during GAN pre-training.
+            missing, unexpected = self.aug.gen_network.load_state_dict(
+                ckpt, strict=False)
+            if missing:
+                print(f"[GAN]   New layers (randomly init): {len(missing)} keys")
+                for k in missing[:8]:
+                    print(f"          {k}")
+                if len(missing) > 8:
+                    print(f"          ... and {len(missing)-8} more")
+            if unexpected:
+                print(f"[GAN]   Old keys ignored: {len(unexpected)} keys")
+            if missing:
+                # Architecture changed — fine-tune for a few epochs so new
+                # layers (StyleMLP, b1) converge before freezing
+                print(f"[GAN] Architecture mismatch detected. "
+                      f"Running {self.cfg.gan_finetune_epochs} fine-tune epochs "
+                      f"to train new layers before freezing.")
+                ft_trainer = GANPretrainer(
+                    self.aug.gen_network, self.dev,
+                    lr=self.cfg.gen_lr * 0.1,          # lower LR for fine-tune
+                    epochs=self.cfg.gan_finetune_epochs,
+                    save_path=None)                     # don't overwrite checkpoint
+                ft_trainer.run(self.train_loader)
         else:
             trainer = GANPretrainer(
                 self.aug.gen_network, self.dev,
