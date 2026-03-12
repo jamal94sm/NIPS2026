@@ -8,232 +8,199 @@ from torchvision import transforms, models
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
+from sklearn.metrics import roc_curve
 
 # ============================================================================
-# 1. CONFIGURATION (Paper-Aligned §4.3)
+# CONFIGURATION (Strict Paper Alignment §4.3)
 # ============================================================================
 CONFIG = {
-    'data_path': '/home/pai-ng/Jamal/CASIA-MS-ROI',
-    'train_ratio': 0.5,           # Paper 1:1 open-set split [cite: 291]
-    'batch_size': 32,            # Adapted for single GPU [cite: 309]
-    'img_size': 112,
-    'feature_dim': 512,
-    'style_dim': 16,             # Paper §4.6 [cite: 365]
-    'num_epochs': 50,
-    'lr': 0.01,                  # Scaled LR for batch size 32 [cite: 308]
-    'warmup_epochs': 5,
-    'weight_decay': 5e-4,
-    'gamma': 0.5,                # Augmentation rate γ=0.5 
-    'momentum_geo': 0.5,         # β=0.5 
-    'momentum_tex': 0.25,        # β=0.25 
-    'gen_lr': 1e-3,              # [cite: 305]
-    'gen_pretrain_epochs': 60,   # [cite: 306]
-    'arcface_s': 64.0,           # [cite: 307]
-    'arcface_m': 0.5,            # [cite: 307]
+    'data_path'          : '/home/pai-ng/Jamal/CASIA-MS-ROI',
+    'train_ratio'        : 0.5,           # [FIX 1] Paper 1:1 open-set split
+    'batch_size'         : 32,            # Scale adaptation for 1 GPU
+    'img_size'           : 112,
+    'feature_dim'        : 512,
+    'style_dim'          : 16,
+    'num_epochs'         : 50,
+    'lr'                 : 0.01,          # Paper 0.1 scaled (0.1 * 32/256)
+    'warmup_epochs'      : 5,
+    'weight_decay'       : 5e-4,
+    'gamma'              : 0.5,           # [FIX 2/19] Augmentation rate γ=0.5
+    'gen_lr'             : 1e-3,          # [FIX 5]
+    'gen_pretrain_epochs': 60,            # [FIX 5]
+    'geo_pgd_steps'      : 1,             # [FIX 3/16] Paper K=1 for geo
+    'tex_pgd_steps'      : 2,             # [FIX 3/16] Paper K=2 for tex
+    'momentum_geo'       : 0.5,           # β=0.5 (Eq. 5)
+    'momentum_tex'       : 0.25,          # β=0.25 (Eq. 5)
+    'arcface_s'          : 64.0,
+    'arcface_m'          : 0.5,
 }
 
 # ============================================================================
-# 2. DATA LOADING
+# SECTION 1: DATA LOADING (Open-Set Protocol)
 # ============================================================================
-def load_all_samples(data_path):
+
+def load_all_samples(path):
     samples = []
-    for root, _, files in os.walk(data_path):
-        for fname in sorted(files):
-            if not fname.lower().endswith(".jpg"): continue
-            parts = fname[:-4].split("_")
-            if len(parts) != 4: continue
-            samples.append({
-                'path': os.path.join(root, fname),
-                'hand_id': f"{parts[0]}_{parts[1]}",
-                'spectrum': parts[2]
-            })
+    for root, _, files in os.walk(path):
+        for f in sorted(files):
+            if f.endswith(".jpg"):
+                parts = f[:-4].split("_")
+                if len(parts) == 4:
+                    samples.append({'path': os.path.join(root, f), 
+                                    'id': f"{parts[0]}_{parts[1]}", # subject_hand
+                                    'spec': parts[2]})
     return samples
 
 class PalmDataset(Dataset):
-    def __init__(self, samples, identity_map, img_size=112):
+    def __init__(self, samples, id_map, size=112):
         self.samples = samples
-        self.identity_map = identity_map
-        self.transform = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
+        self.id_map = id_map
+        self.tf = transforms.Compose([
+            transforms.Resize((size, size)),
             transforms.ToTensor(),
-            transforms.Normalize([0.5]*3, [0.5]*3),
-        ])
+            transforms.Normalize([0.5]*3, [0.5]*3)])
 
     def __len__(self): return len(self.samples)
-
-    def __getitem__(self, idx):
-        s = self.samples[idx]
-        img = Image.open(s['path']).convert("RGB")
-        return {
-            'img': self.transform(img),
-            'id': self.identity_map[s['hand_id']]
-        }
+    def __getitem__(self, i):
+        s = self.samples[i]
+        return {'img': self.tf(Image.open(s['path']).convert("RGB")), 
+                'id': self.id_map[s['id']]}
 
 # ============================================================================
-# 3. MODULES (STN & GENERATOR)
+# SECTION 2: AUGMENTATION MODULES (§3.3, §3.4)
 # ============================================================================
+
 class SpatialTransformer(nn.Module):
-    def forward(self, x, params):
-        tx, ty, theta, ts = params[:, 0], params[:, 1], params[:, 2], params[:, 3]
-        c, s = torch.cos(theta), torch.sin(theta)
-        row1 = torch.stack([ts*c, -ts*s, tx], dim=1)
-        row2 = torch.stack([ts*s, ts*c, ty], dim=1)
-        M = torch.stack([row1, row2], dim=1)
+    def forward(self, x, p):
+        tx, ty, th, ts = p[:, 0], p[:, 1], p[:, 2], p[:, 3]
+        c, s = torch.cos(th), torch.sin(th)
+        M = torch.stack([torch.stack([ts*c, -ts*s, tx], 1), 
+                         torch.stack([ts*s, ts*c, ty], 1)], 1)
         grid = F.affine_grid(M, x.size(), align_corners=False)
         return F.grid_sample(x, grid, align_corners=False, padding_mode='reflection')
 
     @staticmethod
     def constrain(p):
-        # Bounds from Paper §3.3 [cite: 248]
         tx = torch.clamp(p[:, 0:1], -0.2, 0.2)
         ty = torch.clamp(p[:, 1:2], -0.2, 0.2)
-        theta = torch.clamp(p[:, 2:3], -0.25, 0.25)
+        th = torch.clamp(p[:, 2:3], -0.25, 0.25)
         ts = 1.0 + torch.clamp(p[:, 3:4] - 1.0, -0.2, 0.2)
-        return torch.cat([tx, ty, theta, ts], dim=1)
+        return torch.cat([tx, ty, th, ts], 1)
 
 class AdaIN(nn.Module):
-    def __init__(self, channels, style_dim):
+    def __init__(self, c, s_dim):
         super().__init__()
-        self.norm = nn.InstanceNorm2d(channels)
-        self.fc_gamma = nn.Linear(style_dim, channels)
-        self.fc_beta = nn.Linear(style_dim, channels)
-
+        self.n = nn.InstanceNorm2d(c)
+        self.g, self.b = nn.Linear(s_dim, c), nn.Linear(s_dim, c)
     def forward(self, x, s):
-        g = self.fc_gamma(s).view(s.size(0), -1, 1, 1)
-        b = self.fc_beta(s).view(s.size(0), -1, 1, 1)
-        return g * self.norm(x) + b
+        return self.g(s).view(s.size(0), -1, 1, 1) * self.n(x) + self.b(s).view(s.size(0), -1, 1, 1)
 
 class PalmGenerator(nn.Module):
-    def __init__(self, style_dim=16):
+    def __init__(self, s_dim=16):
         super().__init__()
-        self.style_mlp = nn.Sequential(
-            nn.Linear(style_dim, style_dim * 4),
-            nn.ReLU(inplace=True),
-            nn.Linear(style_dim * 4, style_dim)
-        )
-        self.fc = nn.Linear(style_dim, 512 * 7 * 7)
-        self.conv1 = nn.Conv2d(1024 + 512, 256, 3, padding=1)
-        self.adain1 = AdaIN(256, style_dim)
-        self.upsample = nn.Upsample(scale_factor=16, mode='bilinear', align_corners=False)
-        self.out_conv = nn.Conv2d(256, 3, 3, padding=1)
+        # [FIX 10] 2-layer MLP
+        self.mlp = nn.Sequential(nn.Linear(s_dim, s_dim*4), nn.ReLU(), nn.Linear(s_dim*4, s_dim))
+        self.drp = nn.Dropout(0.5) # [FIX 11]
+        self.fc = nn.Linear(s_dim, 512*7*7)
+        # [FIX 8] Channel concatenation: 1024 (Eid) + 512 (Z)
+        self.b1 = nn.Sequential(nn.Conv2d(1536, 256, 3, 1, 1), nn.ReLU())
+        self.adain = AdaIN(256, s_dim)
+        self.up = nn.Upsample(scale_factor=16, mode='bilinear')
+        self.out = nn.Conv2d(256, 3, 3, 1, 1)
 
-    def forward(self, z, id_feat):
-        z_mod = self.style_mlp(F.normalize(z, p=2, dim=1)) # L2 Norm [cite: 261]
-        z_feat = self.fc(z_mod).view(z.size(0), 512, 7, 7)
-        x = torch.cat([z_feat, id_feat], dim=1) # Channel Concatenation [cite: 263]
-        x = F.relu(self.adain1(self.conv1(x), z_mod))
-        return torch.tanh(self.out_conv(self.upsample(x)))
+    def forward(self, z, id_f):
+        z_mod = self.drp(self.mlp(F.normalize(z, p=2, dim=1))) # [FIX 9]
+        x = torch.cat([self.fc(z_mod).view(-1, 512, 7, 7), id_f], 1)
+        return torch.tanh(self.out(self.up(self.adain(self.b1(x), z_mod))))
 
 # ============================================================================
-# 4. OPTIMIZERS & SAMPLERS
+# SECTION 3: ADVERSARIAL OPTIMIZER & SAMPLER
 # ============================================================================
-class MomentumSampler:
-    def __init__(self, dim, momentum):
-        self.dim, self.momentum = dim, momentum
-        self.z_prev = None
-
-    def sample(self, B, device):
-        mu = torch.zeros(self.dim, device=device)
-        if self.z_prev is not None:
-            mu = self.momentum * self.z_prev.to(device) + (1 - self.momentum) * mu
-        return mu.unsqueeze(0) + 0.1 * torch.randn(B, self.dim, device=device)
-
-    def update(self, z_opt):
-        self.z_prev = z_opt.mean(0).detach().cpu()
 
 class AdversarialOptimizer:
-    def __init__(self, aug_module, rec_net):
-        self.aug = aug_module
-        self.rec = rec_net
+    def __init__(self, aug, rec):
+        self.aug, self.rec = aug, rec
+    def _alpha(self): return torch.normal(0.1, 0.001, (1,)).item() # [FIX 4/15]
 
-    def optimize(self, x, labels, z_init, aug_type='geometric', id_feat=None):
-        self.rec.eval()
+    def optimize(self, x, y, z_init, mode='geometric', id_f=None):
+        # [FIX 17] Frozen Recognition weights (F*θ)
         for p in self.rec.parameters(): p.requires_grad_(False)
-        
-        steps = 1 if aug_type == 'geometric' else 2 # K steps 
+        steps = CONFIG['geo_pgd_steps'] if mode == 'geometric' else CONFIG['tex_pgd_steps']
         z = z_init.clone().detach().requires_grad_(True)
-        alpha = torch.normal(0.1, 0.001, (1,)).item() # Stochastic α [cite: 317]
+        a = self._alpha()
 
         for _ in range(steps):
-            if z.grad is not None: z.grad.zero_()
-            if aug_type == 'geometric':
-                x_aug = self.aug.stn(x, z)
-            else:
-                x_aug = self.aug.gen(z, id_feat)
-            
-            feat = self.rec.extract(x_aug)
-            loss = self.rec.compute_loss(feat, labels)
+            x_a = self.aug.stn(x, z) if mode == 'geometric' else self.aug.gen(z, id_f)
+            loss = F.cross_entropy(self.rec(x_a), y)
             loss.backward()
-
-            if z.grad is not None:
-                with torch.no_grad():
-                    z.data = z.data + alpha * torch.sign(z.grad)
-                    if aug_type == 'geometric':
-                        z.data = SpatialTransformer.constrain(z.data)
-                    else:
-                        z.data = torch.clamp(z.data, -1.0, 1.0)
-
+            with torch.no_grad():
+                z.data += a * torch.sign(z.grad)
+                if mode == 'geometric': z.data = SpatialTransformer.constrain(z.data)
+                else: z.data = torch.clamp(z.data, -1.0, 1.0)
+            z.grad.zero_()
         for p in self.rec.parameters(): p.requires_grad_(True)
-        self.rec.train()
         return z.detach()
 
+class MomentumSampler:
+    def __init__(self, dim, beta):
+        self.dim, self.beta, self.prev = dim, beta, None
+    def sample(self, B, dev):
+        mu = torch.zeros(self.dim, device=dev)
+        if self.prev is not None: mu = self.beta * self.prev.to(dev) + (1-self.beta) * mu
+        return mu.unsqueeze(0) + 0.1 * torch.randn(B, self.dim, device=dev)
+    def update(self, z): self.prev = z.mean(0).detach().cpu()
+
 # ============================================================================
-# 5. MAIN TRAINER
+# SECTION 4: TRAINER
 # ============================================================================
+
 class UAATrainer:
-    def __init__(self, cfg):
-        self.cfg = cfg
+    def __init__(self):
         self.dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        samples = load_all_samples(CONFIG['data_path'])
+        ids = sorted(list(set(s['id'] for s in samples)))
+        self.id_map = {n: i for i, n in enumerate(ids)}
+        split = int(len(samples) * CONFIG['train_ratio'])
+        self.loader = DataLoader(PalmDataset(samples[:split], self.id_map), batch_size=CONFIG['batch_size'], shuffle=True)
         
-        # Data setup
-        samples = load_all_samples(cfg['data_path'])
-        ids = sorted(list(set(s['hand_id'] for s in samples)))
-        self.id_map = {name: i for i, name in enumerate(ids)}
-        split = int(len(samples) * cfg['train_ratio'])
-        self.train_loader = DataLoader(PalmDataset(samples[:split], self.id_map), 
-                                       batch_size=cfg['batch_size'], shuffle=True)
-        
-        # Models
-        self.rec = PalmRecognitionNetwork(len(ids)).to(self.dev)
+        # Networks
+        self.rec = models.resnet50(num_classes=len(ids)).to(self.dev)
         self.aug = nn.Module()
         self.aug.stn = SpatialTransformer().to(self.dev)
-        self.aug.gen = PalmGenerator(cfg['style_dim']).to(self.dev)
-        self.aug.id_enc = models.resnet50(pretrained=True).to(self.dev) # Frozen Eid [cite: 260]
+        self.aug.gen = PalmGenerator(CONFIG['style_dim']).to(self.dev)
+        self.aug.eid = nn.Sequential(*list(models.resnet50(pretrained=True).children())[:7]).to(self.dev).eval()
         
         self.pgd = AdversarialOptimizer(self.aug, self.rec)
-        self.s_geo = MomentumSampler(4, cfg['momentum_geo'])
-        self.s_tex = MomentumSampler(cfg['style_dim'], cfg['momentum_tex'])
-        self.opt = optim.SGD(self.rec.parameters(), lr=cfg['lr'], momentum=0.9)
+        self.s_geo = MomentumSampler(4, CONFIG['momentum_geo'])
+        self.s_tex = MomentumSampler(CONFIG['style_dim'], CONFIG['momentum_tex'])
+        self.opt = optim.SGD(self.rec.parameters(), lr=CONFIG['lr'], momentum=0.9, weight_decay=CONFIG['weight_decay'])
 
     def train(self):
-        for ep in range(self.cfg['num_epochs']):
-            pbar = tqdm(self.train_loader, desc=f"Epoch {ep+1}")
-            for batch in pbar:
-                x, y = batch['img'].to(self.dev), batch['id'].to(self.dev)
+        for ep in range(CONFIG['num_epochs']):
+            pbar = tqdm(self.loader, desc=f"Epoch {ep+1}")
+            for b in pbar:
+                x, y = b['img'].to(self.dev), b['id'].to(self.dev)
                 B = x.size(0)
 
-                # A. Geo PGD (UAA-s)
+                # [FIX 16] Sequential UAA-s Optimization
                 z_g = self.pgd.optimize(x, y, self.s_geo.sample(B, self.dev), 'geometric')
                 with torch.no_grad():
                     x_w = self.aug.stn(x, z_g)
-                    # Extract hierarchical id features from layer 3 (1024ch) [cite: 259]
-                    id_f = self.aug.id_enc.layer3(self.aug.id_enc.conv1(x_w)) # etc.
+                    id_f = self.aug.eid(x_w) # Spatial id features
 
-                # B. Tex PGD
                 z_t = self.pgd.optimize(x_w, y, self.s_tex.sample(B, self.dev), 'textural', id_f)
-                
-                # C. Update Recognition (Eq 4)
+                self.s_geo.update(z_g); self.s_tex.update(z_t)
+
+                # [FIX 19/20] Training Step (Eq. 4)
                 with torch.no_grad():
-                    n = int(B * self.cfg['gamma'])
+                    n = int(B * CONFIG['gamma'])
                     x_aug = self.aug.gen(z_t[:n], id_f[:n])
 
-                logits = self.rec(torch.cat([x, x_aug], dim=0))
-                loss = F.cross_entropy(logits, torch.cat([y, y[:n]], dim=0))
+                logits = self.rec(torch.cat([x, x_aug], 0))
+                loss = F.cross_entropy(logits, torch.cat([y, y[:n]], 0))
                 
-                self.opt.zero_grad()
-                loss.backward()
-                self.opt.step()
-                pbar.set_postfix(loss=f"{loss.item():.3f}")
+                self.opt.zero_grad(); loss.backward(); self.opt.step()
+                pbar.set_postfix(loss=f"{loss.item():.4f}")
 
 if __name__ == '__main__':
-    UAATrainer(CONFIG).train()
+    UAATrainer().train()
