@@ -914,33 +914,53 @@ class UAATrainer:
                 os.path.exists(self.cfg.gen_save_path)):
             print(f"[GAN] Loading pre-trained weights from {self.cfg.gen_save_path}")
             ckpt = torch.load(self.cfg.gen_save_path, map_location=self.dev)
-            # strict=False: loads matching weights, skips mismatched/new layers.
-            # Needed when checkpoint was saved with the old architecture (no
-            # StyleMLP, no id_feat channel-concat) but the new architecture adds
-            # these components. New layers (StyleMLP, b1 with 1024-ch input, etc.)
-            # will be randomly initialised and fine-tuned during GAN pre-training.
+
+            # Filter checkpoint: keep only keys that exist in the current model
+            # AND whose tensor shape matches exactly.
+            # strict=False alone still crashes on size mismatches (e.g. b1.conv
+            # changed from 512→1024 input channels after id_feat injection fix).
+            current_state = self.aug.gen_network.state_dict()
+            filtered, skipped_missing, skipped_shape = {}, [], []
+            for k, v in ckpt.items():
+                if k not in current_state:
+                    skipped_missing.append(k)
+                elif v.shape != current_state[k].shape:
+                    skipped_shape.append(
+                        f"{k}: ckpt{list(v.shape)} vs model{list(current_state[k].shape)}")
+                else:
+                    filtered[k] = v
+
+            loaded   = len(filtered)
+            total    = len(current_state)
+            print(f"[GAN]   Loaded   : {loaded}/{total} keys matched shape exactly")
+            if skipped_shape:
+                print(f"[GAN]   Skipped (shape mismatch, will re-init): "
+                      f"{len(skipped_shape)} keys")
+                for s in skipped_shape[:6]:
+                    print(f"          {s}")
+                if len(skipped_shape) > 6:
+                    print(f"          ... and {len(skipped_shape)-6} more")
+            if skipped_missing:
+                print(f"[GAN]   Skipped (not in current model): "
+                      f"{len(skipped_missing)} keys")
+
+            # Load only the safe, shape-compatible subset
             missing, unexpected = self.aug.gen_network.load_state_dict(
-                ckpt, strict=False)
-            if missing:
-                print(f"[GAN]   New layers (randomly init): {len(missing)} keys")
-                for k in missing[:8]:
-                    print(f"          {k}")
-                if len(missing) > 8:
-                    print(f"          ... and {len(missing)-8} more")
-            if unexpected:
-                print(f"[GAN]   Old keys ignored: {len(unexpected)} keys")
-            if missing:
-                # Architecture changed — fine-tune for a few epochs so new
-                # layers (StyleMLP, b1) converge before freezing
-                print(f"[GAN] Architecture mismatch detected. "
-                      f"Running {self.cfg.gan_finetune_epochs} fine-tune epochs "
-                      f"to train new layers before freezing.")
+                filtered, strict=False)
+
+            needs_finetune = len(skipped_shape) > 0 or len(missing) > 0
+            if needs_finetune:
+                print(f"[GAN] Architecture mismatch detected — "
+                      f"running {self.cfg.gan_finetune_epochs} fine-tune epochs "
+                      f"to train re-initialised layers before freezing.")
                 ft_trainer = GANPretrainer(
                     self.aug.gen_network, self.dev,
-                    lr=self.cfg.gen_lr * 0.1,          # lower LR for fine-tune
+                    lr=self.cfg.gen_lr * 0.1,   # lower LR: pretrained layers stay stable
                     epochs=self.cfg.gan_finetune_epochs,
-                    save_path=None)                     # don't overwrite checkpoint
+                    save_path=None)              # don't overwrite the original checkpoint
                 ft_trainer.run(self.train_loader)
+            else:
+                print("[GAN]   All weights loaded successfully — no fine-tuning needed.")
         else:
             trainer = GANPretrainer(
                 self.aug.gen_network, self.dev,
