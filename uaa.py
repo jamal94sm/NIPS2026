@@ -1,16 +1,17 @@
 """
 UNIFIED ADVERSARIAL AUGMENTATION (UAA) FOR PALMPRINT RECOGNITION
 Complete All-in-One Implementation — ICCV 2025
+
 """
 
 # ============================================================================
-# CONFIGURATION — PAPER SETTINGS (§4.3)
+# CONFIGURATION
 # ============================================================================
 
 CONFIG = {
     # ── Data ──────────────────────────────────────────────────────────────
     'data_path'          : '/home/pai-ng/Jamal/CASIA-MS-ROI',
-    'train_ratio'        : 0.5,          # paper: 1:1 open-set split          [FIX 1]
+    'train_ratio'        : 0.7,          # 0.7→more train IDs→better ArcFace at small scale
     'random_seed'        : 42,
 
     # ── Input ─────────────────────────────────────────────────────────────
@@ -22,27 +23,28 @@ CONFIG = {
     'feature_dim'        : 512,
     'style_dim'          : 16,
 
-    # ── Recognition training ──────────────────────────────────────────────
-    'num_epochs'         : 30,           # paper: 30 epochs                   [FIX 6]
-    'lr'                 : 0.1,          # paper: LR=0.1                      [FIX 6]
+    # ── Recognition training (scale-adapted from paper §4.3) ──────────────
+    'num_epochs'         : 50,           # 30→50: more epochs at lower LR
+    'lr'                 : 0.01,         # 0.1→0.01: linear batch-size scaling
+    'warmup_epochs'      : 5,            # 0→5: protects pretrained weights at small scale
     'weight_decay'       : 5e-4,
-    'grad_clip'          : 5.0,          # safety measure, not in paper
+    'grad_clip'          : 5.0,
     'save_freq'          : 5,
 
-    # ── UAA augmentation ──────────────────────────────────────────────────
+    # ── UAA augmentation (paper §4.3 γ=0.5) ──────────────────────────────
     'use_geometric'      : True,
     'use_generation'     : True,
     'use_textural'       : True,
     'geometric_rate'     : 0.5,          # paper: γ=0.5                       [FIX 2]
     'textural_rate'      : 0.5,          # paper: γ=0.5                       [FIX 2]
 
-    # ── GAN pre-training ──────────────────────────────────────────────────
+    # ── GAN pre-training (paper §4.3) ─────────────────────────────────────
     'gen_pretrain_epochs': 60,           # paper: 60 epochs                   [FIX 5]
     'gen_lr'             : 1e-3,         # paper: 1e-3                        [FIX 5]
     'gen_save_path'      : 'checkpoints/generation_network_pretrained.pt',
-    'gan_finetune_epochs': 10,           # epochs to fine-tune new layers when ckpt arch mismatches
+    'gan_finetune_epochs': 10,           # fine-tune new layers when ckpt arch mismatches
 
-    # ── PGD ───────────────────────────────────────────────────────────────
+    # ── PGD (paper §4.3) ──────────────────────────────────────────────────
     'geo_pgd_steps'      : 1,            # paper: K=1 for geometric           [FIX 3]
     'tex_pgd_steps'      : 2,            # paper: K=2 for textural            [FIX 3]
     # α ~ N(0.1, 0.001) sampled per call — no fixed step_size config         [FIX 4]
@@ -851,13 +853,16 @@ class Evaluator:
 # SECTION 10: LR SCHEDULE  (§4.3)
 # ============================================================================
 
-def build_cosine_lr_schedule(optimizer, total_epochs, base_lr, min_lr=0.0):
+def build_lr_schedule(optimizer, warmup_epochs, total_epochs, base_lr, min_lr=1e-5):
     """
-    Cosine decay without warmup — matches paper §4.3.
-    Paper: LR=0.1, cosine weight decay.
+    Linear warmup then cosine decay.
+    Warmup protects pretrained ResNet50 weights from large gradient updates
+    in early epochs — essential at small batch size (32 vs paper's 256).
     """
     def lr_lambda(epoch):
-        progress = epoch / max(1, total_epochs)
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs          # linear ramp 0→1
+        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
         cosine   = 0.5 * (1 + math.cos(math.pi * progress))
         return min_lr / base_lr + (1 - min_lr / base_lr) * cosine
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -888,12 +893,12 @@ class UAATrainer:
             use_generation=cfg.use_generation
         ).to(self.dev)
 
-        # Paper §4.3: SGD with cosine weight decay, LR=0.1
+        # SGD + warmup + cosine decay (scale-adapted from paper §4.3)
         self.opt   = optim.SGD(self.rec.parameters(),
                                lr=cfg.lr, momentum=0.9,
                                weight_decay=cfg.weight_decay)
-        self.sched = build_cosine_lr_schedule(
-            self.opt, cfg.num_epochs, cfg.lr)
+        self.sched = build_lr_schedule(
+            self.opt, cfg.warmup_epochs, cfg.num_epochs, cfg.lr)
 
         # [FIX 16] Separate PGD optimisers are not needed — same object,
         # different pgd_steps passed per call
