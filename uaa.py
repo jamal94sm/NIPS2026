@@ -8,8 +8,22 @@ Complete All-in-One Implementation — ICCV 2025
 # ============================================================================
 
 CONFIG = {
-    # ── Data ──────────────────────────────────────────────────────────────
-    'data_path'          : '/home/pai-ng/Jamal/CASIA-MS-ROI',
+    # ── Dataset toggle ────────────────────────────────────────────────────
+    # Set 'dataset' to 'casia' or 'mpd'
+    'dataset'            : 'mpd',
+
+    # ── CASIA-MS-ROI ──────────────────────────────────────────────────────
+    # Filename: {subject}_{hand}_{spectrum}_{iteration}.jpg
+    # Identity key: subject + hand  (e.g. "0001_l")
+    'casia_data_path'    : '/home/pai-ng/Jamal/CASIA-MS-ROI',
+
+    # ── MPDv2-ROI ─────────────────────────────────────────────────────────
+    # Filename: {id}_{session}_{device}_{hand}_{iteration}.jpg
+    # Identity key: subject id + hand  (e.g. "001_l")
+    # Requires pre-extracted ROI images (run extract_mpd_roi.py first)
+    'mpd_data_path'      : '/home/pai-ng/Jamal/MPDv2-ROI',
+
+    # ── Split ─────────────────────────────────────────────────────────────
     'train_ratio'        : 0.7,
     'random_seed'        : 42,
 
@@ -41,9 +55,7 @@ CONFIG = {
     'gen_save_path'      : 'checkpoints/generation_network_pretrained.pt',
     'gan_finetune_epochs': 10,
 
-    # ── PGD — kept identical to working version ───────────────────────────
-    # pgd_steps=2 for both geo and tex (sequential on same z, whole batch)
-    # step_size=0.05 (small, stable) — NOT N(0.1,0.001) which was too large
+    # ── PGD ───────────────────────────────────────────────────────────────
     'pgd_steps'          : 2,
     'pgd_step_size'      : 0.05,
 
@@ -93,7 +105,15 @@ print("=" * 80 + "\n")
 # SECTION 1: DATA LOADING
 # ============================================================================
 
-def load_all_samples(data_path):
+# ---------------------------------------------------------------------------
+# 1A  CASIA-MS-ROI
+#     Filename: {subject}_{hand}_{spectrum}_{iteration}.jpg
+#     Identity: subject + "_" + hand   (e.g. "0001_l", "0001_r")
+#     Spectra:  multiple per identity → used as the "channel" dimension in eval
+# ---------------------------------------------------------------------------
+
+def load_casia_samples(data_path):
+    """Walk CASIA-MS-ROI directory and return a list of sample dicts."""
     samples = []
     for root, _, files in os.walk(data_path):
         for fname in sorted(files):
@@ -110,32 +130,17 @@ def load_all_samples(data_path):
                 'spectrum' : spectrum,
                 'iteration': iteration,
                 'hand_id'  : f"{subject_id}_{hand}",
+                'dataset'  : 'casia',
             })
     return samples
 
 
-def build_identity_map(samples):
-    all_hand_ids = sorted(set(s['hand_id'] for s in samples))
-    identity_map = {h: i for i, h in enumerate(all_hand_ids)}
-    print(f"[Data] Total identities: {len(identity_map)}")
-    return identity_map, len(identity_map)
-
-
-def split_train_test(samples, identity_map, train_ratio=0.5, seed=42):
-    np.random.seed(seed)
-    all_ids  = list(sorted(set(s['hand_id'] for s in samples)))
-    np.random.shuffle(all_ids)
-    n_train  = int(len(all_ids) * train_ratio)
-    train_ids = set(all_ids[:n_train])
-    test_ids  = set(all_ids[n_train:])
-    train_s  = [s for s in samples if s['hand_id'] in train_ids]
-    test_s   = [s for s in samples if s['hand_id'] in test_ids]
-    print(f"[Data] Train: {len(train_ids)} identities, {len(train_s)} samples")
-    print(f"[Data] Test : {len(test_ids)}  identities, {len(test_s)}  samples")
-    return train_s, test_s, train_ids, test_ids
-
-
-class PalmDataset(Dataset):
+class CASIADataset(Dataset):
+    """
+    Dataset wrapper for CASIA-MS-ROI.
+    Returns a 'spectrum' key so the evaluator can build gallery/probe splits
+    across different spectral channels.
+    """
     def __init__(self, samples, identity_map, img_size=112):
         self.samples   = samples
         self.transform = transforms.Compose([
@@ -157,26 +162,181 @@ class PalmDataset(Dataset):
             'identity': s['identity'],
             'path'    : s['path'],
             'hand_id' : s['hand_id'],
-            'spectrum': s['spectrum'],
+            'spectrum': s['spectrum'],     # used by Evaluator.identification()
             'subject' : s['subject'],
             'hand'    : s['hand'],
         }
 
 
+# ---------------------------------------------------------------------------
+# 1B  MPDv2-ROI
+#     Filename: {id}_{session}_{device}_{hand}_{iteration}.jpg
+#     Identity: id + "_" + hand   (e.g. "001_l", "001_r")
+#     Device:   h (high-res) or m (mobile) → reused as 'spectrum' proxy so the
+#               same Evaluator gallery/probe logic applies without modification
+# ---------------------------------------------------------------------------
+
+def load_mpd_samples(data_path):
+    """
+    Walk MPDv2-ROI directory and return a list of sample dicts.
+    Files that do not match the 5-part MPDv2 naming convention are skipped.
+    """
+    samples = []
+    skipped = 0
+    for root, _, files in os.walk(data_path):
+        for fname in sorted(files):
+            if not fname.lower().endswith(".jpg"):
+                continue
+            parts = fname[:-4].split("_")
+            if len(parts) != 5:
+                skipped += 1
+                continue
+            subj_id, session, device, hand, iteration = parts
+            if not (len(subj_id) == 3 and subj_id.isdigit()
+                    and session in ("1", "2")
+                    and device in ("h", "m")
+                    and hand in ("l", "r")
+                    and len(iteration) == 2 and iteration.isdigit()):
+                skipped += 1
+                continue
+            samples.append({
+                'path'     : os.path.join(root, fname),
+                'subject'  : subj_id,
+                'hand'     : hand,
+                'session'  : session,
+                'device'   : device,
+                'iteration': iteration,
+                'hand_id'  : f"{subj_id}_{hand}",
+                # Map 'device' → 'spectrum' so Evaluator works without changes:
+                # gallery is built from one device, probe from the other
+                'spectrum' : device,
+                'dataset'  : 'mpd',
+            })
+    if skipped:
+        print(f"[Data/MPD] Skipped {skipped} files with non-standard filenames.")
+    return samples
+
+
+class MPDDataset(Dataset):
+    """
+    Dataset wrapper for MPDv2-ROI.
+    'spectrum' holds the device label ("h" or "m"); the Evaluator uses it
+    to split gallery vs probe — identical logic to CASIA spectral channels.
+    """
+    def __init__(self, samples, identity_map, img_size=112):
+        self.samples   = samples
+        self.transform = transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5]*3, [0.5]*3),
+        ])
+        for s in self.samples:
+            s['identity'] = identity_map[s['hand_id']]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        s   = self.samples[idx]
+        img = Image.open(s['path']).convert("RGB")
+        return {
+            'img'     : self.transform(img),
+            'identity': s['identity'],
+            'path'    : s['path'],
+            'hand_id' : s['hand_id'],
+            'spectrum': s['spectrum'],   # device label: "h" or "m"
+            'subject' : s['subject'],
+            'hand'    : s['hand'],
+            # MPDv2-specific extras (ignored by trainer, useful for analysis)
+            'session' : s['session'],
+            'device'  : s['device'],
+        }
+
+
+# ---------------------------------------------------------------------------
+# 1C  Shared helpers: identity map + train/test split
+# ---------------------------------------------------------------------------
+
+def build_identity_map(samples):
+    """Assign a consecutive integer label to every unique hand_id."""
+    all_hand_ids = sorted(set(s['hand_id'] for s in samples))
+    identity_map = {h: i for i, h in enumerate(all_hand_ids)}
+    print(f"[Data] Total identities: {len(identity_map)}")
+    return identity_map, len(identity_map)
+
+
+def split_train_test(samples, identity_map, train_ratio=0.7, seed=42):
+    """
+    Identity-disjoint train/test split.
+    Identities (not individual images) are shuffled and divided.
+    """
+    np.random.seed(seed)
+    all_ids   = list(sorted(set(s['hand_id'] for s in samples)))
+    np.random.shuffle(all_ids)
+    n_train   = int(len(all_ids) * train_ratio)
+    train_ids = set(all_ids[:n_train])
+    test_ids  = set(all_ids[n_train:])
+    train_s   = [s for s in samples if s['hand_id'] in train_ids]
+    test_s    = [s for s in samples if s['hand_id'] in test_ids]
+    print(f"[Data] Train: {len(train_ids)} identities, {len(train_s)} samples")
+    print(f"[Data] Test : {len(test_ids)} identities, {len(test_s)} samples")
+    return train_s, test_s, train_ids, test_ids
+
+
+# ---------------------------------------------------------------------------
+# 1D  create_dataloaders — single entry point, dispatches on cfg.dataset
+# ---------------------------------------------------------------------------
+
 def create_dataloaders(cfg):
-    all_samples = load_all_samples(cfg.data_path)
-    print(f"[Data] Total samples: {len(all_samples)}")
-    identity_map, num_classes = build_identity_map(all_samples)
-    train_s, test_s, _, _ = split_train_test(
-        all_samples, identity_map, cfg.train_ratio, cfg.random_seed)
-    train_ds = PalmDataset(train_s, identity_map, cfg.img_size)
-    test_ds  = PalmDataset(test_s,  identity_map, cfg.img_size)
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
-                              num_workers=cfg.num_workers, pin_memory=True,
-                              drop_last=True)
-    test_loader  = DataLoader(test_ds,  batch_size=cfg.batch_size, shuffle=False,
-                              num_workers=cfg.num_workers, pin_memory=True,
-                              drop_last=False)
+    """
+    Build train/test DataLoaders for either CASIA-MS or MPDv2.
+
+    Toggle via CONFIG['dataset']:
+      'casia'  →  load from cfg.casia_data_path using CASIADataset
+      'mpd'    →  load from cfg.mpd_data_path   using MPDDataset
+
+    Both datasets expose the same keys in every batch:
+      img, identity, path, hand_id, spectrum, subject, hand
+
+    Returns: train_loader, test_loader, num_classes, test_samples, identity_map
+    """
+    dataset = cfg.dataset.lower().strip()
+    print(f"\n[Data] Dataset : {dataset.upper()}")
+
+    if dataset == 'casia':
+        data_path   = cfg.casia_data_path
+        print(f"[Data] Path    : {data_path}")
+        all_samples = load_casia_samples(data_path)
+        print(f"[Data] Samples : {len(all_samples)}")
+        identity_map, num_classes = build_identity_map(all_samples)
+        train_s, test_s, _, _    = split_train_test(
+            all_samples, identity_map, cfg.train_ratio, cfg.random_seed)
+        train_ds = CASIADataset(train_s, identity_map, cfg.img_size)
+        test_ds  = CASIADataset(test_s,  identity_map, cfg.img_size)
+
+    elif dataset == 'mpd':
+        data_path   = cfg.mpd_data_path
+        print(f"[Data] Path    : {data_path}")
+        all_samples = load_mpd_samples(data_path)
+        print(f"[Data] Samples : {len(all_samples)}")
+        identity_map, num_classes = build_identity_map(all_samples)
+        train_s, test_s, _, _    = split_train_test(
+            all_samples, identity_map, cfg.train_ratio, cfg.random_seed)
+        train_ds = MPDDataset(train_s, identity_map, cfg.img_size)
+        test_ds  = MPDDataset(test_s,  identity_map, cfg.img_size)
+
+    else:
+        raise ValueError(
+            f"Unknown dataset '{dataset}'. "
+            "Set CONFIG['dataset'] to 'casia' or 'mpd'.")
+
+    train_loader = DataLoader(
+        train_ds, batch_size=cfg.batch_size, shuffle=True,
+        num_workers=cfg.num_workers, pin_memory=True, drop_last=True)
+    test_loader  = DataLoader(
+        test_ds,  batch_size=cfg.batch_size, shuffle=False,
+        num_workers=cfg.num_workers, pin_memory=True, drop_last=False)
+
     return train_loader, test_loader, num_classes, test_s, identity_map
 
 
