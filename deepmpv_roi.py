@@ -34,8 +34,8 @@ from tqdm import tqdm
 # ============================================================
 # PATHS  — edit these lines
 # ============================================================
-SRC_ROOT = "/path/to/palmSet"          # directory with images + .mat files
-DST_ROOT = "/path/to/ROI"             # output directory
+SRC_ROOT = "/home/pai-ng/Jamal/MPDv2"               # source directory
+DST_ROOT = "/home/pai-ng/Jamal/MPDv2-ROI"           # output directory
 ROI_SIZE = 128                         # output side length in pixels
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
