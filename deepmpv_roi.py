@@ -20,6 +20,10 @@ Steps:
   5. Re-project landmarks into the rotated frame via vec_rotate().
   6. Crop a (7/6 * sideLen) square at offset (x_mid − 7/12·L, y_mid + 1/6·L).
   7. Save to DST_ROOT preserving relative folder structure.
+
+NOTE: Images without a paired .mat file are collected and counted as fallback
+      (centre-cropped to ROI_SIZE). This matches the MPDv2 dataset layout
+      which contains plain JPEGs with no .mat annotations.
 """
 
 import math
@@ -34,11 +38,9 @@ from tqdm import tqdm
 # ============================================================
 # PATHS  — edit these lines
 # ============================================================
-SRC_ROOT = "/home/pai-ng/Jamal/MPDv2"               # source directory
-DST_ROOT = "/home/pai-ng/Jamal/MPDv2-ROI"           # output directory
-ROI_SIZE = 128                         # output side length in pixels
-
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
+SRC_ROOT = "/home/pai-ng/Jamal/MPDv2"      # directory with images (+ optional .mat files)
+DST_ROOT = "/home/pai-ng/Jamal/MPDv2-ROI"  # output directory
+ROI_SIZE = 224                              # output side length in pixels (MobileNetV2 default)
 
 # ============================================================
 # GEOMETRY HELPERS
@@ -48,7 +50,7 @@ def vec_rotate(x, y, angle_deg):
     """
     Rotate point (x, y) around the origin by angle_deg degrees.
 
-    Matches the MATLAB nested helper::
+    Matches the MATLAB nested helper:
         x1 =  x*cos(r) + y*sin(r)
         y1 = -x*sin(r) + y*cos(r)
     """
@@ -61,7 +63,7 @@ def rotation_angle(x1, y1, x2, y2):
     """
     Angle (degrees) that rotates the vector p1->p2 to horizontal.
 
-    Mirrors the MATLAB convention::
+    Mirrors the MATLAB convention:
         vec = normalise([x2-x1, y2-y1])
         if vec_y < 0 : angle = acos(-vec_x) - 180   (negative)
         else          : angle = |acos(-vec_x) - 180| (positive / zero)
@@ -72,7 +74,6 @@ def rotation_angle(x1, y1, x2, y2):
         return 0.0
     vx = dx / length
     vy = dy / length
-
     angle = math.degrees(math.acos(max(-1.0, min(1.0, -vx)))) - 180.0
     if vy >= 0:
         angle = abs(angle)
@@ -87,7 +88,7 @@ def make_square(image):
     """
     Pad the shorter dimension with white so the image becomes square.
 
-    Replicates MATLAB::
+    Replicates MATLAB:
         if wid > len : img(len+1:wid, :, :) = 255
         else         : img(:, wid+1:len, :) = 255
     """
@@ -143,12 +144,9 @@ def load_mat_annotation(mat_path):
     slots : np.ndarray (2,)    int,      0-based landmark indices
     """
     data = sio.loadmat(str(mat_path))
-
     marks = data["marks"].astype(float) - 1.0   # 1-based -> 0-based
-
     raw_slots = data["slots"].flatten().astype(int)
     slots = raw_slots[:2] - 1                   # 1-based -> 0-based
-
     return marks, slots
 
 
@@ -177,10 +175,6 @@ def extract_roi(image, marks, slots):
     square = make_square(image)
 
     # --- 2. Scale marks to the square coordinate system ---------------
-    # MATLAB: labelMarks(:,1) = (marks-0.5) / wid * edge  (x-column)
-    #         labelMarks(:,2) = (marks-0.5) / len * edge  (y-column)
-    # Python marks are already 0-based (equivalent to MATLAB marks-1),
-    # so we just scale without the extra -0.5 shift.
     lm = marks.copy()
     lm[:, 0] = lm[:, 0] / w * edge   # x
     lm[:, 1] = lm[:, 1] / h * edge   # y
@@ -201,7 +195,6 @@ def extract_roi(image, marks, slots):
     m_edge = rotated.shape[0]
 
     # --- 5. Re-project landmarks into rotated frame -------------------
-    # Centre on origin, rotate, shift back
     cx1, cy1 = x1 - edge / 2.0, y1 - edge / 2.0
     cx2, cy2 = x2 - edge / 2.0, y2 - edge / 2.0
 
@@ -211,14 +204,14 @@ def extract_roi(image, marks, slots):
     rx1 += m_edge / 2.0;  ry1 += m_edge / 2.0
     rx2 += m_edge / 2.0;  ry2 += m_edge / 2.0
 
-    x0 = (rx1 + rx2) / 2.0   # mid-point x
-    y0 = (ry1 + ry2) / 2.0   # mid-point y
+    x0 = (rx1 + rx2) / 2.0
+    y0 = (ry1 + ry2) / 2.0
 
     # --- 6. Crop window (matches MATLAB imcrop call exactly) ----------
     # imcrop(temp, [x0 - sideLen*7/12,  y0 + sideLen*1/6,
     #               sideLen*7/6,         sideLen*7/6])
-    crop_x    = int(round(x0  - side_len * 7.0 / 12.0))
-    crop_y    = int(round(y0  + side_len * 1.0 / 6.0))
+    crop_x    = int(round(x0 - side_len * 7.0 / 12.0))
+    crop_y    = int(round(y0 + side_len * 1.0 / 6.0))
     crop_size = int(round(side_len * 7.0 / 6.0))
 
     if (crop_x < 0 or crop_y < 0
@@ -232,56 +225,77 @@ def extract_roi(image, marks, slots):
 
 
 # ============================================================
+# FILENAME PARSER  (matches MPDv2 naming: 001_1_h_l_01.jpg)
+# ============================================================
+
+def parse_mpd_filename(fname):
+    stem = os.path.splitext(fname)[0]
+    parts = stem.split("_")
+    if len(parts) != 5:
+        return None
+    subj_id, session, device, hand, iteration = parts
+    if (len(subj_id) == 3 and subj_id.isdigit()
+            and session in ("1", "2")
+            and device in ("h", "m")
+            and hand in ("l", "r")
+            and len(iteration) == 2 and iteration.isdigit()):
+        return dict(id=subj_id, session=session, device=device,
+                    hand=hand, iteration=iteration)
+    return None
+
+
+# ============================================================
 # MAIN LOOP
 # ============================================================
 
 def main():
     os.makedirs(DST_ROOT, exist_ok=True)
 
-    # Collect all images that have a paired .mat file
+    # Collect ALL images matching the MPD filename convention.
+    # Unlike the previous version this does NOT require a paired .mat file —
+    # that was why all_images was always empty on plain image datasets.
     all_images = []
     for root, _, files in os.walk(SRC_ROOT):
         for f in sorted(files):
-            if os.path.splitext(f)[1].lower() not in IMAGE_EXTENSIONS:
+            if not f.lower().endswith(".jpg"):
                 continue
-            mat_name = os.path.splitext(f)[0] + ".mat"
-            mat_path = os.path.join(root, mat_name)
-            if os.path.exists(mat_path):
-                all_images.append((os.path.join(root, f), mat_path))
+            parsed = parse_mpd_filename(f)
+            if parsed:
+                all_images.append((os.path.join(root, f), parsed))
 
-    num_success = 0
+    num_success  = 0
     num_fallback = 0
-    report_rows = []
+    report_rows  = []
 
-    for src_path, mat_path in tqdm(all_images, desc="Extracting palm ROIs"):
-        # Preserve relative directory structure under DST_ROOT
+    for src_path, meta in tqdm(all_images, desc="Extracting palm ROIs"):
         rel_path = os.path.relpath(src_path, SRC_ROOT)
         stem     = os.path.splitext(os.path.basename(src_path))[0]
         dst_dir  = os.path.join(DST_ROOT, os.path.dirname(rel_path))
         dst_path = os.path.join(dst_dir, stem + "_ROI.jpeg")
         os.makedirs(dst_dir, exist_ok=True)
 
-        # Load image via PIL (consistent with reference script)
+        # Load image
         try:
             img_rgb = np.array(Image.open(src_path).convert("RGB"))
             img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
         except Exception:
             num_fallback += 1
-            report_rows.append({"path": rel_path, "status": "load_error"})
+            report_rows.append({**meta, "path": rel_path, "status": "load_error"})
             continue
 
-        # Load annotation
-        try:
-            marks, slots = load_mat_annotation(mat_path)
-        except Exception:
-            num_fallback += 1
-            report_rows.append({"path": rel_path, "status": "mat_error"})
-            continue
+        # Try to load paired .mat annotation (optional — not present in MPDv2)
+        mat_path = os.path.splitext(src_path)[0] + ".mat"
+        roi_bgr  = None
 
-        # Extract ROI
-        roi_bgr = extract_roi(img_bgr, marks, slots)
+        if os.path.exists(mat_path):
+            try:
+                marks, slots = load_mat_annotation(mat_path)
+                roi_bgr = extract_roi(img_bgr, marks, slots)
+            except Exception:
+                pass   # fall through to fallback below
 
         if roi_bgr is None or roi_bgr.size == 0:
+            # No .mat file (or extraction failed) — resize whole image
             roi_bgr = cv2.resize(img_bgr, (ROI_SIZE, ROI_SIZE))
             status = "fallback"
             num_fallback += 1
@@ -291,7 +305,7 @@ def main():
             num_success += 1
 
         cv2.imwrite(dst_path, roi_bgr, [cv2.IMWRITE_JPEG_QUALITY, 100])
-        report_rows.append({"path": rel_path, "status": status})
+        report_rows.append({**meta, "path": rel_path, "status": status})
 
     print(f"\nDone.  Success: {num_success},  Fallback/skipped: {num_fallback}")
 
