@@ -24,7 +24,6 @@ from torch.nn import Parameter
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import lr_scheduler
 from torchvision import transforms as T
-from skimage import exposure
 
 import matplotlib
 matplotlib.use("Agg")
@@ -41,14 +40,12 @@ OUTPUT_DIR    = "./results_casia_ms"
 GPU_ID        = "0"
 
 # --- Dataset ---
-# CASIA-MS: 460 subjects × 2 hands = 920 identities (Multi-Spec 500 variant = 500)
-# Set to actual number after generate_splits() prints it, or leave 0 to auto-detect
 NUM_CLASSES   = 0        # 0 = auto-detect from data
 TRAIN_RATIO   = 0.5      # first 50% of samples per identity → train
 IMSIDE        = 128      # input image side length (px)
 OUT_CHANNELS  = 1        # grayscale
 
-# --- Architecture (from paper Table I / code defaults) ---
+# --- Architecture ---
 COM_WEIGHT    = 0.8      # channel competition weight (α) inside Competitive Block
 ARC_S         = 30.0     # ArcFace scale s
 ARC_M         = 0.5      # ArcFace margin m
@@ -56,7 +53,7 @@ FC_DIM1       = 4096     # first FC layer output dim
 FC_DIM2       = 2048     # second FC layer output dim (embedding size)
 DROPOUT       = 0.5
 
-# --- Training (from paper / train.py / train_cc20.py) ---
+# --- Training ---
 BATCH_SIZE    = 1024
 EPOCH_NUM     = 3000
 LR            = 0.001
@@ -67,7 +64,7 @@ WEIGHT_CON    = 0.2      # λ₂  supervised contrastive loss weight
 TEMPERATURE   = 0.07     # SupConLoss temperature τ
 BASE_TEMP     = 0.07     # SupConLoss base temperature
 
-# --- Domain adaptation (FDA + histogram matching, train_cc20.py) ---
+# --- Domain adaptation ---
 FDA_L         = 0.1      # low-frequency ratio for FDA transfer
 
 # --- Logging ---
@@ -169,9 +166,9 @@ class PalmDataset(Dataset):
                     T.RandomPerspective(distortion_scale=0.15, p=1),
                     T.RandomChoice([
                         T.RandomRotation(10, expand=False,
-                                         center=(0.5 * imside, 0.0)),
+                                         center=(int(0.5 * imside), 0)),
                         T.RandomRotation(10, expand=False,
-                                         center=(0.0, 0.5 * imside)),
+                                         center=(0, int(0.5 * imside))),
                     ]),
                 ]),
                 T.ToTensor(),
@@ -221,7 +218,7 @@ class GaborConv2d(nn.Module):
         self.theta   = nn.Parameter(
             torch.arange(ch_out).float() * math.pi / ch_out, requires_grad=False)
         self.f       = nn.Parameter(torch.FloatTensor([0.057 / r]))
-        self.psi     = nn.Parameter(torch.FloatTensor([0.0]),    requires_grad=False)
+        self.psi     = nn.Parameter(torch.FloatTensor([0.0]), requires_grad=False)
 
     def _build_bank(self):
         xm  = self.ksize // 2
@@ -268,17 +265,17 @@ class CompetitiveBlock(nn.Module):
         self.g2 = GaborConv2d(nc2,   nc2,    ksize, 2, ksize // 2, init_ratio)
 
         if ksize == 35:
-            self.c1a = nn.Conv2d(ch_in, n_comp, 7, 1, 0)
+            self.c1a = nn.Conv2d(ch_in,  n_comp, 7, 1, 0)
             self.c1b = nn.Conv2d(n_comp, n_comp, 5, 2, 5)
             self.c2a = nn.Conv2d(nc2,    nc2,    7, 1, 0)
             self.c2b = nn.Conv2d(nc2,    nc2,    5, 2, 5)
         elif ksize == 17:
-            self.c1a = nn.Conv2d(ch_in, n_comp, 5, 1, 0)
+            self.c1a = nn.Conv2d(ch_in,  n_comp, 5, 1, 0)
             self.c1b = nn.Conv2d(n_comp, n_comp, 3, 2, 3)
             self.c2a = nn.Conv2d(nc2,    nc2,    5, 1, 0)
             self.c2b = nn.Conv2d(nc2,    nc2,    3, 2, 3)
         else:                                           # ksize == 7
-            self.c1a = nn.Conv2d(ch_in, n_comp, 3, 1, 0)
+            self.c1a = nn.Conv2d(ch_in,  n_comp, 3, 1, 0)
             self.c1b = nn.Conv2d(n_comp, n_comp, 1, 2, 1)
             self.c2a = nn.Conv2d(nc2,    nc2,    3, 1, 0)
             self.c2b = nn.Conv2d(nc2,    nc2,    1, 2, 1)
@@ -299,10 +296,10 @@ class CompetitiveBlock(nn.Module):
 
     def forward(self, x):
         # 1st order
-        f = torch.cat([self.g1(x), self.c1b(self.c1a(x))], dim=1)
+        f  = torch.cat([self.g1(x), self.c1b(self.c1a(x))], dim=1)
         x1 = self.pool(self.ppu1(self.se1(self._compete(f))))
         # 2nd order
-        f = torch.cat([self.g2(f), self.c2b(self.c2a(f))], dim=1)
+        f  = torch.cat([self.g2(f), self.c2b(self.c2a(f))], dim=1)
         x2 = self.pool(self.ppu2(self.se2(self._compete(f))))
         return torch.cat([x1.flatten(1), x2.flatten(1)], dim=1)
 
@@ -310,8 +307,8 @@ class CompetitiveBlock(nn.Module):
 class ArcMarginProduct(nn.Module):
     def __init__(self, in_f, out_f, s=ARC_S, m=ARC_M):
         super().__init__()
-        self.s   = s
-        self.w   = Parameter(torch.FloatTensor(out_f, in_f))
+        self.s     = s
+        self.w     = Parameter(torch.FloatTensor(out_f, in_f))
         nn.init.xavier_uniform_(self.w)
         self.cos_m = math.cos(m)
         self.sin_m = math.sin(m)
@@ -331,9 +328,9 @@ class ArcMarginProduct(nn.Module):
 
 class CCNet(nn.Module):
     """
-    CCNet  (ccnet_2.py variant):
+    CCNet (ccnet_2.py variant):
       3 Competitive Blocks (CB1 ksize=35 / CB2 ksize=17 / CB3 ksize=7)
-      + 2-layer FC  + Dropout  + ArcFace head
+      + 2-layer FC + Dropout + ArcFace head
       Input: 2-channel (histogram-matched | FDA-transferred)
     """
     def __init__(self, num_classes, weight=COM_WEIGHT):
@@ -378,7 +375,7 @@ class SupConLoss(nn.Module):
     def forward(self, features, labels):
         dev  = features.device
         bsz  = features.shape[0]
-        n    = features.shape[1]               # number of views (2)
+        n    = features.shape[1]
         mask = torch.eq(labels.view(-1, 1),
                         labels.view(1, -1)).float().to(dev)
         contrast = torch.cat(torch.unbind(features, dim=1), dim=0)
@@ -396,23 +393,52 @@ class SupConLoss(nn.Module):
 
 
 # ============================================================
-# DOMAIN ADAPTATION  (histogram matching + FDA, train_cc20.py)
+# DOMAIN ADAPTATION  (histogram matching — pure NumPy + FDA)
 # ============================================================
 
-def _fda(src, tgt, L=FDA_L):
-    fs  = torch.fft.rfft2(src, dim=(-2, -1))
-    ft  = torch.fft.rfft2(tgt, dim=(-2, -1))
-    as_, ps = torch.abs(fs), torch.angle(fs)
-    at        = torch.abs(ft)
-    _, _, h, w = as_.shape
-    b  = int(np.floor(0.5 * min(h, w * 2) * L))
-    if b > 0:
-        as_[:, :, :b,      :b] = at[:, :, :b,      :b]
-        as_[:, :, h-b+1:h, :b] = at[:, :, h-b+1:h, :b]
-    out = torch.fft.irfft2(torch.complex(torch.cos(ps) * as_,
-                                          torch.sin(ps) * as_),
-                            dim=(-2, -1), s=[h, w * 2])
-    return out[..., :src.shape[-2], :src.shape[-1]]
+def _hist_match_np(src: np.ndarray, tgt: np.ndarray) -> np.ndarray:
+    """
+    CDF-based histogram matching using NumPy only.
+    src, tgt : H x W x C  float32 arrays
+    """
+    matched = np.empty_like(src)
+    for c in range(src.shape[2]):
+        s = src[..., c].ravel().astype(np.float64)
+        t = tgt[..., c].ravel().astype(np.float64)
+
+        # Clamp to valid range
+        s_min, s_max = s.min(), s.max()
+        t_min, t_max = t.min(), t.max()
+        if s_max == s_min or t_max == t_min:
+            matched[..., c] = src[..., c]
+            continue
+
+        # Normalise to [0, 1] for histogram
+        s_n = (s - s_min) / (s_max - s_min)
+        t_n = (t - t_min) / (t_max - t_min)
+
+        bins = 256
+        s_counts, _ = np.histogram(s_n, bins=bins, range=(0., 1.))
+        t_counts, _ = np.histogram(t_n, bins=bins, range=(0., 1.))
+
+        s_cdf = np.cumsum(s_counts).astype(np.float64)
+        t_cdf = np.cumsum(t_counts).astype(np.float64)
+        s_cdf /= s_cdf[-1]
+        t_cdf /= t_cdf[-1]
+
+        bin_edges   = np.linspace(0., 1., bins + 1)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.
+
+        # For each source CDF value find the matching target bin
+        t_idx = np.searchsorted(t_cdf, s_cdf).clip(0, bins - 1)
+        # Build LUT: source bin → matched value (in original src scale)
+        lut = bin_centers[t_idx] * (s_max - s_min) + s_min
+
+        # Map each pixel through the LUT
+        pixel_bin = np.searchsorted(bin_edges[1:], s_n).clip(0, bins - 1)
+        matched[..., c] = lut[pixel_bin].reshape(src.shape[:2]).astype(np.float32)
+
+    return matched.astype(np.float32)
 
 
 def _hist(src_batch, tgt_batch):
@@ -420,13 +446,30 @@ def _hist(src_batch, tgt_batch):
     for s, t in zip(src_batch, tgt_batch):
         s_np = s.permute(1, 2, 0).numpy()
         t_np = t.permute(1, 2, 0).numpy()
-        rows.append(torch.from_numpy(
-            exposure.match_histograms(s_np, t_np)).permute(2, 0, 1))
+        m    = _hist_match_np(s_np, t_np)
+        rows.append(torch.from_numpy(m).permute(2, 0, 1))
     return torch.stack(rows, dim=0).float()
 
 
+def _fda(src, tgt, L=FDA_L):
+    fs   = torch.fft.rfft2(src, dim=(-2, -1))
+    ft   = torch.fft.rfft2(tgt, dim=(-2, -1))
+    as_  = torch.abs(fs)
+    ps   = torch.angle(fs)
+    at   = torch.abs(ft)
+    _, _, h, w = as_.shape
+    b    = int(np.floor(0.5 * min(h, w * 2) * L))
+    if b > 0:
+        as_[:, :, :b,      :b] = at[:, :, :b,      :b]
+        as_[:, :, h-b+1:h, :b] = at[:, :, h-b+1:h, :b]
+    rec = torch.fft.irfft2(
+        torch.complex(torch.cos(ps) * as_, torch.sin(ps) * as_),
+        dim=(-2, -1), s=[h, w * 2])
+    return rec[..., :src.shape[-2], :src.shape[-1]]
+
+
 def make_2ch(src, tgt):
-    """[hist-matched | FDA-transferred]  → 2-channel input tensor"""
+    """[hist-matched | FDA-transferred] → 2-channel input tensor"""
     return torch.cat([_hist(src, tgt), _fda(src, tgt)], dim=1)
 
 
@@ -442,8 +485,8 @@ def make_2ch_identity(x):
 def compute_eer(ins, outs):
     if ins.mean() < outs.mean():
         ins, outs = -ins, -outs
-    y  = np.concatenate([np.ones(len(ins)), np.zeros(len(outs))])
-    sc = np.concatenate([ins, outs])
+    y   = np.concatenate([np.ones(len(ins)), np.zeros(len(outs))])
+    sc  = np.concatenate([ins, outs])
     fpr, tpr, _ = metrics.roc_curve(y, sc, pos_label=1)
     roc_auc     = auc(fpr, tpr)
     eer = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
@@ -474,7 +517,7 @@ def evaluate(model, tr_loader, te_loader, tag, out_dir):
             s.append(dis)
             l.append(1 if id_te[i] == id_tr[j] else -1)
 
-    s, l = np.array(s), np.array(l)
+    s, l  = np.array(s), np.array(l)
     ins   = 1. - s[l ==  1]
     outs  = 1. - s[l == -1]
     eer, roc_auc = compute_eer(ins, outs)
@@ -506,7 +549,7 @@ def evaluate(model, tr_loader, te_loader, tag, out_dir):
 
 
 # ============================================================
-# TRAINING LOOP  (mirrors train_cc20.py → fit())
+# TRAINING LOOP
 # ============================================================
 
 def fit_epoch(epoch, model, src_loader, tgt_iter_ref,
@@ -518,7 +561,7 @@ def fit_epoch(epoch, model, src_loader, tgt_iter_ref,
         try:
             (tgt1, _), _ = next(tgt_iter_ref[0])
         except StopIteration:
-            tgt_iter_ref[0] = iter(tgt_iter_ref[1])   # reset
+            tgt_iter_ref[0] = iter(tgt_iter_ref[1])
             (tgt1, _), _   = next(tgt_iter_ref[0])
 
         targets = targets.to(device)
@@ -531,8 +574,8 @@ def fit_epoch(epoch, model, src_loader, tgt_iter_ref,
         out2, fe2 = model(data_con, targets)
         fe        = torch.stack([fe1, fe2], dim=1)
 
-        ce  = criterion(out1, targets) + criterion(out2, targets)
-        con = con_crit(fe, targets)
+        ce   = criterion(out1, targets) + criterion(out2, targets)
+        con  = con_crit(fe, targets)
         loss = WEIGHT_CE * ce + WEIGHT_CON * con
 
         loss.backward()
@@ -568,7 +611,7 @@ def main():
     print("\n[2] Building dataloaders ...")
     train_ds  = PalmDataset(train_list, train=True)
     test_ds   = PalmDataset(test_list,  train=False)
-    target_ds = PalmDataset(test_list,  train=True)   # target domain (unlabelled)
+    target_ds = PalmDataset(test_list,  train=True)
 
     kw = dict(num_workers=4, pin_memory=True)
     train_loader  = DataLoader(train_ds,  batch_size=BATCH_SIZE, shuffle=True,
@@ -589,9 +632,9 @@ def main():
 
     # ── 4. Training ──────────────────────────────────────────
     print("\n[4] Training ...")
-    best_acc          = 0.
+    best_acc            = 0.
     loss_hist, acc_hist = [], []
-    tgt_iter_ref      = [iter(target_loader), target_loader]   # mutable ref
+    tgt_iter_ref        = [iter(target_loader), target_loader]
 
     for epoch in range(EPOCH_NUM):
         loss, acc = fit_epoch(epoch, net, train_loader, tgt_iter_ref,
