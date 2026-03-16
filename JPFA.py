@@ -18,13 +18,24 @@ PIXEL_METHOD = "cyclegan"  — Phase 1 trains a CycleGAN (Eq. 4-6),
                              repo. This is implemented from the paper only.
 
 PIXEL_METHOD = "palmrss"   — Replaces CycleGAN with FAT + HM on-the-fly
-                             (same alignment used in PalmRSS / PalmRSS paper).
-                             No pre-training needed. Faster but less accurate
-                             pixel alignment.
+                             (same alignment used in PalmRSS paper).
+                             No pre-training needed. Faster but less
+                             accurate pixel alignment.
 
 PHASE 2 (feature-level) is identical in both cases and is directly
 translated from the provided GitHub repo (train.py, H_loss.py, M_loss.py,
 VGG16_net.py).
+
+FIXES APPLIED
+-------------
+[F1] BNNoScale: BatchNorm without learnable scale (gamma=1, fixed)
+     matches VGG16_net.py which uses tf.nn.batch_normalization with
+     scale=None. Reduces trainable params from ~284M to ~270M.
+
+[F2] Epoch tracking: every print shows both step and equivalent epoch.
+
+[F3] Print table includes: step, epoch, train-loss, train-acc,
+     train-EER, target-Rank1, target-EER, time.
 """
 
 import os, math, time, copy, itertools
@@ -64,26 +75,25 @@ TARGET_SPECTRA   = ["700", "850"]
 
 # ──────────────────────────────────────────────────────────────
 # PIXEL ALIGNMENT TOGGLE
-#   "cyclegan" : CycleGAN (paper, Eq. 4-6). Pre-generates fake
-#                images once, then reuses them in Phase 2.
-#   "palmrss"  : FAT + HM on-the-fly (no pre-training needed).
+#   "cyclegan" : CycleGAN (paper, Eq. 4-6)
+#   "palmrss"  : FAT + HM on-the-fly (no pre-training needed)
 # ──────────────────────────────────────────────────────────────
 PIXEL_METHOD     = "palmrss"   # <-- change to "cyclegan" or "palmrss"
 
 # --- CycleGAN settings (used only when PIXEL_METHOD="cyclegan") ---
 CYC_EPOCHS       = 200
 CYC_LR           = 0.0002
-CYC_LAMBDA_CYC   = 10.0     # cycle-consistency weight
-CYC_LAMBDA_ID    = 1.0      # identity loss weight (Eq. 5)
+CYC_LAMBDA_CYC   = 10.0
+CYC_LAMBDA_ID    = 1.0
 CYC_BATCH        = 4
-CYC_DECAY_EPOCH  = 100      # epoch to start LR linear decay
-N_RESIDUALS      = 9        # ResNet blocks (9 for ≥256px input)
-GAN_IMG_SIZE     = 128      # resize for CycleGAN (saves GPU memory)
+CYC_DECAY_EPOCH  = 100
+N_RESIDUALS      = 9
+GAN_IMG_SIZE     = 128
 
 # --- PalmRSS alignment settings (used only when PIXEL_METHOD="palmrss") ---
-BETA_FAT         = 0.1      # low-frequency swap ratio β (Eq. 5 PalmRSS)
+BETA_FAT         = 0.1
 
-# --- JPFA Phase 2 (from train.py — identical for both methods) ---
+# --- JPFA Phase 2 (from train.py) ---
 HASH_DIM         = 128
 FC_DIMS          = [4096, 4096, 2048, 128]
 MARGIN           = 180
@@ -98,8 +108,8 @@ JPFA_LR_DECAY    = 0.96
 VGG_IMG_SIZE     = 224
 
 # --- Logging ---
-PRINT_INTERVAL   = 500
-EVAL_INTERVAL    = 2000
+PRINT_INTERVAL   = 500    # print every N steps
+EVAL_INTERVAL    = 2000   # full target evaluation every N steps
 
 # ============================================================
 # (nothing to edit below)
@@ -131,12 +141,6 @@ def parse_filename(fname):
 
 
 def build_lists(data_root, source_spectrum, target_spectra):
-    """
-    D1 = iter 01-03  (first half,  used as first session)
-    D2 = iter 04-06  (second half, used as second session)
-    D0 = D1 ∪ D2    (all source images, used as gallery)
-    Dt = all target spectrum images (unlabeled at train time)
-    """
     exts  = {".jpg", ".jpeg", ".png"}
     files = sorted(f for f in os.listdir(data_root)
                    if os.path.splitext(f)[1].lower() in exts)
@@ -212,7 +216,6 @@ def write_txt(lst, path):
 # ============================================================
 
 class PalmDatasetCycleGAN(Dataset):
-    """Single-domain dataset for CycleGAN (returns [-1,1] images)."""
     def __init__(self, samples):
         self.samples = samples
         self.tf = transforms.Compose([
@@ -233,7 +236,6 @@ class PalmDatasetCycleGAN(Dataset):
 
 
 class PalmDatasetJPFA(Dataset):
-    """VGG16-normalised dataset for JPFA Phase 2."""
     def __init__(self, samples, augment=False):
         self.samples = samples
         self.labels  = [s[1] for s in samples]
@@ -265,11 +267,6 @@ class PalmDatasetJPFA(Dataset):
 
 
 class FakeDatasetCycleGAN(Dataset):
-    """
-    Loads pre-generated fake images saved by CycleGAN phase.
-    Falls back to original source image if fake not found.
-    Only used when PIXEL_METHOD = "cyclegan".
-    """
     def __init__(self, fake_dir, source_samples):
         self.samples = []
         n_missing = 0
@@ -302,11 +299,7 @@ class FakeDatasetCycleGAN(Dataset):
 
 
 # ============================================================
-# 3A.  PIXEL ALIGNMENT — CycleGAN  (PIXEL_METHOD = "cyclegan")
-#      Generates fake images once and saves them to disk.
-#      Paper: Section III-B, Eq. 4-6
-#      NOTE: CycleGAN code is NOT in the provided GitHub repo.
-#            This implementation follows the paper description only.
+# 3A.  CYCLEGAN  (PIXEL_METHOD = "cyclegan")
 # ============================================================
 
 class ResidualBlock(nn.Module):
@@ -326,7 +319,6 @@ class ResidualBlock(nn.Module):
 
 
 class CycleGenerator(nn.Module):
-    """ResNet-based generator (N_RESIDUALS=9 for 224px+ input)."""
     def __init__(self, in_ch=3, out_ch=3, n_res=N_RESIDUALS, ngf=64):
         super().__init__()
         layers = [
@@ -359,7 +351,6 @@ class CycleGenerator(nn.Module):
 
 
 class CycleDiscriminator(nn.Module):
-    """PatchGAN discriminator."""
     def __init__(self, in_ch=3, ndf=64):
         super().__init__()
         def blk(ic, oc, stride=2, norm=True):
@@ -381,7 +372,6 @@ class CycleDiscriminator(nn.Module):
 
 
 class ImageBuffer:
-    """50-image replay buffer to stabilise GAN training."""
     def __init__(self, max_size=50):
         self.max_size = max_size; self.data = []
 
@@ -416,15 +406,10 @@ def linear_decay(epoch, n_epochs, decay_start):
 
 
 def run_cyclegan(src_list, tgt_list, fake_dir):
-    """
-    Train CycleGAN and save fake (target-style) source images.
-    Skipped automatically if G_S2T.pth already exists.
-    """
     print("\n" + "="*60)
-    print("  PHASE 1 — CycleGAN pixel-level alignment (paper Eq. 4-6)")
+    print("  PHASE 1 — CycleGAN pixel-level alignment (Eq. 4-6)")
     print(f"  Epochs: {CYC_EPOCHS}  |  Batch: {CYC_BATCH}")
-    print("  NOTE: CycleGAN is NOT in the provided GitHub repo.")
-    print("        Implemented from paper description only.")
+    print("  NOTE: Not in GitHub repo — from paper description only.")
     print("="*60 + "\n")
 
     src_ds = PalmDatasetCycleGAN(src_list)
@@ -443,22 +428,18 @@ def run_cyclegan(src_list, tgt_list, fake_dir):
     for net in [G_S2T, G_T2S, D_S, D_T]:
         net.apply(weights_init)
 
-    # Lightweight identity-loss feature extractor (VGG16 pool1)
-    vgg_tmp = models.vgg16(
-        weights=models.VGG16_Weights.IMAGENET1K_V1)
+    vgg_tmp = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
     id_feat = nn.Sequential(
         *list(vgg_tmp.features.children())[:5]).to(device)
     for p in id_feat.parameters():
         p.requires_grad = False
     id_feat.eval()
 
-    opt_G   = optim.Adam(
+    opt_G  = optim.Adam(
         itertools.chain(G_S2T.parameters(), G_T2S.parameters()),
         lr=CYC_LR, betas=(0.5, 0.999))
-    opt_DS  = optim.Adam(D_S.parameters(),
-                         lr=CYC_LR, betas=(0.5, 0.999))
-    opt_DT  = optim.Adam(D_T.parameters(),
-                         lr=CYC_LR, betas=(0.5, 0.999))
+    opt_DS = optim.Adam(D_S.parameters(), lr=CYC_LR, betas=(0.5, 0.999))
+    opt_DT = optim.Adam(D_T.parameters(), lr=CYC_LR, betas=(0.5, 0.999))
 
     sch_G  = optim.lr_scheduler.LambdaLR(opt_G,
         lr_lambda=lambda e: linear_decay(e, CYC_EPOCHS, CYC_DECAY_EPOCH))
@@ -467,9 +448,9 @@ def run_cyclegan(src_list, tgt_list, fake_dir):
     sch_DT = optim.lr_scheduler.LambdaLR(opt_DT,
         lr_lambda=lambda e: linear_decay(e, CYC_EPOCHS, CYC_DECAY_EPOCH))
 
-    crit_GAN = nn.MSELoss()   # LSGAN
+    crit_GAN = nn.MSELoss()
     crit_cyc = nn.L1Loss()
-    crit_id  = nn.MSELoss()   # Euclidean for identity loss (Eq. 5)
+    crit_id  = nn.MSELoss()
 
     buf_S = ImageBuffer(); buf_T = ImageBuffer()
     mean_ = torch.tensor([0.485,0.456,0.406],
@@ -482,11 +463,10 @@ def run_cyclegan(src_list, tgt_list, fake_dir):
         f.write("epoch,loss_G,loss_DS,loss_DT\n")
 
     for epoch in range(1, CYC_EPOCHS + 1):
-        G_S2T.train(); G_T2S.train()
-        D_S.train(); D_T.train()
+        G_S2T.train(); G_T2S.train(); D_S.train(); D_T.train()
         eg = eds = edt = 0.; nb = 0
-
         tgt_it = iter(tgt_loader)
+
         for src_imgs, _, _ in src_loader:
             try:
                 tgt_imgs, _, _ = next(tgt_it)
@@ -501,23 +481,19 @@ def run_cyclegan(src_list, tgt_list, fake_dir):
             rl = torch.ones (bs, 1, *patch, device=device)
             fl = torch.zeros(bs, 1, *patch, device=device)
 
-            # Generator step
             opt_G.zero_grad()
             fake_T = G_S2T(real_S); fake_S = G_T2S(real_T)
             rec_S  = G_T2S(fake_T); rec_T  = G_S2T(fake_S)
 
-            l_gan  = (crit_GAN(D_T(fake_T), rl)
-                      + crit_GAN(D_S(fake_S), rl))
-            l_cyc  = (crit_cyc(rec_S, real_S)
-                      + crit_cyc(rec_T, real_T)) * CYC_LAMBDA_CYC
+            l_gan = (crit_GAN(D_T(fake_T), rl)
+                     + crit_GAN(D_S(fake_S), rl))
+            l_cyc = (crit_cyc(rec_S, real_S)
+                     + crit_cyc(rec_T, real_T)) * CYC_LAMBDA_CYC
 
-            # Identity loss (Eq. 5): VGG features of src vs fake_T
-            rs_n = (F.interpolate(real_S, 224,
-                                  mode='bilinear',
+            rs_n = (F.interpolate(real_S, 224, mode='bilinear',
                                   align_corners=False) * 0.5
                     + 0.5 - mean_) / std_
-            ft_n = (F.interpolate(fake_T, 224,
-                                  mode='bilinear',
+            ft_n = (F.interpolate(fake_T, 224, mode='bilinear',
                                   align_corners=False) * 0.5
                     + 0.5 - mean_) / std_
             l_id = crit_id(id_feat(rs_n).flatten(1),
@@ -526,16 +502,14 @@ def run_cyclegan(src_list, tgt_list, fake_dir):
             loss_G = l_gan + l_cyc + l_id
             loss_G.backward(); opt_G.step()
 
-            # Discriminator D_T
             opt_DT.zero_grad()
-            ft_buf = buf_T.push_and_pop(fake_T.detach())
+            ft_buf  = buf_T.push_and_pop(fake_T.detach())
             loss_DT = (crit_GAN(D_T(real_T), rl)
                        + crit_GAN(D_T(ft_buf), fl)) * 0.5
             loss_DT.backward(); opt_DT.step()
 
-            # Discriminator D_S
             opt_DS.zero_grad()
-            fs_buf = buf_S.push_and_pop(fake_S.detach())
+            fs_buf  = buf_S.push_and_pop(fake_S.detach())
             loss_DS = (crit_GAN(D_S(real_S), rl)
                        + crit_GAN(D_S(fs_buf), fl)) * 0.5
             loss_DS.backward(); opt_DS.step()
@@ -544,24 +518,21 @@ def run_cyclegan(src_list, tgt_list, fake_dir):
             edt += loss_DT.item(); nb += 1
 
         sch_G.step(); sch_DS.step(); sch_DT.step()
-        avg_G = eg/nb; avg_DS = eds/nb; avg_DT = edt/nb
 
         if epoch % 10 == 0 or epoch == 1:
             print(f"  Epoch {epoch:3d}/{CYC_EPOCHS}  "
-                  f"G={avg_G:.4f}  DS={avg_DS:.4f}  "
-                  f"DT={avg_DT:.4f}")
+                  f"G={eg/nb:.4f}  DS={eds/nb:.4f}  "
+                  f"DT={edt/nb:.4f}")
 
         with open(cyc_log, "a") as f:
-            f.write(f"{epoch},{avg_G:.5f},"
-                    f"{avg_DS:.5f},{avg_DT:.5f}\n")
+            f.write(f"{epoch},{eg/nb:.5f},"
+                    f"{eds/nb:.5f},{edt/nb:.5f}\n")
 
-    # Save generators
     torch.save(G_S2T.state_dict(),
                os.path.join(OUTPUT_DIR, "cyclegan", "G_S2T.pth"))
     torch.save(G_T2S.state_dict(),
                os.path.join(OUTPUT_DIR, "cyclegan", "G_T2S.pth"))
 
-    # Generate and save fake images
     print(f"\n  Generating fake images → {fake_dir}")
     G_S2T.eval()
     gen_tf = transforms.Compose([
@@ -572,30 +543,23 @@ def run_cyclegan(src_list, tgt_list, fake_dir):
         transforms.Normalize([0.5]*3, [0.5]*3),
     ])
     to_pil = transforms.ToPILImage()
-    n_saved = 0
     with torch.no_grad():
         for path, _ in src_list:
             img_t = gen_tf(
                 Image.open(path).convert("L")
             ).unsqueeze(0).to(device)
-            fake_t = G_S2T(img_t).squeeze(0).cpu()
-            fake_t = (fake_t * 0.5 + 0.5).clamp(0., 1.)
-            out_path = os.path.join(fake_dir,
-                                    os.path.basename(path))
-            to_pil(fake_t).convert("RGB").save(out_path)
-            n_saved += 1
-    print(f"  Saved {n_saved} fake images.")
+            fake_t = (G_S2T(img_t).squeeze(0).cpu() * 0.5 + 0.5).clamp(0., 1.)
+            to_pil(fake_t).convert("RGB").save(
+                os.path.join(fake_dir, os.path.basename(path)))
+    print(f"  Saved {len(src_list)} fake images.")
 
 
 # ============================================================
-# 3B.  PIXEL ALIGNMENT — PalmRSS  (PIXEL_METHOD = "palmrss")
-#      FAT + HM applied on-the-fly every training batch.
-#      No pre-training or disk storage needed.
+# 3B.  PALMRSS ALIGNMENT  (PIXEL_METHOD = "palmrss")
 # ============================================================
 
 def _hist_match_np(src: np.ndarray,
                    tgt: np.ndarray) -> np.ndarray:
-    """CDF-based histogram matching (NumPy-only)."""
     matched = np.empty_like(src)
     for c in range(src.shape[2]):
         s = src[..., c].ravel().astype(np.float64)
@@ -616,13 +580,11 @@ def _hist_match_np(src: np.ndarray,
         t_idx   = np.searchsorted(t_cdf, s_cdf).clip(0, bins - 1)
         lut     = centers[t_idx] * (s_max - s_min) + s_min
         pb      = np.searchsorted(edges[1:], s_n).clip(0, bins - 1)
-        matched[..., c] = (lut[pb].reshape(src.shape[:2])
-                           .astype(np.float32))
+        matched[..., c] = lut[pb].reshape(src.shape[:2]).astype(np.float32)
     return matched.astype(np.float32)
 
 
 def hm_batch(src_batch, tgt_batch):
-    """Histogram matching on CPU tensors [B,C,H,W]."""
     rows = []
     for s, t in zip(src_batch, tgt_batch):
         s_np = s.permute(1, 2, 0).numpy()
@@ -633,7 +595,6 @@ def hm_batch(src_batch, tgt_batch):
 
 
 def fat_batch(src, tgt, beta=BETA_FAT):
-    """Fourier Alignment Transform on CPU tensors [B,C,H,W]."""
     fs  = torch.fft.rfft2(src, dim=(-2, -1))
     ft  = torch.fft.rfft2(tgt, dim=(-2, -1))
     as_ = torch.abs(fs).clone(); ps = torch.angle(fs)
@@ -651,54 +612,91 @@ def fat_batch(src, tgt, beta=BETA_FAT):
 
 
 def make_fake_palmrss(src_cpu, tgt_cpu):
-    """
-    PalmRSS alignment: F_cat = average(FAT, HM).
-    src_cpu, tgt_cpu: CPU tensors [B, C, H, W].
-    Returns fake [B, C, H, W] on CPU.
-    """
     return (fat_batch(src_cpu, tgt_cpu) + hm_batch(src_cpu, tgt_cpu)) / 2.
 
 
 # ============================================================
-# 4.  VGG16 FEATURE EXTRACTOR  (from VGG16_net.py)
+# 4.  VGG16 FEATURE EXTRACTOR  (VGG16_net.py)
+#
+# [F1] BNNoScale: BatchNorm without learnable scale (gamma=1, fixed)
+#      Matches VGG16_net.py: tf.nn.batch_normalization(..., None, ...)
+#      where the scale parameter is None (not learned).
+#      Difference vs standard PyTorch BN: weight.requires_grad = False
 # ============================================================
 
+class BNNoScale(nn.Module):
+    """
+    BatchNorm with fixed scale (gamma=1, not learned).
+    Matches TF code: tf.nn.batch_normalization(x, mean, var, bias, None, eps)
+    where None means scale is not applied / fixed at 1.
+    Bias (beta) is still learned as in the TF code.
+    """
+    def __init__(self, num_features):
+        super().__init__()
+        self.bn = nn.BatchNorm2d(num_features, affine=True)
+        nn.init.ones_(self.bn.weight)
+        self.bn.weight.requires_grad = False   # freeze gamma = 1
+
+    def forward(self, x):
+        return self.bn(x)
+
+
+class BNNoScale1d(nn.Module):
+    """Same as BNNoScale but for 1D (FC layers)."""
+    def __init__(self, num_features):
+        super().__init__()
+        self.bn = nn.BatchNorm1d(num_features, affine=True)
+        nn.init.ones_(self.bn.weight)
+        self.bn.weight.requires_grad = False   # freeze gamma = 1
+
+    def forward(self, x):
+        return self.bn(x)
+
+
 class FeatureExtractor(nn.Module):
+    """
+    Matches VGG16_net.py:
+      Map(): VGG pool4 (frozen) → 3×Conv(512,512,3)+BNNoScale+ReLU → MaxPool
+      FC() : flatten → 4096 → 4096 → 2048 → 128 (tanh)
+             each FC uses BNNoScale1d + ReLU + Dropout(0.5)
+
+    Spatial flow for 224×224 input:
+      backbone[:24] → 14×14×512  (pool4, frozen)
+      extra_conv    →  7×7×512   (3 convs + 1 maxpool)
+      flatten       → 25088
+      fc            → 4096 → 4096 → 2048 → 128 (tanh)
+    """
     def __init__(self):
         super().__init__()
         vgg16 = models.vgg16(
             weights=models.VGG16_Weights.IMAGENET1K_V1)
 
-        # Frozen backbone: features[:24] → pool4 output = 14×14×512
+        # Frozen Batch1-4 up to pool4 output (14×14×512)
         self.backbone = nn.Sequential(
             *list(vgg16.features.children())[:24])
         for p in self.backbone.parameters():
             p.requires_grad = False
 
-        # NO batch5 here — Map() in VGG16_net.py starts from pool4
-        # directly, it does NOT use VGG's pool5
-
-        # Extra conv layers from Map() in VGG16_net.py:
-        # 3 × Conv(512→512, 3×3, pad=1) + MaxPool
-        # 14×14×512 → 14×14×512 → 7×7×512 = 25088
+        # Map() — 3 conv layers + maxpool starting from pool4
+        # Uses BNNoScale to match TF: scale=None in batch_normalization
         self.extra_conv = nn.Sequential(
             nn.Conv2d(512, 512, 3, 1, 1),
-            nn.BatchNorm2d(512), nn.ReLU(True),
+            BNNoScale(512), nn.ReLU(True),
             nn.Conv2d(512, 512, 3, 1, 1),
-            nn.BatchNorm2d(512), nn.ReLU(True),
+            BNNoScale(512), nn.ReLU(True),
             nn.Conv2d(512, 512, 3, 1, 1),
-            nn.BatchNorm2d(512), nn.ReLU(True),
-            nn.MaxPool2d(2, 2),   # 14×14 → 7×7
+            BNNoScale(512), nn.ReLU(True),
+            nn.MaxPool2d(2, 2),         # 14×14 → 7×7
         )
 
-        # FC: 7×7×512=25088 → 4096 → 4096 → 2048 → 128 (tanh)
+        # FC() — uses BNNoScale1d to match TF: scale=None
         self.fc = nn.Sequential(
             nn.Linear(512 * 7 * 7, FC_DIMS[0]),
-            nn.BatchNorm1d(FC_DIMS[0]), nn.ReLU(True), nn.Dropout(0.5),
+            BNNoScale1d(FC_DIMS[0]), nn.ReLU(True), nn.Dropout(0.5),
             nn.Linear(FC_DIMS[0], FC_DIMS[1]),
-            nn.BatchNorm1d(FC_DIMS[1]), nn.ReLU(True), nn.Dropout(0.5),
+            BNNoScale1d(FC_DIMS[1]), nn.ReLU(True), nn.Dropout(0.5),
             nn.Linear(FC_DIMS[1], FC_DIMS[2]),
-            nn.BatchNorm1d(FC_DIMS[2]), nn.ReLU(True), nn.Dropout(0.5),
+            BNNoScale1d(FC_DIMS[2]), nn.ReLU(True), nn.Dropout(0.5),
             nn.Linear(FC_DIMS[2], FC_DIMS[3]),
             nn.Tanh(),
         )
@@ -707,11 +705,11 @@ class FeatureExtractor(nn.Module):
         with torch.no_grad():
             x = self.backbone(x)    # frozen → 14×14×512
         x = self.extra_conv(x)      # → 7×7×512
-        return self.fc(x.flatten(1))  # → 128
+        return self.fc(x.flatten(1))  # → 128 tanh codes
 
 
 # ============================================================
-# 5.  JPFA LOSSES  (H_loss.py, M_loss.py, train.py — unchanged)
+# 5.  JPFA LOSSES  (H_loss.py, M_loss.py, train.py)
 # ============================================================
 
 def hashing_loss(feature, label_onehot):
@@ -724,16 +722,15 @@ def hashing_loss(feature, label_onehot):
         b2 = (B**2).sum(1, keepdim=True)
         return (a2 + b2.T - 2 * A @ B.T).clamp(min=0.)
 
-    aa_d  = euclid(a_code, a_code); as_d = euclid(a_code, s_code)
-    aa_s  = (a_lbl @ a_lbl.T > 0).float()
-    as_s  = (a_lbl @ s_lbl.T  > 0).float()
+    aa_d = euclid(a_code, a_code); as_d = euclid(a_code, s_code)
+    aa_s = (a_lbl @ a_lbl.T > 0).float()
+    as_s = (a_lbl @ s_lbl.T  > 0).float()
 
     l_hash = (
         (0.5*aa_s*aa_d + 0.5*(1-aa_s)*F.relu(MARGIN-aa_d)).mean()
         + (0.5*as_s*as_d + 0.5*(1-as_s)*F.relu(MARGIN-as_d)).mean()
     )
-    q_loss = ((feature.abs() - 1.)**2).mean()
-    return l_hash + ALPHA_Q * q_loss
+    return l_hash + ALPHA_Q * ((feature.abs() - 1.)**2).mean()
 
 
 def mkmmd_loss(X, Y):
@@ -743,9 +740,9 @@ def mkmmd_loss(X, Y):
     K_XX = K_XY = K_YY = 0.
     for sigma in MMD_BANDWIDTHS:
         g = 1. / (2 * sigma**2)
-        K_XX = K_XX + torch.exp(-g*(x2.unsqueeze(1)+x2.unsqueeze(0)-2*XX))
-        K_XY = K_XY + torch.exp(-g*(x2.unsqueeze(1)+y2.unsqueeze(0)-2*XY))
-        K_YY = K_YY + torch.exp(-g*(y2.unsqueeze(1)+y2.unsqueeze(0)-2*YY))
+        K_XX += torch.exp(-g*(x2.unsqueeze(1)+x2.unsqueeze(0)-2*XX))
+        K_XY += torch.exp(-g*(x2.unsqueeze(1)+y2.unsqueeze(0)-2*XY))
+        K_YY += torch.exp(-g*(y2.unsqueeze(1)+y2.unsqueeze(0)-2*YY))
     n = float(X.size(0)); m = float(Y.size(0))
     mmd2 = K_XX.sum()/(n*n) + K_YY.sum()/(m*m) - 2*K_XY.sum()/(n*m)
     return torch.sqrt(mmd2.clamp(min=1e-8))
@@ -783,50 +780,75 @@ def extract_codes(model, loader):
 
 
 def hamming_sim(A, B):
-    """Hamming similarity in [-1,1] for codes in {-1,+1}."""
     return (A @ B.T) / A.shape[1]
 
 
-def evaluate(fs_model, ff_model, src_loader, tgt_loader,
-             tag, out_dir):
-    """Gallery=D0 (source). Probe=Dt. Best of FS/FF/avg reported."""
-    print(f"\n{'='*60}")
+def compute_metrics(gc, g_id, pc, p_id):
+    """Rank-1 and EER from gallery codes gc and probe codes pc."""
+    sim   = hamming_sim(pc, gc)
+    preds = g_id[sim.argmax(axis=1)]
+    rank1 = 100. * (preds == p_id).mean()
+
+    n_g = len(g_id)
+    s   = sim.ravel()
+    l   = np.where(
+        np.tile(g_id, len(p_id)) == np.repeat(p_id, n_g), 1, -1)
+    ins  = s[l ==  1]; outs = s[l == -1]
+    eer, roc_auc = compute_eer(ins, outs)
+    return rank1, eer, roc_auc
+
+
+def quick_eval(fs_model, ff_model, src_loader, tgt_loader):
+    """
+    Fast evaluation returning best-of-three (FS / FF / avg).
+    Returns: (best_rank1, best_eer, best_label)
+    """
+    gc_s, g_id = extract_codes(fs_model, src_loader)
+    gc_f, _    = extract_codes(ff_model, src_loader)
+    pc_s, p_id = extract_codes(fs_model, tgt_loader)
+    pc_f, _    = extract_codes(ff_model, tgt_loader)
+
+    best_eer = 100.; best_rank1 = 0.; best_lbl = ""
+    for gc, pc, lbl in [
+        (gc_s,           pc_s,           "FS"),
+        (gc_f,           pc_f,           "FF"),
+        ((gc_s+gc_f)/2., (pc_s+pc_f)/2., "avg"),
+    ]:
+        rank1, eer, _ = compute_metrics(gc, g_id, pc, p_id)
+        if eer < best_eer:
+            best_eer = eer; best_rank1 = rank1; best_lbl = lbl
+
+    return best_rank1, best_eer, best_lbl
+
+
+def full_evaluate(fs_model, ff_model, src_loader, tgt_loader,
+                  tag, out_dir):
+    """Full evaluation with per-extractor breakdown and file output."""
+    print(f"\n{'='*65}")
     print(f"  Evaluation : {tag}  [{PIXEL_METHOD.upper()}]")
     print(f"  Gallery=D0 (source)  |  Probe=Dt (target)")
-    print(f"{'='*60}")
+    print(f"{'='*65}")
 
     gc_s, g_id = extract_codes(fs_model, src_loader)
     gc_f, _    = extract_codes(ff_model, src_loader)
     pc_s, p_id = extract_codes(fs_model, tgt_loader)
     pc_f, _    = extract_codes(ff_model, tgt_loader)
 
-    best_eer = 100.; best_rank1 = 0.
-    best_auc = 0.;   best_lbl   = ""
-
+    best_eer = 100.; best_rank1 = 0.; best_lbl = ""
     for gc, pc, lbl in [
-        (gc_s, pc_s, "FS"),
-        (gc_f, pc_f, "FF"),
+        (gc_s,           pc_s,           "FS"),
+        (gc_f,           pc_f,           "FF"),
         ((gc_s+gc_f)/2., (pc_s+pc_f)/2., "avg"),
     ]:
-        sim   = hamming_sim(pc, gc)
-        preds = g_id[sim.argmax(axis=1)]
-        rank1 = 100. * (preds == p_id).mean()
-        n_g   = len(g_id)
-        s     = sim.ravel()
-        l     = np.where(
-            np.tile(g_id, len(p_id)) == np.repeat(p_id, n_g),
-            1, -1)
-        ins  = s[l ==  1]; outs = s[l == -1]
-        eer, roc_auc = compute_eer(ins, outs)
+        rank1, eer, roc_auc = compute_metrics(gc, g_id, pc, p_id)
         print(f"  {lbl:4s}  Rank-1={rank1:.3f}%  "
               f"EER={eer:.4f}%  AUC={roc_auc:.6f}")
         if eer < best_eer:
-            best_eer = eer; best_rank1 = rank1
-            best_auc = roc_auc; best_lbl = lbl
+            best_eer = eer; best_rank1 = rank1; best_lbl = lbl
 
     print(f"  Best ({best_lbl}): Rank-1={best_rank1:.3f}%  "
           f"EER={best_eer:.4f}%")
-    print(f"{'='*60}\n")
+    print(f"{'='*65}\n")
 
     ev_dir = os.path.join(out_dir, tag)
     os.makedirs(ev_dir, exist_ok=True)
@@ -834,8 +856,17 @@ def evaluate(fs_model, ff_model, src_loader, tgt_loader,
         f.write(f"Method : {PIXEL_METHOD}\n")
         f.write(f"EER    : {best_eer:.4f}%\n")
         f.write(f"Rank-1 : {best_rank1:.3f}%\n")
-        f.write(f"AUC    : {best_auc:.6f}\n")
     return best_eer, best_rank1
+
+
+def train_source_eval(fs_model, src_loader):
+    """
+    Training-set Rank-1 and EER (gallery = probe = source).
+    Uses FS only (source extractor), self-matching with leave-one-out.
+    """
+    gc, g_id = extract_codes(fs_model, src_loader)
+    rank1, eer, _ = compute_metrics(gc, g_id, gc, g_id)
+    return rank1, eer
 
 
 # ============================================================
@@ -849,34 +880,26 @@ def make_onehot(labels, num_classes):
 
 
 def train_jpfa(src_list, fake_dir, tgt_list, num_classes):
-    """
-    Phase 2: JPFA feature-level training.
-    Directly mirrors train.py from the GitHub repo.
-
-    When PIXEL_METHOD = "cyclegan":
-        fake images loaded from fake_dir (pre-generated).
-    When PIXEL_METHOD = "palmrss":
-        fake images generated on-the-fly via FAT+HM per batch.
-    """
-    print("\n" + "="*60)
+    print("\n" + "="*65)
     method_label = ("CycleGAN fake images"
                     if PIXEL_METHOD == "cyclegan"
                     else "PalmRSS on-the-fly (FAT+HM)")
     print(f"  PHASE 2 — JPFA feature-level training")
-    print(f"  Fake source : {method_label}")
-    print(f"  Steps: {JPFA_STEPS}  |  Batch: {BATCH_SIZE}")
-    print("="*60 + "\n")
+    print(f"  Fake source  : {method_label}")
+    print(f"  Steps        : {JPFA_STEPS}  (≈ "
+          f"{JPFA_STEPS / (len(src_list)//BATCH_SIZE):.0f} epochs)")
+    print(f"  Batch        : {BATCH_SIZE}  "
+          f"(steps/epoch ≈ {len(src_list)//BATCH_SIZE})")
+    print("="*65 + "\n")
 
-    # ── Datasets ─────────────────────────────────────────────
+    steps_per_epoch = max(1, len(src_list) // BATCH_SIZE)
+
     src_ds  = PalmDatasetJPFA(src_list, augment=True)
     tgt_ds  = PalmDatasetJPFA(tgt_list, augment=False)
 
     if PIXEL_METHOD == "cyclegan":
-        # Load pre-generated fake images from disk
         fake_ds = FakeDatasetCycleGAN(fake_dir, src_list)
     else:
-        # PalmRSS: fake generated on-the-fly from source+target pairs
-        # Use source dataset as placeholder — fake built in training loop
         fake_ds = PalmDatasetJPFA(src_list, augment=False)
 
     def inf_loader(ds, bs):
@@ -897,7 +920,6 @@ def train_jpfa(src_list, fake_dir, tgt_list, num_classes):
         PalmDatasetJPFA(tgt_list, augment=False),
         batch_size=64, shuffle=False, num_workers=2)
 
-    # ── Models ───────────────────────────────────────────────
     FS = FeatureExtractor().to(device)
     FF = FeatureExtractor().to(device)
     best_FS = copy.deepcopy(FS)
@@ -913,23 +935,30 @@ def train_jpfa(src_list, fake_dir, tgt_list, num_classes):
     print(f"  Trainable params: "
           f"{sum(p.numel() for p in trainable):,}")
 
-    header = (f"{'Step':>6}  {'Loss':>8}  {'SrcDHN':>8}  "
-              f"{'FkDHN':>8}  {'MMD_s':>7}  {'MMD_f':>7}  "
-              f"{'Consis':>7}  {'Rank1':>7}  {'EER':>7}  Time")
+    # ── [F3] Print header ────────────────────────────────────
+    # Columns: Step | Epoch | Loss | TrAcc | TrEER | TgtR1 | TgtEER | Time
+    header = (f"{'Step':>6}  {'Epoch':>6}  {'Loss':>8}  "
+              f"{'SrcDHN':>8}  {'FkDHN':>8}  "
+              f"{'TrAcc':>7}  {'TrEER':>7}  "
+              f"{'TgtR1':>7}  {'TgtEER':>7}  "
+              f"{'Time':>6}")
     sep = "-" * len(header)
     print(header); print(sep)
 
     log_path = os.path.join(OUTPUT_DIR,
                             f"jpfa_log_{PIXEL_METHOD}.csv")
     with open(log_path, "w") as f:
-        f.write("step,loss,src_dhn,fake_dhn,"
-                "mmd_s,mmd_f,consis,rank1,eer\n")
+        f.write("step,epoch,loss,src_dhn,fake_dhn,"
+                "tr_acc,tr_eer,tgt_rank1,tgt_eer\n")
 
     best_eer   = 100.
     loss_hist  = []
-    eer_hist   = []
-    rank1_hist = []
+    tr_eer_hist  = []; tr_acc_hist  = []
+    tgt_eer_hist = []; tgt_r1_hist  = []
     eval_steps = []
+
+    # Accumulators for running train accuracy between prints
+    run_corr = 0; run_total = 0
     t0 = time.time()
 
     for step in range(1, JPFA_STEPS + 1):
@@ -939,37 +968,27 @@ def train_jpfa(src_list, fake_dir, tgt_list, num_classes):
         tgt_imgs, _        = next(tgt_iter)
 
         if PIXEL_METHOD == "cyclegan":
-            # Load pre-generated fake images from disk
             fk_imgs, fk_lbls = next(fake_iter)
-            fk_imgs = fk_imgs.to(device)
+            fk_imgs     = fk_imgs.to(device)
             fk_lbls_dev = fk_lbls
         else:
-            # PalmRSS: generate fake on-the-fly from source→target
-            # next(fake_iter) gives us src_cpu with correct labels
             fk_raw, fk_lbls = next(fake_iter)
-            # tgt_cpu needed for alignment reference
-            fk_imgs = make_fake_palmrss(
-                fk_raw.cpu(),
-                tgt_imgs.cpu()
-            ).to(device)
+            fk_imgs     = make_fake_palmrss(
+                fk_raw.cpu(), tgt_imgs.cpu()).to(device)
             fk_lbls_dev = fk_lbls
 
         src_imgs = src_imgs.to(device)
         tgt_imgs = tgt_imgs.to(device)
-        src_oh   = make_onehot(src_lbls,     num_classes)
-        fk_oh    = make_onehot(fk_lbls_dev,  num_classes)
+        src_oh   = make_onehot(src_lbls,    num_classes)
+        fk_oh    = make_onehot(fk_lbls_dev, num_classes)
 
         optimizer.zero_grad()
 
-        # FS: source + target  (train.py lines 29-30)
         src_feat   = FS(src_imgs)
         tgt_feat_s = FS(tgt_imgs)
-
-        # FF: fake + target  (train.py lines 33-34)
         fake_feat  = FF(fk_imgs)
         tgt_feat_f = FF(tgt_imgs)
 
-        # Losses (train.py lines 37-44)
         src_dhn  = hashing_loss(src_feat,  src_oh)
         fake_dhn = hashing_loss(fake_feat, fk_oh)
 
@@ -982,7 +1001,6 @@ def train_jpfa(src_list, fake_dir, tgt_list, num_classes):
         mmd_f  = mkmmd_loss(tgt_feat_f, fake_feat)
         consis = consistency_loss(tgt_feat_s, tgt_feat_f)
 
-        # train.py line 44
         loss = (mmd_s + mmd_f
                 + src_dhn + fake_dhn + q_loss
                 + BETA_CONSIS * consis)
@@ -990,66 +1008,102 @@ def train_jpfa(src_list, fake_dir, tgt_list, num_classes):
         loss.backward(); optimizer.step(); scheduler.step()
         loss_hist.append(loss.item())
 
-        if step % PRINT_INTERVAL == 0:
-            elapsed = time.time() - t0
-            print(f"{step:>6}  {loss.item():>8.4f}  "
-                  f"{src_dhn.item():>8.4f}  "
-                  f"{fake_dhn.item():>8.4f}  "
-                  f"{mmd_s.item():>7.4f}  "
-                  f"{mmd_f.item():>7.4f}  "
-                  f"{consis.item():>7.4f}  "
-                  f"{'--':>7}  {'--':>7}  {elapsed:.0f}s")
-            t0 = time.time()
+        # Running training accuracy (Hamming Rank-1 on this batch)
+        with torch.no_grad():
+            src_codes = src_feat.sign().cpu().numpy()
+            src_ids   = src_lbls.numpy()
+            sim_self  = hamming_sim(src_codes, src_codes)
+            # Exclude self-match (diagonal) by setting to -inf
+            np.fill_diagonal(sim_self, -np.inf)
+            nn_preds  = src_ids[sim_self.argmax(axis=1)]
+            run_corr  += (nn_preds == src_ids).sum()
+            run_total += len(src_ids)
 
-        if step % EVAL_INTERVAL == 0:
-            eer, rank1 = evaluate(
-                FS, FF, eval_src, eval_tgt,
-                f"step_{step:05d}_{PIXEL_METHOD}", OUTPUT_DIR)
-            eer_hist.append(eer); rank1_hist.append(rank1)
+        # ── [F2] Print every PRINT_INTERVAL steps ────────────
+        if step % PRINT_INTERVAL == 0:
+            epoch   = step / steps_per_epoch
+            elapsed = time.time() - t0
+
+            # Training accuracy from accumulated batch stats
+            tr_acc_running = 100. * run_corr / run_total
+            run_corr = 0; run_total = 0   # reset accumulator
+
+            # Training EER on full source set
+            tr_rank1, tr_eer = train_source_eval(FS, eval_src)
+
+            # Target evaluation (quick)
+            tgt_rank1, tgt_eer, _ = quick_eval(
+                FS, FF, eval_src, eval_tgt)
+
+            print(f"{step:>6}  {epoch:>6.1f}  {loss.item():>8.4f}  "
+                  f"{src_dhn.item():>8.4f}  {fake_dhn.item():>8.4f}  "
+                  f"{tr_acc_running:>6.2f}%  {tr_eer:>6.2f}%  "
+                  f"{tgt_rank1:>6.2f}%  {tgt_eer:>6.2f}%  "
+                  f"{elapsed:>5.0f}s  [{time.strftime('%H:%M:%S')}]")
+
+            tr_eer_hist.append(tr_eer)
+            tr_acc_hist.append(tr_acc_running)
+            tgt_eer_hist.append(tgt_eer)
+            tgt_r1_hist.append(tgt_rank1)
             eval_steps.append(step)
 
             with open(log_path, "a") as f:
-                f.write(f"{step},{loss.item():.5f},"
-                        f"{src_dhn.item():.5f},"
-                        f"{fake_dhn.item():.5f},"
-                        f"{mmd_s.item():.5f},"
-                        f"{mmd_f.item():.5f},"
-                        f"{consis.item():.5f},"
-                        f"{rank1:.4f},{eer:.4f}\n")
+                f.write(f"{step},{epoch:.2f},{loss.item():.5f},"
+                        f"{src_dhn.item():.5f},{fake_dhn.item():.5f},"
+                        f"{tr_acc_running:.4f},{tr_eer:.4f},"
+                        f"{tgt_rank1:.4f},{tgt_eer:.4f}\n")
+
+            t0 = time.time()
+
+        # ── Full evaluation at EVAL_INTERVAL ─────────────────
+        if step % EVAL_INTERVAL == 0:
+            eer, rank1 = full_evaluate(
+                FS, FF, eval_src, eval_tgt,
+                f"step_{step:05d}_{PIXEL_METHOD}", OUTPUT_DIR)
 
             if eer < best_eer:
                 best_eer = eer
-                torch.save(FS.state_dict(),
-                           os.path.join(OUTPUT_DIR,
-                               f"best_FS_{PIXEL_METHOD}.pth"))
-                torch.save(FF.state_dict(),
-                           os.path.join(OUTPUT_DIR,
-                               f"best_FF_{PIXEL_METHOD}.pth"))
-                best_FS.load_state_dict(
-                    copy.deepcopy(FS.state_dict()))
-                best_FF.load_state_dict(
-                    copy.deepcopy(FF.state_dict()))
+                torch.save(FS.state_dict(), os.path.join(
+                    OUTPUT_DIR, f"best_FS_{PIXEL_METHOD}.pth"))
+                torch.save(FF.state_dict(), os.path.join(
+                    OUTPUT_DIR, f"best_FF_{PIXEL_METHOD}.pth"))
+                best_FS.load_state_dict(copy.deepcopy(FS.state_dict()))
+                best_FF.load_state_dict(copy.deepcopy(FF.state_dict()))
                 print(f"  >>> Best EER: {best_eer:.4f}%  "
-                      f"Rank-1: {rank1:.3f}%  — saved")
+                      f"Rank-1: {rank1:.3f}%  — saved\n")
 
+    # ── Final evaluation ─────────────────────────────────────
     print(f"\n{sep}")
     print(f"JPFA complete.  Best EER: {best_eer:.4f}%")
-    evaluate(FS,      FF,      eval_src, eval_tgt,
-             f"final_last_{PIXEL_METHOD}", OUTPUT_DIR)
-    evaluate(best_FS, best_FF, eval_src, eval_tgt,
-             f"final_best_{PIXEL_METHOD}", OUTPUT_DIR)
+    full_evaluate(FS,      FF,      eval_src, eval_tgt,
+                  f"final_last_{PIXEL_METHOD}", OUTPUT_DIR)
+    full_evaluate(best_FS, best_FF, eval_src, eval_tgt,
+                  f"final_best_{PIXEL_METHOD}", OUTPUT_DIR)
 
-    # Curves
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    axes[0].plot(loss_hist)
-    axes[0].set_title(f"Total loss [{PIXEL_METHOD}]")
-    axes[0].set_xlabel("Step")
-    axes[1].plot(eval_steps, eer_hist, color="red")
-    axes[1].set_title("Target EER %")
-    axes[1].set_xlabel("Step")
-    axes[2].plot(eval_steps, rank1_hist, color="green")
-    axes[2].set_title("Target Rank-1 %")
-    axes[2].set_xlabel("Step")
+    # ── Training curves ───────────────────────────────────────
+    fig, axes = plt.subplots(2, 3, figsize=(18, 8))
+
+    axes[0,0].plot(eval_steps, loss_hist[::(len(loss_hist)//len(eval_steps)+1)][:len(eval_steps)])
+    axes[0,0].set_title(f"Total loss [{PIXEL_METHOD}]")
+    axes[0,0].set_xlabel("Step")
+
+    axes[0,1].plot(eval_steps, tr_acc_hist, color="blue",  label="Train Acc")
+    axes[0,1].set_title("Train accuracy (batch, %)"); axes[0,1].set_xlabel("Step")
+
+    axes[0,2].plot(eval_steps, tr_eer_hist, color="navy", label="Train EER")
+    axes[0,2].set_title("Train EER (source, %)"); axes[0,2].set_xlabel("Step")
+
+    axes[1,0].plot(eval_steps, tgt_r1_hist,  color="green", label="Tgt Rank-1")
+    axes[1,0].set_title("Target Rank-1 (%)"); axes[1,0].set_xlabel("Step")
+
+    axes[1,1].plot(eval_steps, tgt_eer_hist, color="red",   label="Tgt EER")
+    axes[1,1].set_title("Target EER (%)"); axes[1,1].set_xlabel("Step")
+
+    ax = axes[1,2]
+    ax.plot(eval_steps, tr_eer_hist,  color="navy",  label="Train EER")
+    ax.plot(eval_steps, tgt_eer_hist, color="red",   label="Target EER")
+    ax.set_title("Train vs Target EER"); ax.set_xlabel("Step"); ax.legend()
+
     plt.tight_layout()
     plt.savefig(os.path.join(OUTPUT_DIR,
                              f"curves_{PIXEL_METHOD}.png"), dpi=120)
@@ -1067,13 +1121,12 @@ def train_jpfa(src_list, fake_dir, tgt_list, num_classes):
 # ============================================================
 
 def main():
-    print(f"\n{'='*60}")
+    print(f"\n{'='*65}")
     print(f"  JPFA  |  Source={SOURCE_SPECTRUM}  "
           f"Target={TARGET_SPECTRA}")
-    print(f"  Pixel alignment: {PIXEL_METHOD.upper()}")
-    print(f"{'='*60}")
+    print(f"  Pixel alignment : {PIXEL_METHOD.upper()}")
+    print(f"{'='*65}")
 
-    # ── 1. Build data lists ───────────────────────────────────
     print("\n[1] Building data lists ...")
     d0, d1, d2, dt, num_classes = build_lists(
         DATA_PATH, SOURCE_SPECTRUM, TARGET_SPECTRA)
@@ -1087,10 +1140,8 @@ def main():
 
     fake_dir = os.path.join(OUTPUT_DIR, "fake_images")
 
-    # ── 2. Phase 1: pixel alignment ──────────────────────────
     if PIXEL_METHOD == "cyclegan":
-        cyc_weights = os.path.join(
-            OUTPUT_DIR, "cyclegan", "G_S2T.pth")
+        cyc_weights = os.path.join(OUTPUT_DIR, "cyclegan", "G_S2T.pth")
         if os.path.exists(cyc_weights):
             print(f"\n[2] CycleGAN weights found — skipping training.")
             print(f"    Delete {cyc_weights} to retrain.")
@@ -1098,10 +1149,9 @@ def main():
             print("\n[2] Running CycleGAN ...")
             run_cyclegan(d0, dt, fake_dir)
     else:
-        print("\n[2] PalmRSS mode — no Phase 1 pre-training needed.")
-        print("    Fake images will be generated on-the-fly via FAT+HM.")
+        print("\n[2] PalmRSS mode — no Phase 1 needed.")
+        print("    Fake images generated on-the-fly via FAT+HM.")
 
-    # ── 3. Phase 2: JPFA feature training ────────────────────
     print("\n[3] Running JPFA feature-level training ...")
     train_jpfa(d0, fake_dir, dt, num_classes)
 
