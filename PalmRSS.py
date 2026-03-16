@@ -57,48 +57,39 @@ OUTPUT_DIR      = "./results_casia_ms"
 GPU_ID          = "0"
 
 # --- Cross-spectral experiment (Table 1) ---
-# Available spectra in the dataset — check your actual filenames.
-# Set SOURCE_SPECTRUM to one spectrum; TARGET_SPECTRA = the rest.
-# Examples: "WHT", "460", "700", "850", "Red", "Green", "Blue", "NIR"
-SOURCE_SPECTRUM = "WHT"          # D0: train source spectrum
-TARGET_SPECTRA  = ["460", "700", "850"]  # Dt: unseen target spectra
-
-# --- Session split (Section 4.2) ---
-# D1 = session 1 (first half of sorted iterations per identity)
-# D2 = session 2 (second half of sorted iterations per identity)
-# Set to True for time-based split (recommended by paper), False for random
-SESSION_SPLIT   = True
+SOURCE_SPECTRUM = "460"
+TARGET_SPECTRA  = ["700"]
 
 # --- Architecture ---
-COM_WEIGHT      = 0.8     # channel competition weight alpha
-ARC_S           = 30.0    # ArcFace scale s
-ARC_M           = 0.5     # ArcFace margin m
-FC_DIM1         = 4096    # FC layer 1 output dim
-FC_DIM2         = 2048    # FC layer 2 output dim (embedding size)
+COM_WEIGHT      = 0.8
+ARC_S           = 30.0
+ARC_M           = 0.5
+FC_DIM1         = 4096
+FC_DIM2         = 2048
 DROPOUT         = 0.5
 
 # --- Loss weights (Eq. 13) ---
-W_CE            = 0.8     # cross-entropy weight
-W_CON           = 0.1     # supervised contrastive loss weight  [paper: 0.1]
-W_SIM           = 0.1     # feature similarity loss weight      [paper: 0.1]
-LAMBDA_HYB      = 1.0     # lambda in Eq. 15
-TEMPERATURE     = 0.07    # SupConLoss temperature tau
+W_CE            = 0.8
+W_CON           = 0.1
+W_SIM           = 0.1
+LAMBDA_HYB      = 1.0
+TEMPERATURE     = 0.07
 BASE_TEMP       = 0.07
 
 # --- FDA (Eq. 5-6) ---
-BETA            = 0.1     # low-frequency ratio beta
+BETA            = 0.1
 
 # --- Training ---
-BATCH_SIZE      = 512     # paper uses 1024; reduce if OOM
-EPOCH_NUM       = 3000
+BATCH_SIZE      = 512
+EPOCH_NUM       = 300
 LR              = 0.001
 LR_STEP         = 500
 LR_GAMMA        = 0.8
 IMSIDE          = 128
 
 # --- Logging ---
-TEST_INTERVAL   = 100
-SAVE_INTERVAL   = 500
+PRINT_INTERVAL  = 10    # print train + target metrics every N epochs
+SAVE_INTERVAL   = 500   # save checkpoint every N epochs
 
 # ============================================================
 # (nothing to edit below this line)
@@ -115,7 +106,6 @@ print(f"Device: {device}")
 # ============================================================
 
 def parse_filename(fname):
-    """Parse {id}_{hand}_{spectrum}_{iter}.jpg"""
     stem  = os.path.splitext(fname)[0]
     parts = stem.split("_")
     if len(parts) < 4 or not parts[0].isdigit():
@@ -124,33 +114,24 @@ def parse_filename(fname):
 
 
 def build_splits(data_root, source_spectrum, target_spectra):
-    """
-    Returns:
-      d1_list   : (path, label) for session-1 of source spectrum  -> train source
-      d2_list   : (path, label) for session-2 of source spectrum  -> train target (for alignment + adv)
-      dt_list   : (path, label) for all target spectra            -> unseen test
-      num_classes: number of identities in source domain
-    """
     exts = {".jpg", ".jpeg", ".png"}
     files = sorted(f for f in os.listdir(data_root)
                    if os.path.splitext(f)[1].lower() in exts)
 
-    # Group by (id, hand, spectrum)
-    src_groups = defaultdict(list)   # source spectrum
-    tgt_groups = defaultdict(list)   # target spectra
+    src_groups = defaultdict(list)
+    tgt_groups = defaultdict(list)
 
     for f in files:
         m = parse_filename(f)
         if m is None:
             continue
-        key_id = f"{m['id']}_{m['hand']}"   # identity key
+        key_id = f"{m['id']}_{m['hand']}"
         path   = os.path.join(data_root, f)
         if m['spectrum'] == source_spectrum:
             src_groups[key_id].append((m['iteration'], path))
         elif m['spectrum'] in target_spectra:
             tgt_groups[(key_id, m['spectrum'])].append(path)
 
-    # Assign integer labels (source domain identities only)
     sorted_ids  = sorted(src_groups.keys())
     label_map   = {k: i for i, k in enumerate(sorted_ids)}
     num_classes = len(sorted_ids)
@@ -158,33 +139,28 @@ def build_splits(data_root, source_spectrum, target_spectra):
     d1_list, d2_list = [], []
     for key_id in sorted_ids:
         lbl   = label_map[key_id]
-        items = sorted(src_groups[key_id], key=lambda x: x[0])  # sort by iteration
-        n     = len(items)
-        half  = n // 2
-        # Session 1 (D1) = first half, Session 2 (D2) = second half
+        items = sorted(src_groups[key_id], key=lambda x: x[0])
+        half  = len(items) // 2
         for _, p in items[:half]:
             d1_list.append((p, lbl))
         for _, p in items[half:]:
             d2_list.append((p, lbl))
 
-    # Target domain: use source labels if identity overlaps, else skip
-    # (open-set: target identities are NOT in training set)
+    tgt_label_map = {}
     dt_list = []
-    tgt_label_map = {}   # separate labels for target eval
     for (key_id, spec), paths in tgt_groups.items():
-        tgt_key = key_id
-        if tgt_key not in tgt_label_map:
-            tgt_label_map[tgt_key] = len(tgt_label_map)
-        lbl = tgt_label_map[tgt_key]
+        if key_id not in tgt_label_map:
+            tgt_label_map[key_id] = len(tgt_label_map)
+        lbl = tgt_label_map[key_id]
         for p in sorted(paths):
             dt_list.append((p, lbl))
 
-    print(f"  Source spectrum : {source_spectrum}")
-    print(f"  Target spectra  : {target_spectra}")
+    print(f"  Source spectrum  : {source_spectrum}")
+    print(f"  Target spectra   : {target_spectra}")
     print(f"  Source identities: {num_classes}")
-    print(f"  D1 (session 1)  : {len(d1_list)} samples")
-    print(f"  D2 (session 2)  : {len(d2_list)} samples")
-    print(f"  Dt (target)     : {len(dt_list)} samples  "
+    print(f"  D1 (session 1)   : {len(d1_list)} samples")
+    print(f"  D2 (session 2)   : {len(d2_list)} samples")
+    print(f"  Dt (target)      : {len(dt_list)} samples "
           f"({len(tgt_label_map)} identities)")
     return d1_list, d2_list, dt_list, num_classes
 
@@ -255,7 +231,6 @@ class PalmDataset(Dataset):
 
     def __getitem__(self, idx):
         img1, label = self._load(idx)
-        # Sample a same-class augmented partner for contrastive / sim loss
         same = [i for i, l in enumerate(self.labels) if l == label]
         idx2 = idx
         if self.train and len(same) > 1:
@@ -266,33 +241,29 @@ class PalmDataset(Dataset):
 
 
 # ============================================================
-# 3.  MODEL  (CCNet backbone — ccnet_2.py, 2-channel input)
+# 3.  MODEL  (CCNet — ccnet_2.py, 2-channel input)
 # ============================================================
 
 class GaborConv2d(nn.Module):
     def __init__(self, ch_in, ch_out, ksize, stride=1, padding=0, init_ratio=1.):
         super().__init__()
-        r            = init_ratio
-        self.ch_in   = ch_in
-        self.ch_out  = ch_out
-        self.ksize   = ksize
-        self.stride  = stride
-        self.padding = padding
-        self.kernel  = None
-        self.gamma   = nn.Parameter(torch.FloatTensor([2.0]))
-        self.sigma   = nn.Parameter(torch.FloatTensor([9.2 * r]))
-        self.theta   = nn.Parameter(
+        r = init_ratio
+        self.ch_in = ch_in; self.ch_out = ch_out
+        self.ksize = ksize; self.stride = stride; self.padding = padding
+        self.kernel = None
+        self.gamma  = nn.Parameter(torch.FloatTensor([2.0]))
+        self.sigma  = nn.Parameter(torch.FloatTensor([9.2 * r]))
+        self.theta  = nn.Parameter(
             torch.arange(ch_out).float() * math.pi / ch_out, requires_grad=False)
-        self.f       = nn.Parameter(torch.FloatTensor([0.057 / r]))
-        self.psi     = nn.Parameter(torch.FloatTensor([0.0]), requires_grad=False)
+        self.f      = nn.Parameter(torch.FloatTensor([0.057 / r]))
+        self.psi    = nn.Parameter(torch.FloatTensor([0.0]), requires_grad=False)
 
     def _build_bank(self):
         xm  = self.ksize // 2
         rng = torch.arange(-xm, xm + 1).float()
         y   = rng.view(1, -1).repeat(self.ch_out, self.ch_in, self.ksize, 1)
         x   = rng.view(-1, 1).repeat(self.ch_out, self.ch_in, 1, self.ksize)
-        x   = x.to(self.sigma.device)
-        y   = y.to(self.sigma.device)
+        x   = x.to(self.sigma.device); y = y.to(self.sigma.device)
         th  = self.theta.view(-1, 1, 1, 1)
         xt  =  x * torch.cos(th) + y * torch.sin(th)
         yt  = -x * torch.sin(th) + y * torch.cos(th)
@@ -318,15 +289,13 @@ class SELayer(nn.Module):
 
     def forward(self, x):
         b, c, _, _ = x.shape
-        y = self.pool(x).view(b, c)
-        return x * self.fc(y).view(b, c, 1, 1)
+        return x * self.fc(self.pool(x).view(b, c)).view(b, c, 1, 1)
 
 
 class CompetitiveBlock(nn.Module):
     def __init__(self, ch_in, n_comp, ksize, weight, init_ratio=1., o1=32):
         super().__init__()
-        nc2 = n_comp * 2
-        nc4 = n_comp * 4
+        nc2 = n_comp * 2; nc4 = n_comp * 4
         self.g1 = GaborConv2d(ch_in, n_comp, ksize, 2, ksize // 2, init_ratio)
         self.g2 = GaborConv2d(nc2,   nc2,    ksize, 2, ksize // 2, init_ratio)
         if ksize == 35:
@@ -339,21 +308,18 @@ class CompetitiveBlock(nn.Module):
             self.c1b = nn.Conv2d(n_comp, n_comp, 3, 2, 3)
             self.c2a = nn.Conv2d(nc2,    nc2,    5, 1, 0)
             self.c2b = nn.Conv2d(nc2,    nc2,    3, 2, 3)
-        else:   # ksize == 7
+        else:
             self.c1a = nn.Conv2d(ch_in,  n_comp, 3, 1, 0)
             self.c1b = nn.Conv2d(n_comp, n_comp, 1, 2, 1)
             self.c2a = nn.Conv2d(nc2,    nc2,    3, 1, 0)
             self.c2b = nn.Conv2d(nc2,    nc2,    1, 2, 1)
-        self.sm_c = nn.Softmax(dim=1)
-        self.sm_h = nn.Softmax(dim=2)
+        self.sm_c = nn.Softmax(dim=1); self.sm_h = nn.Softmax(dim=2)
         self.sm_w = nn.Softmax(dim=3)
-        self.se1  = SELayer(nc2)
-        self.se2  = SELayer(nc4)
+        self.se1  = SELayer(nc2);  self.se2  = SELayer(nc4)
         self.ppu1 = nn.Conv2d(nc2, o1 // 2, 5, 2, 0)
         self.ppu2 = nn.Conv2d(nc4, o1 // 2, 5, 2, 0)
         self.pool = nn.MaxPool2d(2, 2)
-        self.wc   = weight
-        self.ws   = (1. - weight) / 2.
+        self.wc   = weight; self.ws = (1. - weight) / 2.
 
     def _compete(self, x):
         return self.wc * self.sm_c(x) + self.ws * (self.sm_h(x) + self.sm_w(x))
@@ -372,8 +338,7 @@ class ArcMarginProduct(nn.Module):
         self.s     = s
         self.w     = Parameter(torch.FloatTensor(out_f, in_f))
         nn.init.xavier_uniform_(self.w)
-        self.cos_m = math.cos(m)
-        self.sin_m = math.sin(m)
+        self.cos_m = math.cos(m); self.sin_m = math.sin(m)
         self.th    = math.cos(math.pi - m)
         self.mm    = math.sin(math.pi - m) * m
 
@@ -388,17 +353,10 @@ class ArcMarginProduct(nn.Module):
         return self.s * cos
 
     def cosine_scores(self, x):
-        """Pure cosine similarity without margin -- for monitoring only"""
         return F.linear(F.normalize(x), F.normalize(self.w)) * self.s
 
 
 class CCNet(nn.Module):
-    """
-    CCNet backbone (ccnet_2.py):
-      3 Competitive Blocks: CB1 (ksize=35), CB2 (ksize=17), CB3 (ksize=7)
-      2-layer FC + Dropout + ArcFace
-      Input: 2-channel [FAT | HM]
-    """
     def __init__(self, num_classes, weight=COM_WEIGHT):
         super().__init__()
         self.cb1  = CompetitiveBlock(2,  9, 35, weight, init_ratio=1.00)
@@ -413,15 +371,13 @@ class CCNet(nn.Module):
         return torch.cat([self.cb1(x), self.cb2(x), self.cb3(x)], dim=1)
 
     def forward(self, x, y=None):
-        """Returns (arc_logits, feature_encoding_fe)"""
         h1  = self.fc(self._backbone(x))
         h2  = self.fc1(h1)
-        fe  = torch.cat([h1, h2], dim=1)       # v1 / v2 for L_adv and L_sim
+        fe  = torch.cat([h1, h2], dim=1)
         out = self.arc(self.drop(h2), y)
         return out, F.normalize(fe, dim=-1)
 
     def cosine_classify(self, x):
-        """No-margin cosine logits -- real training accuracy metric"""
         h2 = self.fc1(self.fc(self._backbone(x)))
         return self.arc.cosine_scores(self.drop(h2))
 
@@ -434,22 +390,16 @@ class CCNet(nn.Module):
 # ============================================================
 
 class DomainDiscriminator(nn.Module):
-    """
-    Predicts whether a feature encoding v comes from D1 (label=1)
-    or D2 (label=0).  Input dim = FC_DIM1 + FC_DIM2 = 6144.
-    """
     def __init__(self, input_dim=FC_DIM1 + FC_DIM2, hidden_dim=1024):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.Linear(input_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
 
     def forward(self, x):
-        return self.net(x)   # raw logit; use BCEWithLogitsLoss
+        return self.net(x)
 
 
 # ============================================================
@@ -457,18 +407,14 @@ class DomainDiscriminator(nn.Module):
 # ============================================================
 
 class SupConLoss(nn.Module):
-    """Supervised contrastive loss (Eq. 11)"""
     def __init__(self, temperature=TEMPERATURE, base_temperature=BASE_TEMP):
         super().__init__()
-        self.T    = temperature
-        self.base = base_temperature
+        self.T = temperature; self.base = base_temperature
 
     def forward(self, features, labels):
         dev  = features.device
-        bsz  = features.shape[0]
-        n    = features.shape[1]   # 2 views
-        mask = torch.eq(labels.view(-1, 1),
-                        labels.view(1, -1)).float().to(dev)
+        bsz  = features.shape[0]; n = features.shape[1]
+        mask = torch.eq(labels.view(-1, 1), labels.view(1, -1)).float().to(dev)
         contrast = torch.cat(torch.unbind(features, dim=1), dim=0)
         dot      = torch.div(torch.matmul(contrast, contrast.T), self.T)
         lm, _    = torch.max(dot, dim=1, keepdim=True)
@@ -479,33 +425,20 @@ class SupConLoss(nn.Module):
         exp_log  = torch.exp(logits) * lmask
         log_prob = logits - torch.log(exp_log.sum(1, keepdim=True) + 1e-9)
         denom    = mask.sum(1).clamp(min=1.)
-        loss     = -(self.T / self.base) * (mask * log_prob).sum(1) / denom
-        return loss.mean()
+        return (-(self.T / self.base) * (mask * log_prob).sum(1) / denom).mean()
 
 
 def feature_similarity_loss(v, v_aug):
-    """
-    L_sim = (1/N) sum_i d(v_i, v_aug_i)   (Eq. 12)
-    d = cosine distance = 1 - cosine_similarity
-    v, v_aug: [N, D] normalised feature encodings
-    """
-    cos_sim = F.cosine_similarity(v, v_aug, dim=-1)   # [N]
-    return (1. - cos_sim).mean()
+    """L_sim = mean cosine distance between original and augmented features (Eq. 12)"""
+    return (1. - F.cosine_similarity(v, v_aug, dim=-1)).mean()
 
 
 def adversarial_loss(disc, v1, v2):
-    """
-    L_adv = -E[log A(v1)] - E[log(1 - A(v2))]   (Eq. 14)
-    Implemented with BCEWithLogitsLoss for numerical stability.
-    v1: features from D1 (label = 1)
-    v2: features from D2 (label = 0)
-    """
+    """L_adv (Eq. 14): D1 features -> label 1, D2 features -> label 0"""
+    bce  = nn.BCEWithLogitsLoss()
     lbl1 = torch.ones (v1.size(0), 1, device=v1.device)
     lbl2 = torch.zeros(v2.size(0), 1, device=v2.device)
-    out1 = disc(v1)
-    out2 = disc(v2)
-    bce  = nn.BCEWithLogitsLoss()
-    return bce(out1, lbl1) + bce(out2, lbl2)
+    return bce(disc(v1), lbl1) + bce(disc(v2), lbl2)
 
 
 # ============================================================
@@ -513,37 +446,33 @@ def adversarial_loss(disc, v1, v2):
 # ============================================================
 
 def _hist_match_np(src: np.ndarray, tgt: np.ndarray) -> np.ndarray:
-    """
-    CDF-based histogram matching (Eq. 7-9), NumPy-only implementation.
-    src, tgt: [H, W, C] float32
-    """
+    """CDF-based histogram matching (Eq. 7-9), NumPy-only."""
     matched = np.empty_like(src)
     for c in range(src.shape[2]):
-        s      = src[..., c].ravel().astype(np.float64)
-        t      = tgt[..., c].ravel().astype(np.float64)
+        s = src[..., c].ravel().astype(np.float64)
+        t = tgt[..., c].ravel().astype(np.float64)
         s_min, s_max = s.min(), s.max()
         t_min, t_max = t.min(), t.max()
         if s_max == s_min or t_max == t_min:
-            matched[..., c] = src[..., c]
-            continue
+            matched[..., c] = src[..., c]; continue
         s_n = (s - s_min) / (s_max - s_min)
         t_n = (t - t_min) / (t_max - t_min)
         bins = 256
         s_cnt, _ = np.histogram(s_n, bins=bins, range=(0., 1.))
         t_cnt, _ = np.histogram(t_n, bins=bins, range=(0., 1.))
-        s_cdf    = np.cumsum(s_cnt).astype(np.float64); s_cdf /= s_cdf[-1]
-        t_cdf    = np.cumsum(t_cnt).astype(np.float64); t_cdf /= t_cdf[-1]
-        edges    = np.linspace(0., 1., bins + 1)
-        centers  = (edges[:-1] + edges[1:]) / 2.
-        t_idx    = np.searchsorted(t_cdf, s_cdf).clip(0, bins - 1)
-        lut      = centers[t_idx] * (s_max - s_min) + s_min
-        pix_bin  = np.searchsorted(edges[1:], s_n).clip(0, bins - 1)
+        s_cdf = np.cumsum(s_cnt).astype(np.float64); s_cdf /= s_cdf[-1]
+        t_cdf = np.cumsum(t_cnt).astype(np.float64); t_cdf /= t_cdf[-1]
+        edges   = np.linspace(0., 1., bins + 1)
+        centers = (edges[:-1] + edges[1:]) / 2.
+        t_idx   = np.searchsorted(t_cdf, s_cdf).clip(0, bins - 1)
+        lut     = centers[t_idx] * (s_max - s_min) + s_min
+        pix_bin = np.searchsorted(edges[1:], s_n).clip(0, bins - 1)
         matched[..., c] = lut[pix_bin].reshape(src.shape[:2]).astype(np.float32)
     return matched.astype(np.float32)
 
 
 def hm_batch(src_batch, tgt_batch):
-    """Histogram matching: F2 = HM(x_D1, x_D2)  — CPU tensors [B,C,H,W]"""
+    """F2 = HM(x_D1, x_D2) — CPU tensors [B,C,H,W]"""
     rows = []
     for s, t in zip(src_batch, tgt_batch):
         s_np = s.permute(1, 2, 0).numpy()
@@ -553,25 +482,17 @@ def hm_batch(src_batch, tgt_batch):
 
 
 def fat_batch(src, tgt, beta=BETA):
-    """
-    Fourier Alignment Transform: F1 = FAT(x_D1, x_D2)  (Eq. 6)
-    Replaces low-frequency amplitude of src with that of tgt.
-    src, tgt: CPU tensors [B, C, H, W]
-    """
-    fs   = torch.fft.rfft2(src, dim=(-2, -1))
-    ft   = torch.fft.rfft2(tgt, dim=(-2, -1))
-    as_  = torch.abs(fs).clone()
-    ps   = torch.angle(fs)
-    at   = torch.abs(ft)
+    """F1 = FAT(x_D1, x_D2) — Eq. 6, CPU tensors [B,C,H,W]"""
+    fs  = torch.fft.rfft2(src, dim=(-2, -1))
+    ft  = torch.fft.rfft2(tgt, dim=(-2, -1))
+    as_ = torch.abs(fs).clone(); ps = torch.angle(fs); at = torch.abs(ft)
     _, _, h, w2 = as_.shape
-    w    = w2  # rfft half-width
-    # Mask M_beta: center region of size [beta*H, beta*W]
-    bh   = int(np.floor(beta * h))
-    bw   = int(np.floor(beta * w * 2))   # full-width equivalent
-    b    = min(bh, bw)
+    bh = int(np.floor(beta * h))
+    bw = int(np.floor(beta * w2 * 2))
+    b  = min(bh, bw)
     if b > 0:
-        as_[:, :, :b, :b]       = at[:, :, :b, :b]
-        as_[:, :, h-b+1:h, :b]  = at[:, :, h-b+1:h, :b]
+        as_[:, :, :b,      :b] = at[:, :, :b,      :b]
+        as_[:, :, h-b+1:h, :b] = at[:, :, h-b+1:h, :b]
     rec = torch.fft.irfft2(
         torch.complex(torch.cos(ps) * as_, torch.sin(ps) * as_),
         dim=(-2, -1), s=[h, w2 * 2])
@@ -579,22 +500,17 @@ def fat_batch(src, tgt, beta=BETA):
 
 
 def make_2ch(src, tgt):
-    """
-    F_cat = Concat(FAT(x_D1, x_D2), HM(x_D1, x_D2))  (Eq. 3)
-    Returns 2-channel tensor [B, 2, H, W] on CPU.
-    """
-    f1 = fat_batch(src, tgt)          # frequency-domain alignment
-    f2 = hm_batch(src, tgt)           # spatial-domain alignment
-    return torch.cat([f1, f2], dim=1)
+    """F_cat = Concat(FAT, HM)  (Eq. 3) — returns [B,2,H,W] CPU tensor"""
+    return torch.cat([fat_batch(src, tgt), hm_batch(src, tgt)], dim=1)
 
 
 def make_2ch_identity(x):
-    """Test-time 2-channel: duplicate single channel [B,1,H,W]->[B,2,H,W]"""
+    """Test-time: duplicate single channel -> [B,2,H,W]"""
     return torch.cat([x, x], dim=1)
 
 
 # ============================================================
-# 7.  EVALUATION
+# 7.  EVALUATION UTILITIES
 # ============================================================
 
 def compute_eer(ins, outs):
@@ -619,40 +535,46 @@ def extract_features(model, loader):
     return np.concatenate(feats), np.concatenate(ids)
 
 
-def evaluate(model, gallery_loader, probe_loader, tag, out_dir):
-    print(f"\n{'='*60}")
-    print(f"  Evaluation : {tag}")
-    print(f"{'='*60}")
+def quick_eval(model, gallery_loader, probe_loader):
+    """
+    Fast target-set evaluation called every PRINT_INTERVAL epochs.
+    Returns: rank1 (%), eer (%), auc
+    Uses fully vectorised cosine similarity — no per-sample loops.
+    """
     ft_g, id_g = extract_features(model, gallery_loader)
     ft_p, id_p = extract_features(model, probe_loader)
 
-    # Vectorised Rank-1
-    sim    = ft_p @ ft_g.T
-    preds  = id_g[sim.argmax(axis=1)]
-    rank1  = 100. * (preds == id_p).mean()
-    print(f"  Rank-1     : {rank1:.3f}%")
+    # Rank-1 (vectorised)
+    sim   = ft_p @ ft_g.T                         # [M, N]
+    preds = id_g[sim.argmax(axis=1)]
+    rank1 = 100. * (preds == id_p).mean()
 
-    # EER
-    s, l = [], []
-    for i in range(len(ft_p)):
-        sim_row = ft_p[i] @ ft_g.T
-        dis_row = np.arccos(np.clip(sim_row, -1., 1.)) / np.pi
-        s.append(dis_row)
-        l.append(np.where(id_g == id_p[i], 1, -1))
-    s = np.concatenate(s)
-    l = np.concatenate(l)
-    ins  = 1. - s[l ==  1]
-    outs = 1. - s[l == -1]
+    # EER (vectorised distance matrix)
+    dis   = np.arccos(np.clip(sim, -1., 1.)) / np.pi   # [M, N]
+    s     = dis.ravel()
+    l     = np.where(
+        id_g[np.tile(np.arange(len(id_g)), len(id_p))] ==
+        id_p.repeat(len(id_g)),
+        1, -1)
+    ins   = 1. - s[l ==  1]
+    outs  = 1. - s[l == -1]
     eer, roc_auc = compute_eer(ins, outs)
-    print(f"  EER        : {eer:.4f}%")
-    print(f"  AUC        : {roc_auc:.6f}")
-    print(f"{'='*60}\n")
+    return rank1, eer, roc_auc
+
+
+def full_evaluate(model, gallery_loader, probe_loader, tag, out_dir):
+    """Full evaluation with file output — called at final checkpoints."""
+    print(f"\n{'='*65}")
+    print(f"  Full Evaluation : {tag}")
+    print(f"{'='*65}")
+    rank1, eer, roc_auc = quick_eval(model, gallery_loader, probe_loader)
+    print(f"  Rank-1  : {rank1:.3f}%")
+    print(f"  EER     : {eer:.4f}%")
+    print(f"  AUC     : {roc_auc:.6f}")
+    print(f"{'='*65}\n")
 
     ev_dir = os.path.join(out_dir, tag)
     os.makedirs(ev_dir, exist_ok=True)
-    with open(os.path.join(ev_dir, "scores.txt"), "w") as f:
-        for sc, lb in zip(1. - s, l):
-            f.write(f"{sc:.6f} {lb}\n")
     with open(os.path.join(ev_dir, "results.txt"), "w") as f:
         f.write(f"EER    : {eer:.4f}%\n")
         f.write(f"Rank-1 : {rank1:.3f}%\n")
@@ -669,17 +591,17 @@ def fit_epoch(epoch, model, disc,
               criterion, con_crit,
               opt_model, opt_disc):
     """
-    L_hyb  = 0.8*L_ce + 0.1*L_con + 0.1*L_sim        (Eq. 13)
-    L_total = L_adv + lambda * L_hyb                   (Eq. 15)
+    L_hyb  = W_CE*L_ce + W_CON*L_con + W_SIM*L_sim   (Eq. 13)
+    L_total = L_adv + LAMBDA_HYB * L_hyb               (Eq. 15)
 
-    NOTE on 0% arc_acc: ArcFace penalises the correct class logit during
-    training. cos_acc (no-margin) is the real convergence indicator.
+    Returns: loss_avg, arc_acc, cos_acc
+      arc_acc -- ArcFace-penalised accuracy (~0% early, expected)
+      cos_acc -- cosine accuracy without margin (real convergence metric)
     """
     model.train(); disc.train()
     run_loss = 0.; arc_corr = 0; cos_corr = 0; total = 0
 
     for (x_d1, x_d1_aug), y_d1 in d1_loader:
-        # Get a batch from D2 (target domain for alignment + adversarial)
         try:
             (x_d2, _), _ = next(d2_iter_ref[0])
         except StopIteration:
@@ -688,55 +610,36 @@ def fit_epoch(epoch, model, disc,
 
         y_d1 = y_d1.to(device)
 
-        # Build 2-channel aligned inputs (Eq. 1-3)
-        data      = make_2ch(x_d1,     x_d2).to(device)  # F_cat for D1
-        data_aug  = make_2ch(x_d1_aug, x_d2).to(device)  # augmented view
-        data_d2   = make_2ch(x_d2,     x_d1).to(device)  # F_cat for D2
+        data     = make_2ch(x_d1,     x_d2).to(device)
+        data_aug = make_2ch(x_d1_aug, x_d2).to(device)
+        data_d2  = make_2ch(x_d2,     x_d1).to(device)
 
-        # ── Model forward ────────────────────────────────────
-        opt_model.zero_grad()
-        opt_disc.zero_grad()
+        opt_model.zero_grad(); opt_disc.zero_grad()
 
         out1, fe1 = model(data,     y_d1)
         out2, fe2 = model(data_aug, y_d1)
 
-        # Feature encoding of D2 (for L_adv)
         with torch.no_grad():
             _, fe_d2 = model(data_d2, None)
 
-        # ── Losses ───────────────────────────────────────────
-        # L_ce (Eq. 10)
-        l_ce  = criterion(out1, y_d1)
-
-        # L_con (Eq. 11)
-        fe_stack = torch.stack([fe1, fe2], dim=1)   # [B, 2, D]
-        l_con = con_crit(fe_stack, y_d1)
-
-        # L_sim (Eq. 12): cosine distance between v1 and v1_aug
-        l_sim = feature_similarity_loss(fe1, fe2)
-
-        # L_hyb (Eq. 13)
-        l_hyb = W_CE * l_ce + W_CON * l_con + W_SIM * l_sim
-
-        # L_adv (Eq. 14): train discriminator to separate D1 vs D2 features
-        l_adv = adversarial_loss(disc, fe1.detach(), fe_d2.detach())
-
-        # L_total (Eq. 15)
-        loss  = l_adv + LAMBDA_HYB * l_hyb
+        # Losses (paper equations)
+        l_ce  = criterion(out1, y_d1)                          # Eq. 10
+        l_con = con_crit(torch.stack([fe1, fe2], dim=1), y_d1) # Eq. 11
+        l_sim = feature_similarity_loss(fe1, fe2)               # Eq. 12
+        l_hyb = W_CE * l_ce + W_CON * l_con + W_SIM * l_sim    # Eq. 13
+        l_adv = adversarial_loss(disc, fe1.detach(), fe_d2.detach())  # Eq. 14
+        loss  = l_adv + LAMBDA_HYB * l_hyb                      # Eq. 15
 
         loss.backward()
-        opt_model.step()
-        opt_disc.step()
+        opt_model.step(); opt_disc.step()
 
         run_loss += loss.item() * y_d1.size(0)
         total    += y_d1.size(0)
 
-        # Accuracy: ArcFace-penalised (reference) vs cosine (real)
         with torch.no_grad():
             arc_corr += out1.argmax(1).eq(y_d1).sum().item()
             model.eval()
-            cos_out   = model.cosine_classify(data)
-            cos_corr += cos_out.argmax(1).eq(y_d1).sum().item()
+            cos_corr += model.cosine_classify(data).argmax(1).eq(y_d1).sum().item()
             model.train(); disc.train()
 
     return run_loss / total, 100.*arc_corr/total, 100.*cos_corr/total
@@ -747,7 +650,7 @@ def fit_epoch(epoch, model, disc,
 # ============================================================
 
 def main():
-    # ── 1. Data splits ───────────────────────────────────────
+    # ── 1. Splits ────────────────────────────────────────────
     print("\n[1] Building session-based train/test splits ...")
     d1_list, d2_list, dt_list, num_classes = build_splits(
         DATA_PATH, SOURCE_SPECTRUM, TARGET_SPECTRA)
@@ -758,36 +661,34 @@ def main():
 
     if len(d1_list) == 0:
         print(f"\nERROR: No images found for source spectrum '{SOURCE_SPECTRUM}'.")
-        print("Check DATA_PATH and SOURCE_SPECTRUM setting.")
-        print("Available spectra in your data:")
-        exts = {".jpg", ".jpeg", ".png"}
+        exts  = {".jpg", ".jpeg", ".png"}
         files = [f for f in os.listdir(DATA_PATH)
                  if os.path.splitext(f)[1].lower() in exts]
         spectra = set()
         for f in files[:200]:
             m = parse_filename(f)
             if m: spectra.add(m['spectrum'])
-        print(f"  {sorted(spectra)}")
+        print(f"  Available spectra: {sorted(spectra)}")
         return
 
     # ── 2. Dataloaders ───────────────────────────────────────
     print("\n[2] Building dataloaders ...")
-    d1_ds  = PalmDataset(d1_list, train=True)
-    d2_ds  = PalmDataset(d2_list, train=True)
-    dt_ds  = PalmDataset(dt_list, train=False)
+    d1_ds = PalmDataset(d1_list, train=True)
+    d2_ds = PalmDataset(d2_list, train=True)
+    dt_ds = PalmDataset(dt_list, train=False)
 
     kw = dict(num_workers=4, pin_memory=True)
-    d1_loader = DataLoader(d1_ds,  batch_size=BATCH_SIZE, shuffle=True,
-                           drop_last=True,  **kw)
-    d2_loader = DataLoader(d2_ds,  batch_size=BATCH_SIZE, shuffle=True,
-                           drop_last=True,  **kw)
-    dt_loader = DataLoader(dt_ds,  batch_size=BATCH_SIZE, shuffle=False, **kw)
+    d1_loader = DataLoader(d1_ds, batch_size=BATCH_SIZE, shuffle=True,
+                           drop_last=True, **kw)
+    d2_loader = DataLoader(d2_ds, batch_size=BATCH_SIZE, shuffle=True,
+                           drop_last=True, **kw)
+    dt_loader = DataLoader(dt_ds, batch_size=BATCH_SIZE, shuffle=False, **kw)
 
     # ── 3. Model + discriminator ─────────────────────────────
     print(f"\n[3] Building CCNet (num_classes={num_classes}) + Discriminator ...")
-    net       = CCNet(num_classes, COM_WEIGHT).to(device)
-    best_net  = CCNet(num_classes, COM_WEIGHT).to(device)
-    disc      = DomainDiscriminator(FC_DIM1 + FC_DIM2, 1024).to(device)
+    net      = CCNet(num_classes, COM_WEIGHT).to(device)
+    best_net = CCNet(num_classes, COM_WEIGHT).to(device)
+    disc     = DomainDiscriminator(FC_DIM1 + FC_DIM2, 1024).to(device)
 
     criterion = nn.CrossEntropyLoss()
     con_crit  = SupConLoss(TEMPERATURE, BASE_TEMP)
@@ -795,80 +696,127 @@ def main():
     opt_disc  = optim.Adam(disc.parameters(), lr=LR)
     sched     = lr_scheduler.StepLR(opt_model, step_size=LR_STEP, gamma=LR_GAMMA)
 
-    print(f"\n  Loss weights: L_ce={W_CE}, L_con={W_CON}, L_sim={W_SIM}")
-    print(f"  Total: L_adv + {LAMBDA_HYB} * (L_hyb)")
+    print(f"  Loss: L_adv + {LAMBDA_HYB} * "
+          f"({W_CE}*L_ce + {W_CON}*L_con + {W_SIM}*L_sim)")
 
-    # ── 4. Baseline evaluation ───────────────────────────────
-    print("\n[4] Baseline (random init) evaluation on target Dt ...")
-    evaluate(net, d1_loader, dt_loader, "baseline_Dt", OUTPUT_DIR)
+    # ── 4. Training ──────────────────────────────────────────
+    print("\n[4] Training ...")
+    print("  NOTE: arc_acc near 0% is EXPECTED — ArcFace penalises the")
+    print("        correct class logit during training. cos_acc is the")
+    print("        real convergence indicator.")
+    print()
 
-    # ── 5. Training ──────────────────────────────────────────
-    print("\n[5] Training ...")
-    print("  NOTE: arc_acc near 0% is EXPECTED with ArcFace (margin penalty).")
-    print("        cos_acc = real convergence indicator.\n")
+    # Print header
+    header = (f"{'Epoch':>6}  "
+              f"{'Tr-Loss':>9}  {'Tr-ArcAcc':>10}  {'Tr-CosAcc':>10}  "
+              f"{'Dt-Rank1':>9}  {'Dt-EER':>8}  {'Dt-AUC':>8}  "
+              f"{'Time':>8}")
+    sep = "-" * len(header)
+    print(header)
+    print(sep)
 
     best_eer     = 100.
     best_cos_acc = 0.
     loss_hist, arc_hist, cos_hist = [], [], []
-    d2_iter_ref  = [iter(d2_loader), d2_loader]
+    eer_hist, rank1_hist          = [], []
+    d2_iter_ref = [iter(d2_loader), d2_loader]
 
     log_path = os.path.join(OUTPUT_DIR, "training_log.csv")
     with open(log_path, "w") as f:
-        f.write("epoch,loss,arc_acc,cos_acc\n")
+        f.write("epoch,tr_loss,tr_arc_acc,tr_cos_acc,"
+                "dt_rank1,dt_eer,dt_auc\n")
 
     for epoch in range(EPOCH_NUM):
+        t0 = time.time()
         loss, arc_acc, cos_acc = fit_epoch(
             epoch, net, disc, d1_loader, d2_iter_ref,
             criterion, con_crit, opt_model, opt_disc)
         sched.step()
 
-        loss_hist.append(loss); arc_hist.append(arc_acc); cos_hist.append(cos_acc)
+        loss_hist.append(loss)
+        arc_hist.append(arc_acc)
+        cos_hist.append(cos_acc)
 
-        if epoch % 10 == 0:
-            print(f"  Epoch {epoch:4d} | loss {loss:.5f} "
-                  f"| arc_acc {arc_acc:6.2f}% | cos_acc {cos_acc:6.2f}%"
-                  f"  [{time.strftime('%H:%M:%S')}]")
+        # Target evaluation every PRINT_INTERVAL epochs
+        if epoch % PRINT_INTERVAL == 0:
+            rank1, eer, roc_auc = quick_eval(net, d1_loader, dt_loader)
+            eer_hist.append(eer)
+            rank1_hist.append(rank1)
 
-        with open(log_path, "a") as f:
-            f.write(f"{epoch},{loss:.6f},{arc_acc:.4f},{cos_acc:.4f}\n")
+            elapsed = time.time() - t0
+            print(f"{epoch:>6}  "
+                  f"{loss:>9.5f}  {arc_acc:>9.2f}%  {cos_acc:>9.2f}%  "
+                  f"{rank1:>8.3f}%  {eer:>7.4f}%  {roc_auc:>8.6f}  "
+                  f"{elapsed:>6.1f}s  [{time.strftime('%H:%M:%S')}]")
+
+            with open(log_path, "a") as f:
+                f.write(f"{epoch},{loss:.6f},{arc_acc:.4f},{cos_acc:.4f},"
+                        f"{rank1:.4f},{eer:.4f},{roc_auc:.6f}\n")
+
+            if eer < best_eer:
+                best_eer = eer
+                torch.save(net.state_dict(),
+                           os.path.join(OUTPUT_DIR, "best_eer_model.pth"))
+                print(f"  >>> New best EER on Dt: {best_eer:.4f}%  "
+                      f"(Rank-1: {rank1:.3f}%)  — model saved")
 
         if cos_acc >= best_cos_acc:
             best_cos_acc = cos_acc
-            torch.save(net.state_dict(), os.path.join(OUTPUT_DIR, "best_model.pth"))
+            torch.save(net.state_dict(),
+                       os.path.join(OUTPUT_DIR, "best_model.pth"))
             best_net.load_state_dict(copy.deepcopy(net.state_dict()))
 
         if epoch % SAVE_INTERVAL == 0 and epoch > 0:
             torch.save(net.state_dict(),
                        os.path.join(OUTPUT_DIR, f"epoch_{epoch}.pth"))
 
-        if epoch % TEST_INTERVAL == 0 and epoch > 0:
-            # Evaluate on target Dt (cross-spectral, unseen domain)
-            eer, rank1 = evaluate(net, d1_loader, dt_loader,
-                                  f"ep{epoch:04d}_Dt", OUTPUT_DIR)
-            if eer < best_eer:
-                best_eer = eer
-                torch.save(net.state_dict(),
-                           os.path.join(OUTPUT_DIR, "best_eer_model.pth"))
-                print(f"  *** New best EER on Dt: {best_eer:.4f}% — saved ***\n")
-            net.train(); disc.train()
+    # ── 5. Final evaluation ──────────────────────────────────
+    print(f"\n{sep}")
+    print(f"Training complete.  Best EER on Dt: {best_eer:.4f}%")
+    print(sep)
+    full_evaluate(net,      d1_loader, dt_loader, "final_last", OUTPUT_DIR)
+    full_evaluate(best_net, d1_loader, dt_loader, "final_best", OUTPUT_DIR)
 
-    # ── 6. Final evaluation ──────────────────────────────────
-    print("\n[6] Final evaluation ...")
-    evaluate(net,      d1_loader, dt_loader, "final_last_Dt", OUTPUT_DIR)
-    evaluate(best_net, d1_loader, dt_loader, "final_best_Dt", OUTPUT_DIR)
+    # ── 6. Training curves ───────────────────────────────────
+    epochs_all  = list(range(EPOCH_NUM))
+    epochs_eval = list(range(0, EPOCH_NUM, PRINT_INTERVAL))
 
-    # ── 7. Training curve ────────────────────────────────────
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    axes[0].plot(loss_hist);  axes[0].set_title("Train Loss");             axes[0].set_xlabel("Epoch")
-    axes[1].plot(arc_hist);   axes[1].set_title("ArcFace Acc (penalised)"); axes[1].set_xlabel("Epoch")
-    axes[2].plot(cos_hist);   axes[2].set_title("Cosine Acc (real)");       axes[2].set_xlabel("Epoch")
+    fig, axes = plt.subplots(2, 3, figsize=(18, 8))
+
+    axes[0, 0].plot(epochs_all, loss_hist)
+    axes[0, 0].set_title("Train Loss"); axes[0, 0].set_xlabel("Epoch")
+
+    axes[0, 1].plot(epochs_all, arc_hist, label="arc_acc (penalised)", alpha=0.6)
+    axes[0, 1].plot(epochs_all, cos_hist, label="cos_acc (real)")
+    axes[0, 1].set_title("Train Accuracy (%)"); axes[0, 1].set_xlabel("Epoch")
+    axes[0, 1].legend()
+
+    axes[0, 2].plot(epochs_eval[:len(eer_hist)], eer_hist, color="red")
+    axes[0, 2].set_title("Target EER (%)"); axes[0, 2].set_xlabel("Epoch")
+
+    axes[1, 0].plot(epochs_eval[:len(rank1_hist)], rank1_hist, color="green")
+    axes[1, 0].set_title("Target Rank-1 (%)"); axes[1, 0].set_xlabel("Epoch")
+
+    axes[1, 1].plot(epochs_all, loss_hist, label="Train Loss", alpha=0.7)
+    ax2 = axes[1, 1].twinx()
+    ax2.plot(epochs_eval[:len(eer_hist)], eer_hist,
+             color="red", label="Target EER")
+    axes[1, 1].set_title("Loss vs Target EER"); axes[1, 1].set_xlabel("Epoch")
+    axes[1, 1].legend(loc="upper left"); ax2.legend(loc="upper right")
+
+    axes[1, 2].plot(epochs_all, cos_hist, label="Cos Acc", alpha=0.7)
+    ax3 = axes[1, 2].twinx()
+    ax3.plot(epochs_eval[:len(rank1_hist)], rank1_hist,
+             color="green", label="Target Rank-1")
+    axes[1, 2].set_title("Cos Acc vs Target Rank-1"); axes[1, 2].set_xlabel("Epoch")
+    axes[1, 2].legend(loc="upper left"); ax3.legend(loc="upper right")
+
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, "training_curve.png"))
+    plt.savefig(os.path.join(OUTPUT_DIR, "training_curves.png"), dpi=120)
     plt.close()
 
     torch.save(net.state_dict(), os.path.join(OUTPUT_DIR, "last_model.pth"))
     print(f"\nAll outputs saved to: {OUTPUT_DIR}")
-    print(f"Best EER on target Dt: {best_eer:.4f}%")
 
 
 if __name__ == "__main__":
