@@ -140,7 +140,8 @@ def main():
     num_fallback = 0
     report_rows = []
 
-    for src_path, meta in tqdm(all_images, desc="Processing MPDv2"):
+    pbar = tqdm(all_images, desc="Processing MPDv2")
+    for src_path, meta in pbar:
         rel_path = os.path.relpath(src_path, SRC_ROOT)
         dst_path = os.path.join(DST_ROOT, rel_path)
         os.makedirs(os.path.dirname(dst_path), exist_ok=True)
@@ -150,6 +151,7 @@ def main():
             img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
         except Exception:
             num_fallback += 1
+            pbar.set_postfix(success=num_success, failed=num_fallback)
             continue
 
         roi_bgr, _, _ = extract_palm_roi(img_bgr)
@@ -161,14 +163,16 @@ def main():
                 roi_bgr = cv2.resize(img_bgr, (ROI_SIZE, ROI_SIZE))
                 cv2.imwrite(dst_path, roi_bgr)
             report_rows.append({**meta, 'path': rel_path, 'status': status})
-            continue
+        else:
+            roi_bgr = cv2.resize(roi_bgr, (ROI_SIZE, ROI_SIZE))
+            status = "ok"
+            num_success += 1
+            cv2.imwrite(dst_path, roi_bgr)
+            report_rows.append({**meta, 'path': rel_path, 'status': status})
 
-        roi_bgr = cv2.resize(roi_bgr, (ROI_SIZE, ROI_SIZE))
-        status = "ok"
-        num_success += 1
+        pbar.set_postfix(success=num_success, failed=num_fallback)
 
-        cv2.imwrite(dst_path, roi_bgr)
-        report_rows.append({**meta, 'path': rel_path, 'status': status})
+    print(f"\nDone. Success: {num_success}, Fallback: {num_fallback}")
 
 if __name__ == "__main__":
     main()
