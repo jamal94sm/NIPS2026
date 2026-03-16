@@ -96,7 +96,7 @@ BETA            = 0.1
 
 # --- Training ---
 BATCH_SIZE      = 512
-EPOCH_NUM       = 500
+EPOCH_NUM       = 250
 LR              = 0.001
 LR_STEP         = 500
 LR_GAMMA        = 0.8
