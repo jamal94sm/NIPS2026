@@ -771,13 +771,22 @@ def full_evaluate(fs_model, ff_model, src_loader, tgt_loader, tag, out_dir):
 
 def train_source_eval(fs_model, src_loader):
     gc, g_id = extract_codes(fs_model, src_loader)
-    # Leave-one-out: mask diagonal
-    sim = hamming_sim(gc, gc); np.fill_diagonal(sim, -np.inf)
-    preds = g_id[sim.argmax(axis=1)]
+    n   = len(g_id)
+    sim = hamming_sim(gc, gc)
+
+    # Rank-1: leave-one-out (fill diagonal with -inf so self is never top-1)
+    sim_loo = sim.copy()
+    np.fill_diagonal(sim_loo, -np.inf)
+    preds = g_id[sim_loo.argmax(axis=1)]
     rank1 = 100.*(preds==g_id).mean()
-    eer, _ = compute_eer(
-        sim.ravel()[np.tile(g_id,len(g_id))==np.repeat(g_id,len(g_id))],
-        sim.ravel()[np.tile(g_id,len(g_id))!=np.repeat(g_id,len(g_id))])
+
+    # EER: exclude diagonal entirely (self-matches have sim=1.0, no meaning)
+    # -np.inf entries would crash sklearn roc_curve
+    off_diag = ~np.eye(n, dtype=bool)           # True for all non-self pairs
+    s    = sim[off_diag]
+    same = (np.tile(g_id, n) == np.repeat(g_id, n))[off_diag]
+    ins  = s[same]; outs = s[~same]
+    eer, _ = compute_eer(ins, outs)
     return rank1, eer
 
 
