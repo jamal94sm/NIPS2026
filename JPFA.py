@@ -664,27 +664,23 @@ def make_fake_palmrss(src_cpu, tgt_cpu):
 # ============================================================
 
 class FeatureExtractor(nn.Module):
-    """
-    Matches VGG16_net.py exactly:
-      Map(): VGG pool4 → 3×Conv(512,512,3)+BN+ReLU → MaxPool
-      FC() : flatten → 4096 → 4096 → 2048 → 128 (tanh)
-
-    Frozen : VGG features[:24] (Batch1-4, up to pool4)
-    Trained: features[24:] + extra_conv + fc
-    """
     def __init__(self):
         super().__init__()
         vgg16 = models.vgg16(
             weights=models.VGG16_Weights.IMAGENET1K_V1)
 
+        # Frozen backbone: features[:24] → pool4 output = 14×14×512
         self.backbone = nn.Sequential(
             *list(vgg16.features.children())[:24])
         for p in self.backbone.parameters():
             p.requires_grad = False
 
-        self.batch5 = nn.Sequential(
-            *list(vgg16.features.children())[24:])
+        # NO batch5 here — Map() in VGG16_net.py starts from pool4
+        # directly, it does NOT use VGG's pool5
 
+        # Extra conv layers from Map() in VGG16_net.py:
+        # 3 × Conv(512→512, 3×3, pad=1) + MaxPool
+        # 14×14×512 → 14×14×512 → 7×7×512 = 25088
         self.extra_conv = nn.Sequential(
             nn.Conv2d(512, 512, 3, 1, 1),
             nn.BatchNorm2d(512), nn.ReLU(True),
@@ -692,13 +688,12 @@ class FeatureExtractor(nn.Module):
             nn.BatchNorm2d(512), nn.ReLU(True),
             nn.Conv2d(512, 512, 3, 1, 1),
             nn.BatchNorm2d(512), nn.ReLU(True),
-            nn.MaxPool2d(2, 2),
+            nn.MaxPool2d(2, 2),   # 14×14 → 7×7
         )
 
-        # 224px input → pool4 = 14×14×512
-        # after batch5 + extra_conv → 7×7×512 = 25088
+        # FC: 7×7×512=25088 → 4096 → 4096 → 2048 → 128 (tanh)
         self.fc = nn.Sequential(
-            nn.Linear(512*7*7, FC_DIMS[0]),
+            nn.Linear(512 * 7 * 7, FC_DIMS[0]),
             nn.BatchNorm1d(FC_DIMS[0]), nn.ReLU(True), nn.Dropout(0.5),
             nn.Linear(FC_DIMS[0], FC_DIMS[1]),
             nn.BatchNorm1d(FC_DIMS[1]), nn.ReLU(True), nn.Dropout(0.5),
@@ -710,10 +705,9 @@ class FeatureExtractor(nn.Module):
 
     def forward(self, x):
         with torch.no_grad():
-            x = self.backbone(x)
-        x = self.batch5(x)
-        x = self.extra_conv(x)
-        return self.fc(x.flatten(1))
+            x = self.backbone(x)    # frozen → 14×14×512
+        x = self.extra_conv(x)      # → 7×7×512
+        return self.fc(x.flatten(1))  # → 128
 
 
 # ============================================================
