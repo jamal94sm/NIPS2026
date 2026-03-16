@@ -38,6 +38,7 @@ from tqdm import tqdm
 SRC_ROOT = "/home/pai-ng/Jamal/MPDv2"       # source directory
 DST_ROOT = "/home/pai-ng/Jamal/MPDv2-ROI"   # output directory
 ROI_SIZE = 224                               # output side length in pixels
+SAVE_FAILED = False  # ← Set to True to save fallback ROIs, False to skip them
 
 # ============================================================
 # STEP 1 — DETECT FINGER-GAP POINTS A AND B
@@ -374,17 +375,19 @@ def main():
             roi_bgr = generate_roi(img_bgr, point_a, point_b)
 
         if roi_bgr is None or roi_bgr.size == 0:
-            # fallback: resize whole image
-            roi_bgr = cv2.resize(img_bgr, (ROI_SIZE, ROI_SIZE))
-            status  = "fallback"
+            status = "fallback"
             num_fallback += 1
+            if SAVE_FAILED:
+                roi_bgr = cv2.resize(img_bgr, (ROI_SIZE, ROI_SIZE))
+                cv2.imwrite(dst_path, roi_bgr, [cv2.IMWRITE_JPEG_QUALITY, 100])
+            report_rows.append({**meta, "path": rel_path, "status": status})
         else:
             roi_bgr = cv2.resize(roi_bgr, (ROI_SIZE, ROI_SIZE))
             status  = "ok"
             num_success += 1
+            cv2.imwrite(dst_path, roi_bgr, [cv2.IMWRITE_JPEG_QUALITY, 100])
+            report_rows.append({**meta, "path": rel_path, "status": status})
 
-        cv2.imwrite(dst_path, roi_bgr, [cv2.IMWRITE_JPEG_QUALITY, 100])
-        report_rows.append({**meta, "path": rel_path, "status": status})
         pbar.set_postfix(success=num_success, fallback=num_fallback, refresh=True)
 
     print(f"\nDone.  Success: {num_success},  Fallback: {num_fallback}")
