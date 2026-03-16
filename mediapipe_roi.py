@@ -15,6 +15,7 @@ SRC_ROOT = "/home/pai-ng/Jamal/MPDv2"
 DST_ROOT = "/home/pai-ng/Jamal/MPDv2-ROI"
 MODEL_PATH = "hand_landmarker.task"  # Ensure this file is in the same folder
 ROI_SIZE = 160
+SAVE_FAILED = False  # ← Set to True to save fallback ROIs, False to skip them
 
 # ============================================================
 # NEW: Initialize MediaPipe Tasks Detector
@@ -154,18 +155,20 @@ def main():
         roi_bgr, _, _ = extract_palm_roi(img_bgr)
 
         if roi_bgr is None or roi_bgr.size == 0:
-            roi_bgr = cv2.resize(img_bgr, (ROI_SIZE, ROI_SIZE))
-            status = "fallback"
+            status = "failed"
             num_fallback += 1
-        else:
-            roi_bgr = cv2.resize(roi_bgr, (ROI_SIZE, ROI_SIZE))
-            status = "ok"
-            num_success += 1
+            if SAVE_FAILED:
+                roi_bgr = cv2.resize(img_bgr, (ROI_SIZE, ROI_SIZE))
+                cv2.imwrite(dst_path, roi_bgr)
+            report_rows.append({**meta, 'path': rel_path, 'status': status})
+            continue
+
+        roi_bgr = cv2.resize(roi_bgr, (ROI_SIZE, ROI_SIZE))
+        status = "ok"
+        num_success += 1
 
         cv2.imwrite(dst_path, roi_bgr)
         report_rows.append({**meta, 'path': rel_path, 'status': status})
-
-    print(f"\nDone. Success: {num_success}, Fallback: {num_fallback}")
 
 if __name__ == "__main__":
     main()
