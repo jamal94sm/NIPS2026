@@ -780,11 +780,12 @@ def train_source_eval(fs_model, src_loader):
     preds = g_id[sim_loo.argmax(axis=1)]
     rank1 = 100.*(preds==g_id).mean()
 
-    # EER: exclude diagonal entirely (self-matches have sim=1.0, no meaning)
-    # -np.inf entries would crash sklearn roc_curve
-    off_diag = ~np.eye(n, dtype=bool)           # True for all non-self pairs
-    s    = sim[off_diag]
-    same = (np.tile(g_id, n) == np.repeat(g_id, n))[off_diag]
+    # EER: exclude diagonal entirely (self-matches are trivially genuine)
+    # Build same/diff label matrix in 2D (n×n), then flatten with off_diag
+    off_diag  = ~np.eye(n, dtype=bool)               # 2D mask (n×n)
+    same_mat  = g_id[:, None] == g_id[None, :]       # 2D (n×n) bool
+    s    = sim[off_diag]                              # 1D, non-self scores
+    same = same_mat[off_diag]                         # 1D, genuine/impostor
     ins  = s[same]; outs = s[~same]
     eer, _ = compute_eer(ins, outs)
     return rank1, eer
