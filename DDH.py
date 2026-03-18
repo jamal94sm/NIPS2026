@@ -80,7 +80,7 @@ SEP         = '_'        # Filename token separator.
 # ── Train / Test split ───────────────────────────────────────────
 # Paper Section V-B: "half … training set, remaining half … test set"
 # CASIA-MS: ~8-9 images per hand → ~4 train / ~4-5 test per class.
-TRAIN_RATIO = 0.5        # 0.5 = 50% train / 50% test  (paper default)
+TRAIN_RATIO = 0.8        # 0.5 = 50% train / 50% test  (paper default)
                          # Change to e.g. 0.6 for 60/40.
 
 # ── Regularisation ───────────────────────────────────────────────
@@ -96,8 +96,8 @@ BATCH_SIZE = 128     # standard random batch size
 # ── Training (epoch-based) ────────────────────────────────────────
 # One epoch = one full pass through all training batches.
 # With 200 classes and batch covering 25 classes, one epoch ≈ 8 batches.
-TEACHER_EPOCHS = 500     # epochs for teacher training
-STUDENT_EPOCHS = 500     # epochs for DDH student training
+TEACHER_EPOCHS = 200     # epochs for teacher training
+STUDENT_EPOCHS = 200     # epochs for DDH student training
 LR             = 1e-3    # Adam initial learning rate
 LR_MIN         = 1e-5    # cosine schedule final LR (reached at last epoch)
 
