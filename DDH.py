@@ -96,8 +96,8 @@ BATCH_SIZE = 128     # standard random batch size
 # ── Training (epoch-based) ────────────────────────────────────────
 # One epoch = one full pass through all training batches.
 # With 200 classes and batch covering 25 classes, one epoch ≈ 8 batches.
-TEACHER_EPOCHS = 200     # epochs for teacher training
-STUDENT_EPOCHS = 200     # epochs for DDH student training
+TEACHER_EPOCHS = 500     # epochs for teacher training
+STUDENT_EPOCHS = 500     # epochs for DDH student training
 LR             = 1e-3    # Adam initial learning rate
 LR_MIN         = 1e-5    # cosine schedule final LR (reached at last epoch)
 
