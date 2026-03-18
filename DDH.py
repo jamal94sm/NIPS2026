@@ -72,7 +72,7 @@ log = logging.getLogger()
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 CFG = dict(
-    data_dir        = './casia_ms',
+    data_dir        = "/home/pai-ng/Jamal/CASIA-MS-ROI",
     label_pos       = 0,
     sep             = '_',
     train_ratio     = 0.5,
