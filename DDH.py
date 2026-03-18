@@ -857,7 +857,7 @@ def main():
     log.info('╔══════════════════════════════════════════════════════════════╗')
     log.info('║           DDH – paper + released code synthesis             ║')
     log.info('╠══════════════════════════════════════════════════════════════╣')
-    log.info(f'║  Device     : {device:<48}║')
+    log.info(f'║  Device     : {str(device):<48}║')
     log.info(f'║  Data dir   : {CFG["data_dir"]:<48}║')
     log.info(f'║  Stage      : {args.stage:<48}║')
     log.info(f'║  Split      : {TRAIN_RATIO:.0%} train / '
