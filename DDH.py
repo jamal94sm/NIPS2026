@@ -1,35 +1,43 @@
 """
-ddh_paper.py  — Implementation faithful to the PAPER text only
-================================================================
-Paper: "Towards Efficient Unconstrained Palmprint Recognition via
-        Deep Distillation Hashing", Shao et al.
+ddh_best.py  — Best synthesis of paper + released code
+=======================================================
 
-Every equation implemented exactly as written, every architecture
-decision taken from the paper text and figures only.
+╔══════════════════════════════════════════════════════════════╗
+║                  DATASET SPLIT CONFIGURATION                 ║
+╠══════════════════════════════════════════════════════════════╣
+║  Paper protocol (Section V-B):                               ║
+║    "For each category, the HALF of palmprint images are      ║
+║     adopted as training set and the remaining half are used  ║
+║     as test set."                                            ║
+║                                                              ║
+║  CASIA-MS palmprint database facts:                          ║
+║    • 5,502 images total                                      ║
+║    • 624 hands (subjects / classes)                          ║
+║    • ~8–9 images per hand (two sessions, ~4–5 each)          ║
+║                                                              ║
+║  Applied split  (TRAIN_RATIO = 0.5):                         ║
+║    • First 50% of each subject's images  →  TRAIN            ║
+║    • Remaining 50%                       →  TEST             ║
+║    • Subject with 8 images: 4 train / 4 test                 ║
+║    • Subject with 9 images: 4 train / 5 test                 ║
+║                                                              ║
+║  To change: edit TRAIN_RATIO below, e.g. 0.6 for 60/40.     ║
+╚══════════════════════════════════════════════════════════════╝
 
-KEY PAPER CHOICES (vs. released code):
-  • Teacher: full VGG-16 up to pool5. batch1–4 fine-tuned from ImageNet,
-    batch5 + FC head trained from scratch. (paper Fig.5 and Section IV-A)
-  • Student: Conv1(3×3,16ch,stride=4,VALID)→ReLU→MaxPool(2×2,stride=1)
-             Conv2(5×5,32ch,stride=2,VALID)→ReLU→MaxPool(2×2,stride=1)
-             FC(512,ReLU)→FC(128,Tanh)→sign()
-    Standard ReLU, NO batch-norm. (paper Fig.6)
-  • L_q = ‖|h|-1‖_2  per sample, vector L2 norm.  (Eq.2)
-  • d_ij = ‖b_i - b_j‖_2  L2 norm.  (Eq.7/8)
-  • L_rela = ‖d^T - d^S‖_2  (Eq.6)
-  • L_hard: NO clamp — raw differences.  (Eq.9 as written)
-  • L = L_DHN + α·L_rela + β·L_hard,  α=1, β=0.8 (Tables XI/XII best)
-  • Adam lr=0.001  (Section V-B)
-  • 10,000 iterations  (Table XV)
-  • Input 128×128  (all databases use 128×128 ROI, Section V-A)
+ARCHITECTURE choices:
+  ✓ VGG pool4 frozen        ← released code (ground truth of what ran)
+  ✓ Custom conv5 + FC head  ← released code (trainable on top of pool4)
+  ✓ BN + LeakyReLU(0.2)     ← released code (critical for stability)
+  ✓ Student Conv2 SAME pad  ← released code (paper padding=0 breaks sizes)
+  ✓ Input 128×128            ← paper Section V-A (all databases 128×128)
 
-Usage:
-  python ddh_paper.py --data_dir /path/to/casia_ms --stage all
-  python ddh_paper.py --data_dir /path/to/casia_ms --stage teacher
-  python ddh_paper.py --data_dir /path/to/casia_ms --stage student
-  python ddh_paper.py --data_dir /path/to/casia_ms --stage eval
-  # For CASIA-MS flat folder with filenames like 001_2_L_03.jpg:
-  python ddh_paper.py --data_dir /path --label_pos 0 --sep _
+LOSS choices:
+  ✓ D = squared Euclidean        ← both agree (t=180 calibrated to this)
+  ✓ d_ij = L2 norm               ← paper Eq.7/8 explicit ‖·‖_2
+  ✓ L_q = mean((|h|−1)²), w=0.5 ← released code form
+  ✓ L_rela = MSE of L2 dists     ← paper structure, MSE for gradient flow
+  ✓ L_hard + hinge clamp(·,0)    ← no reward for already-met constraints
+  ✓ Adam lr=0.001, α=1, β=0.8   ← paper Section V-B, Tables XI/XII
 """
 
 import os, random, logging, argparse, csv
@@ -39,7 +47,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader, Subset, Sampler
 from torchvision import transforms, models
 from PIL import Image
 from sklearn.metrics import roc_curve
@@ -48,50 +56,83 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s | %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
+# ╔══════════════════════════════════════════════════════════════╗
+# ║            >>>  CHANGE ONLY THIS SECTION  <<<               ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+DATA_DIR    = '/home/pai-ng/Jamal/CASIA-MS-ROI'
+                         # Path to the folder of pre-cropped 128×128 ROI images.
+                         # Supports two layouts:
+                         #   (a) Subdirectory per subject:  DATA_DIR/001/img1.bmp
+                         #   (b) Flat folder, label in name: DATA_DIR/001_L_01.bmp
+
+LABEL_POS   = 0          # Which token in the filename is the subject ID.
+                         # e.g. '001_L_01.bmp' split by '_' → token 0 = '001'
+
+SEP         = '_'        # Filename token separator.
+
+# ── Train / Test split ───────────────────────────────────────────
+# Paper Section V-B: "half … training set, remaining half … test set"
+# CASIA-MS has ~8-9 images per hand → 4 train / 4-5 test per subject.
+TRAIN_RATIO = 0.5        # 0.5 = 50% train / 50% test  (paper default)
+                         # Change to e.g. 0.6 for 60/40.
+
+# ── Batch composition ────────────────────────────────────────────
+# batch_size = NUM_PER × N_CLS_PER_BATCH
+# Rule: NUM_PER must be ≤ your per-subject TRAIN count.
+# CASIA-MS at 50/50 split → ~4 train per subject → NUM_PER = 4
+NUM_PER         = 4      # images per class per batch
+N_CLS_PER_BATCH = 12     # classes per batch  →  batch = 4 × 12 = 48
+
+# ── Training ─────────────────────────────────────────────────────
+TEACHER_ITERS = 10000    # Table XV: 10,000 iterations for teacher
+STUDENT_ITERS = 10000    # Table XV: 10,000 iterations for student/DDH
+LR            = 1e-3     # Adam learning rate (paper Section V-B)
+
+# ── Mid-training evaluation frequency ────────────────────────────
+# At every EVAL_EVERY iterations the model is evaluated on BOTH the
+# training set and test set, and Acc + EER are printed for each.
+# Set to 0 to disable mid-training evaluation (only final is shown).
+EVAL_EVERY = 2000
+
+# ── Loss-print frequency ─────────────────────────────────────────
+LOG_EVERY  = 500
+
+# ── Output directory ─────────────────────────────────────────────
+SAVE_DIR = './ckpt_best'
+
+# ══════════════════════════════════════════════════════════════════
+# Do not edit below this line unless you know what you are changing
+# ══════════════════════════════════════════════════════════════════
+
 CFG = dict(
-    data_dir        = "/home/pai-ng/Jamal/CASIA-MS-ROI",
-    label_pos       = 0,
-    sep             = '_',
-    train_ratio     = 0.5,           # first 50 % per subject → train
-
+    data_dir        = DATA_DIR,
+    label_pos       = LABEL_POS,
+    sep             = SEP,
+    train_ratio     = TRAIN_RATIO,
     hash_dim        = 128,
-    img_size        = 128,           # paper: 128×128 ROI (Section V-A)
-
-    # DHN loss (Eq.1-3)
-    margin_t        = 180.0,         # t in Eq.1 (paper: "set to 180, like [7]")
-    w_quant         = 1.0,           # w in Eq.3 (paper does not fix value;
-                                     # 1.0 = equal weight as a plain reading implies)
-
-    # Distillation weights (Eq.10, Tables XI/XII best)
+    img_size        = 128,
+    lrelu_alpha     = 0.2,
+    margin_t        = 180.0,
+    w_quant         = 0.5,
     alpha           = 1.0,
     beta            = 0.8,
-
-    # Optimisation (Section V-B, Table XV)
-    teacher_iters   = 10000,
-    student_iters   = 10000,
-    lr              = 1e-3,          # Adam lr=0.001
-
-    batch_size      = 32,            # pairs per batch
-    num_pairs       = 40000,         # pairs pre-sampled per pass
-
+    num_per         = NUM_PER,
+    n_cls_per_batch = N_CLS_PER_BATCH,
+    batch_size      = NUM_PER * N_CLS_PER_BATCH,
+    teacher_iters   = TEACHER_ITERS,
+    student_iters   = STUDENT_ITERS,
+    lr              = LR,
+    eval_every      = EVAL_EVERY,
+    log_every       = LOG_EVERY,
     num_workers     = 4,
-    log_every       = 500,
-    eval_every      = 2000,          # evaluate train+test every N iterations
-    save_dir        = './ckpt_paper',
+    save_dir        = SAVE_DIR,
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
 # DATASET
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
 class CASIADataset(Dataset):
-    """
-    Supports both layouts:
-      • Flat folder:  root/001_L_01.jpg  (label from filename token)
-      • Subdirectory: root/001/01.jpg    (label from folder name)
-    """
     EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.pgm', '.tiff'}
 
     def __init__(self, root, transform=None, label_pos=0, sep='_'):
@@ -102,17 +143,17 @@ class CASIADataset(Dataset):
 
         subdirs = sorted(d for d in os.listdir(root)
                          if os.path.isdir(os.path.join(root, d)))
-        if subdirs:                                # subdirectory layout
+        if subdirs:
             lbl_map = {s: i for i, s in enumerate(subdirs)}
             for subj in subdirs:
                 for fn in sorted(os.listdir(os.path.join(root, subj))):
                     if os.path.splitext(fn)[1].lower() in self.EXTS:
-                        idx = len(self.paths)
+                        i = len(self.paths)
                         self.paths.append(os.path.join(root, subj, fn))
                         lbl = lbl_map[subj]
                         self.labels.append(lbl)
-                        self.idx_by_label[lbl].append(idx)
-        else:                                      # flat layout
+                        self.idx_by_label[lbl].append(i)
+        else:
             files = sorted(fn for fn in os.listdir(root)
                            if os.path.splitext(fn)[1].lower() in self.EXTS)
             if not files:
@@ -122,10 +163,10 @@ class CASIADataset(Dataset):
             for fn in files:
                 sid = fn.split(sep)[label_pos]
                 lbl = lbl_map[sid]
-                idx = len(self.paths)
+                i   = len(self.paths)
                 self.paths.append(os.path.join(root, fn))
                 self.labels.append(lbl)
-                self.idx_by_label[lbl].append(idx)
+                self.idx_by_label[lbl].append(i)
 
     @property
     def num_classes(self): return len(self.idx_by_label)
@@ -137,51 +178,42 @@ class CASIADataset(Dataset):
 
 
 def split_dataset(ds, ratio=0.5):
-    """First `ratio` fraction of each subject's images → train."""
-    train_idx, test_idx = [], []
-    for lbl, idxs in ds.idx_by_label.items():
+    """
+    First `ratio` fraction of each subject's sorted images → train.
+    Remaining → test.  Mirrors paper Section V-B 50/50 protocol.
+    """
+    tr, te = [], []
+    for lbl, idxs in sorted(ds.idx_by_label.items()):
         k = max(1, int(len(idxs) * ratio))
-        train_idx.extend(idxs[:k])
-        test_idx.extend(idxs[k:])
-    return train_idx, test_idx
+        tr.extend(idxs[:k])
+        te.extend(idxs[k:])
+    return tr, te
 
 
-class PairDataset(Dataset):
-    """
-    Pre-generates (img_i, img_j, S_ij) triples.
-    S_ij = 1  for genuine (same subject), 0 for imposter.
-    """
-    def __init__(self, base_ds, indices, num_pairs, seed=42):
-        self.base = base_ds
-        rng = random.Random(seed)
-        lbl_map = defaultdict(list)
-        for i in indices:
-            lbl_map[base_ds.labels[i]].append(i)
-        valid_lbls = [l for l, v in lbl_map.items() if len(v) >= 2]
-        all_lbls   = list(lbl_map.keys())
-
-        pairs = []
-        half  = num_pairs // 2
-        # genuine pairs
-        for _ in range(half):
-            l    = rng.choice(valid_lbls)
-            a, b = rng.sample(lbl_map[l], 2)
-            pairs.append((a, b, 1.0))
-        # imposter pairs
-        for _ in range(num_pairs - half):
-            l1, l2 = rng.sample(all_lbls, 2)
-            a = rng.choice(lbl_map[l1])
-            b = rng.choice(lbl_map[l2])
-            pairs.append((a, b, 0.0))
-        rng.shuffle(pairs)
-        self.pairs = pairs
-
-    def __len__(self): return len(self.pairs)
-    def __getitem__(self, i):
-        a, b, s = self.pairs[i]
-        x1, _  = self.base[a]
-        x2, _  = self.base[b]
-        return x1, x2, torch.tensor(s, dtype=torch.float32)
+def print_split_summary(ds, tr_idx, te_idx):
+    """Print a clear description of the train/test sets."""
+    tr_set = set(tr_idx); te_set = set(te_idx)
+    per_tr = [sum(1 for i in v if i in tr_set)
+              for v in ds.idx_by_label.values()]
+    per_te = [sum(1 for i in v if i in te_set)
+              for v in ds.idx_by_label.values()]
+    log.info('')
+    log.info('  ┌─────────────────────────────────────────────────┐')
+    log.info('  │              TRAIN / TEST SPLIT                 │')
+    log.info('  ├─────────────────────────────────────────────────┤')
+    log.info(f'  │  Subjects (classes)  : {ds.num_classes:<27}│')
+    log.info(f'  │  Total images        : {len(ds):<27}│')
+    log.info(f'  │  Train images        : {len(tr_idx):<5}  '
+             f'({len(tr_idx)/len(ds)*100:.1f}% of total)          │')
+    log.info(f'  │  Test  images        : {len(te_idx):<5}  '
+             f'({len(te_idx)/len(ds)*100:.1f}% of total)          │')
+    log.info(f'  │  Train per subject   : {min(per_tr)}–{max(per_tr)} images'
+             f'{"":>28}│')
+    log.info(f'  │  Test  per subject   : {min(per_te)}–{max(per_te)} images'
+             f'{"":>28}│')
+    log.info(f'  │  Split rule          : first {TRAIN_RATIO:.0%} per subject → train │')
+    log.info('  └─────────────────────────────────────────────────┘')
+    log.info('')
 
 
 def get_transform(train=True, size=128):
@@ -195,104 +227,134 @@ def get_transform(train=True, size=128):
     return transforms.Compose(ops)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MODELS  — exact paper descriptions
-# ─────────────────────────────────────────────────────────────────────────────
+class ClassOrderedBatchSampler(Sampler):
+    """Each batch = [class_A×num_per, class_B×num_per, …]."""
+    def __init__(self, idx_by_label, train_indices,
+                 num_per, n_cls_per_batch, seed=42):
+        self.num_per = num_per
+        self.n_cls   = n_cls_per_batch
+        self.rng     = random.Random(seed)
+        tr_set       = set(train_indices)
+        self.lbl_idx = {
+            lbl: [i for i in idxs if i in tr_set]
+            for lbl, idxs in idx_by_label.items()
+            if any(i in tr_set for i in idxs)
+        }
+        self.labels = list(self.lbl_idx.keys())
+
+    def __iter__(self):
+        lbls = self.labels.copy()
+        self.rng.shuffle(lbls)
+        for start in range(0, len(lbls) - self.n_cls + 1, self.n_cls):
+            grp   = lbls[start: start + self.n_cls]
+            batch = []
+            for lbl in grp:
+                pool = self.lbl_idx[lbl]
+                k    = self.num_per
+                batch.extend(self.rng.sample(pool, k)
+                             if len(pool) >= k
+                             else self.rng.choices(pool, k=k))
+            yield batch
+
+    def __len__(self): return len(self.labels) // self.n_cls
+
+
+def make_onehot(labels_int, n_cls, device):
+    oh = torch.zeros(labels_int.shape[0], n_cls, device=device)
+    oh[torch.arange(labels_int.shape[0]), labels_int] = 1.0
+    return oh
+
+
+# ─────────────────────────────────────────────────────────────────
+# MODELS
+# ─────────────────────────────────────────────────────────────────
+class LReLU(nn.Module):
+    def __init__(self, a=0.2): super().__init__(); self.a = a
+    def forward(self, x): return torch.max(self.a * x, x)
+
+
 class TeacherDHN(nn.Module):
-    """
-    Paper Fig.5 / Section IV-A:
-    VGG-16 backbone (all 5 conv-batches + pooling = features[0:31]).
-    • Batch 1–4 (features[0:23]) : pretrained ImageNet weights, fine-tuned.
-    • Batch 5   (features[23:30]): re-initialised, trained from scratch.
-    • AdaptiveAvgPool → Flatten
-    • FC head (trained from scratch):
-        Linear(flat→4096, ReLU, Dropout) →
-        Linear(4096→4096, ReLU, Dropout) →
-        Linear(4096→128,  Tanh)          ← coding layer
-    Paper says "DHN transforms the softmax layer of VGG-16 into a coding
-    layer"; original VGG has FC(4096)→FC(4096)→FC(1000), so we replace
-    the last layer with FC(128, tanh).
-    """
-    def __init__(self, hash_dim=128, pretrained=True):
+    """VGG pool4 frozen + trainable conv5 block + FC head."""
+    def __init__(self, hash_dim=128, img_size=128, alpha=0.2):
         super().__init__()
-        vgg = models.vgg16(weights='IMAGENET1K_V1' if pretrained else None)
+        vgg = models.vgg16(weights='IMAGENET1K_V1')
+        self.backbone = nn.Sequential(*list(vgg.features.children())[:24])
+        for p in self.backbone.parameters(): p.requires_grad_(False)
 
-        # ── Backbone: all 5 conv batches + pooling layers
-        self.features   = vgg.features          # indices 0-30  (31 layers)
-        self.avgpool    = nn.AdaptiveAvgPool2d((4, 4))   # safe for any input
-
-        # ── batch5 (features[24:30]) trained from scratch per paper
-        for m in list(self.features.children())[24:30]:
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                nn.init.zeros_(m.bias)
-
-        # ── FC head: replaces VGG classifier; all trained from scratch
-        flat = 512 * 4 * 4
-        self.head = nn.Sequential(
-            nn.Linear(flat, 4096), nn.ReLU(inplace=True), nn.Dropout(0.5),
-            nn.Linear(4096, 4096), nn.ReLU(inplace=True), nn.Dropout(0.5),
-            nn.Linear(4096, hash_dim),             # coding layer
-            nn.Tanh(),
+        self.conv5 = nn.Sequential(
+            nn.Conv2d(512, 512, 3, padding=1),
+            nn.BatchNorm2d(512, eps=1e-5), LReLU(alpha),
+            nn.Conv2d(512, 512, 3, padding=1),
+            nn.BatchNorm2d(512, eps=1e-5), LReLU(alpha),
+            nn.Conv2d(512, 512, 3, padding=1),
+            nn.BatchNorm2d(512, eps=1e-5), LReLU(alpha),
+            nn.MaxPool2d(2, stride=2),
         )
-        for m in self.head.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.trunc_normal_(m.weight, std=0.01)
-                nn.init.zeros_(m.bias)
+        flat = self._flat(img_size)
+        self.fc = nn.Sequential(
+            nn.Linear(flat, 4096),
+            nn.BatchNorm1d(4096, eps=1e-5), LReLU(alpha),
+            nn.Linear(4096, 4096),
+            nn.BatchNorm1d(4096, eps=1e-5), LReLU(alpha),
+            nn.Linear(4096, 2048),
+            nn.BatchNorm1d(2048, eps=1e-5), LReLU(alpha),
+            nn.Linear(2048, hash_dim), nn.Tanh(),
+        )
+        self._init()
+
+    def _flat(self, s):
+        with torch.no_grad():
+            x = self.backbone(torch.zeros(1, 3, s, s))
+            return self.conv5(x).view(1, -1).shape[1]
+
+    def _init(self):
+        for m in list(self.conv5.modules()) + list(self.fc.modules()):
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu', a=0.2)
+                if m.bias is not None: nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.1)
+                if m.bias is not None: nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        x = self.features(x)
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        return self.head(x)                       # h ∈ (−1,+1)^D
+        with torch.no_grad(): x = self.backbone(x)
+        return self.fc(torch.flatten(self.conv5(x), 1))
 
     @torch.no_grad()
-    def get_codes(self, x):
-        return torch.sign(self.forward(x))        # b ∈ {−1,+1}^D
+    def get_codes(self, x): return torch.sign(self.forward(x))
 
 
 class StudentDHN(nn.Module):
-    """
-    Paper Fig.6 exactly:
-      Conv1: 3×3,16ch,stride=4,padding=0(VALID) → ReLU → MaxPool(2×2,stride=1)
-      Conv2: 5×5,32ch,stride=2,padding=0(VALID) → ReLU → MaxPool(2×2,stride=1)
-      FC1:   → 512, ReLU
-      FC3:   → 128, Tanh        (paper labels it FC3; it is the second FC layer)
-      Code:  sign() at inference
-    Standard ReLU, NO batch-norm. (paper Fig.6 shows ReLU boxes, no BN mentioned)
-    """
-    def __init__(self, hash_dim=128, img_size=128):
+    """Paper Fig.6 + BN/LReLU from released code."""
+    def __init__(self, hash_dim=128, img_size=128, alpha=0.2):
         super().__init__()
         self.conv = nn.Sequential(
-            # Conv1 (paper: 3×3×16, stride=4, padding=0)
-            nn.Conv2d(3,  16, kernel_size=3, stride=4, padding=0),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=1),    # 2×2, stride=1
-
-            # Conv2 (paper: 5×5×32, stride=2, padding=0)
-            nn.Conv2d(16, 32, kernel_size=5, stride=2, padding=0),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=1),    # 2×2, stride=1
+            nn.Conv2d(3,  16, 3, stride=4, padding=0),    # VALID
+            nn.BatchNorm2d(16, eps=1e-5), LReLU(alpha),
+            nn.MaxPool2d(2, stride=1),
+            nn.Conv2d(16, 32, 5, stride=2, padding=2),    # SAME
+            nn.BatchNorm2d(32, eps=1e-5), LReLU(alpha),
+            nn.MaxPool2d(2, stride=1),
         )
-        flat = self._flat_dim(img_size)
+        flat = self._flat(img_size)
         self.fc = nn.Sequential(
-            nn.Linear(flat, 512),     nn.ReLU(inplace=True),   # FC1
-            nn.Linear(512, hash_dim), nn.Tanh(),                # FC3 / coding
+            nn.Linear(flat, 512), nn.BatchNorm1d(512, eps=1e-5), LReLU(alpha),
+            nn.Linear(512, hash_dim), nn.Tanh(),
         )
-        self._init_weights()
+        self._init()
 
-    def _flat_dim(self, s):
+    def _flat(self, s):
         with torch.no_grad():
             return self.conv(torch.zeros(1, 3, s, s)).view(1, -1).shape[1]
 
-    def _init_weights(self):
+    def _init(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                nn.init.zeros_(m.bias)
+                nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu', a=0.2)
+                if m.bias is not None: nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
                 nn.init.trunc_normal_(m.weight, std=0.1)
-                nn.init.zeros_(m.bias)
+                if m.bias is not None: nn.init.zeros_(m.bias)
 
     def forward(self, x):
         return self.fc(torch.flatten(self.conv(x), 1))
@@ -301,74 +363,94 @@ class StudentDHN(nn.Module):
     def get_codes(self, x): return torch.sign(self.forward(x))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LOSS FUNCTIONS — strict paper equations
-# ─────────────────────────────────────────────────────────────────────────────
-def loss_dhn_paper(h1, h2, s, t=180.0, w=1.0):
-    """
-    Eq.1:  L_h_{i,j} = 0.5·S·D + 0.5·(1−S)·max(t−D,0)
-           D = ‖h_i − h_j‖²  (squared Euclidean — t=180 is calibrated to this)
-    Eq.2:  L_q_i = ‖|h_i| − 1‖_2   (vector L2 norm per sample, then mean)
-    Eq.3:  L_DHN = L_h + w·L_q
-    """
-    # Eq.1 — squared Euclidean distance
-    D  = torch.sum((h1 - h2) ** 2, dim=1)                    # [B]
+# ─────────────────────────────────────────────────────────────────
+# LOSS FUNCTIONS
+# ─────────────────────────────────────────────────────────────────
+def _sq_dist(A, B=None):
+    if B is None: B = A
+    return ((A * A).sum(1, keepdim=True) +
+            (B * B).sum(1, keepdim=True).t()
+            - 2.0 * A @ B.t()).clamp(min=0.0)
+
+
+def _l2_dist(A, B=None, eps=1e-8):
+    # eps MUST be inside the sqrt — sqrt'(0) = inf causes NaN in backprop
+    # without it the diagonal (self-distance = 0) gives infinite gradient
+    return (_sq_dist(A, B) + eps).sqrt()
+
+
+def loss_dhn(h1, h2, s, t=180.0, w=0.5):
+    D  = torch.sum((h1 - h2) ** 2, dim=1)
     Lh = (0.5 * s * D +
           0.5 * (1.0 - s) * torch.clamp(t - D, min=0.0)).mean()
-
-    # Eq.2 — VECTOR L2 norm per sample (not MSE), then mean
-    Lq = (torch.norm(torch.abs(h1) - 1.0, p=2, dim=1).mean() +
-          torch.norm(torch.abs(h2) - 1.0, p=2, dim=1).mean()) / 2.0
-
+    Lq = ((torch.abs(h1) - 1.0).pow(2).mean() +
+          (torch.abs(h2) - 1.0).pow(2).mean()) / 2.0
     return Lh + w * Lq, Lh, Lq
 
 
-def loss_rela_paper(bT1, bT2, bS1, bS2):
-    """
-    Eq.6:  L_rela = ‖d^T − d^S‖_2
-    Eq.7:  d_ij^T = ‖b_i^T − b_j^T‖_2  (L2 norm, NOT squared)
-    Eq.8:  d_ij^S = ‖b_i^S − b_j^S‖_2  (L2 norm)
-    The outer ‖·‖_2 in Eq.6 is the L2 norm of the vector of differences.
-    """
-    dT = torch.norm(bT1 - bT2, p=2, dim=1)   # [B]
-    dS = torch.norm(bS1 - bS2, p=2, dim=1)   # [B]
-    return torch.norm(dT - dS, p=2)           # scalar
+def loss_dhn_batch(h, label_oh, batch_size, omega, t=180.0, w=0.5):
+    f_a, f_s = h[:omega], h[omega:]
+    la, ls   = label_oh[:omega], label_oh[omega:]
+    d_aa_sq  = _sq_dist(f_a)
+    d_as_sq  = _sq_dist(f_a, f_s)
+    d_aa_l2  = d_aa_sq.sqrt()
+    d_as_l2  = d_as_sq.sqrt()
+    sim_aa   = la @ la.t()
+    sim_as   = la @ ls.t()
+
+    def cont(d_sq, sim):
+        return (0.5 * sim * d_sq +
+                0.5 * (1.0 - sim) * torch.clamp(t - d_sq, min=0.0)).mean()
+
+    hl = cont(d_aa_sq, sim_aa) + cont(d_as_sq, sim_as)
+    ql = torch.mean((torch.abs(h) - 1.0) ** 2)
+    return hl + w * ql, d_aa_l2, d_as_l2
 
 
-def loss_hard_paper(bT1, bT2, bS1, bS2, s):
-    """
-    Eq.9:  L_hard (exactly as written — NO clamp):
-      For genuines  (S=1): max_S(d_genuine)  − min_T(d_genuine)
-      For imposters (S=0): max_T(d_imposter) − min_S(d_imposter)
-    d_ij = ‖b_i − b_j‖_2  (L2 norm, consistent with Eq.7/8)
-    """
-    dT = torch.norm(bT1 - bT2, p=2, dim=1)
-    dS = torch.norm(bS1 - bS2, p=2, dim=1)
-    gm = s.bool(); im = ~gm
-
-    loss = bT1.new_zeros(())
-    if gm.sum() >= 2:
-        loss = loss + (dS[gm].max() - dT[gm].min())    # Eq.9 genuine term
-    if im.sum() >= 2:
-        loss = loss + (dT[im].max() - dS[im].min())    # Eq.9 imposter term
-    return loss
+def loss_rela(s_aa, s_as, t_aa, t_as):
+    return (torch.mean((s_aa - t_aa) ** 2) +
+            torch.mean((s_as - t_as) ** 2))
 
 
-def loss_student_total(bT1, bT2, bS1, bS2, s, cfg):
-    """Eq.10: L = L_DHN + α·L_rela + β·L_hard"""
-    Ldhn, Lh, Lq = loss_dhn_paper(bS1, bS2, s, cfg['margin_t'], cfg['w_quant'])
-    Lrela         = loss_rela_paper(bT1, bT2, bS1, bS2)
-    Lhard         = loss_hard_paper(bT1, bT2, bS1, bS2, s)
-    total = Ldhn + cfg['alpha'] * Lrela + cfg['beta'] * Lhard
-    return total, Ldhn, Lrela, Lhard
+def loss_hard(feat_T, feat_S, label_oh, batch_size, num_per):
+    T_d   = _l2_dist(feat_T)   # eps already inside sqrt — no NaN gradient
+    S_d   = _l2_dist(feat_S)
+    lbl_m = label_oh @ label_oh.t()
+    T_pos = lbl_m * T_d;  T_neg = (1.0 - lbl_m) * T_d
+    S_pos = lbl_m * S_d;  S_neg = (1.0 - lbl_m) * S_d
+    pos_l, neg_l = [], []
+    n_blk = batch_size // num_per
+
+    # Pre-build diagonal mask for genuine blocks (size num_per × num_per).
+    # The diagonal is the self-distance ≈ 0 (eps only).
+    # Without masking, T_blk.min() = 0 always → genuine constraint is
+    # always violated → loss is always large → gradients explode.
+    diag_mask = torch.eye(num_per, dtype=torch.bool, device=feat_T.device)
+
+    for i in range(n_blk):
+        s, e = i * num_per, (i + 1) * num_per
+
+        # ── Genuine block: off-diagonal pairs only
+        T_blk = T_pos[s:e, s:e]
+        S_blk = S_pos[s:e, s:e]
+        # Mask diagonal out of min/max so self-distances don't dominate
+        T_blk_od = T_blk.masked_fill(diag_mask, float('inf'))   # for min
+        S_blk_od = S_blk.masked_fill(diag_mask, 0.0)            # for max
+        pos_l.append(torch.clamp(S_blk_od.max() - T_blk_od.min(), min=0.0))
+
+        # ── Imposter block: all columns outside class i
+        T_n = torch.cat([T_neg[s:e, :s], T_neg[s:e, e:]], dim=1)
+        S_n = torch.cat([S_neg[s:e, :s], S_neg[s:e, e:]], dim=1)
+        neg_l.append(torch.clamp(T_n.max() - S_n.min(), min=0.0))
+
+    return torch.stack(pos_l).mean() + torch.stack(neg_l).mean()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# EVALUATION HELPERS  (used during training and at final eval)
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# EVALUATION HELPERS
+# ─────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def _extract_codes_internal(model, loader, device):
-    """Extract binary codes; preserves model.training state."""
+def extract_codes(model, loader, device):
     was_training = model.training
     model.eval()
     codes, labels = [], []
@@ -381,17 +463,17 @@ def _extract_codes_internal(model, loader, device):
     return np.vstack(codes), np.concatenate(labels)
 
 
-def _id_acc(tr_codes, tr_labels, te_codes, te_labels):
-    """1-NN by Hamming distance. Training set used as gallery."""
+def identification_accuracy(tr_codes, tr_labels, te_codes, te_labels):
+    """1-NN by Hamming distance.  Returns accuracy %."""
     correct = 0
     for code, true_lbl in zip(te_codes, te_labels):
-        ham = np.sum(code != tr_codes, axis=1)
+        ham     = np.sum(code != tr_codes, axis=1)
         correct += int(tr_labels[np.argmin(ham)] == true_lbl)
     return correct / len(te_labels) * 100.0
 
 
-def _eer(tr_codes, tr_labels, te_codes, te_labels):
-    """EER via sklearn roc_curve with negative-Hamming similarity."""
+def compute_eer(tr_codes, tr_labels, te_codes, te_labels):
+    """EER via roc_curve with negative-Hamming as similarity score."""
     scores, truth = [], []
     for code, lbl in zip(te_codes, te_labels):
         sim = -np.sum(code != tr_codes, axis=1).astype(np.float32)
@@ -405,16 +487,38 @@ def _eer(tr_codes, tr_labels, te_codes, te_labels):
 
 def run_metrics(model, tr_ld, te_ld, device):
     """
-    Returns (train_acc, train_eer, test_acc, test_eer).
-    Train set is used as gallery for both train-query and test-query.
+    Compute Acc and EER for both training set and test set.
+    Train metrics: 1-NN retrieval within the training set itself.
+    Test  metrics: 1-NN retrieval from test codes against training gallery.
+    Returns (tr_acc, tr_eer, te_acc, te_eer).
     """
-    tr_c, tr_l = _extract_codes_internal(model, tr_ld, device)
-    te_c, te_l = _extract_codes_internal(model, te_ld, device)
-    tr_acc = _id_acc(tr_c, tr_l, tr_c, tr_l)
-    tr_eer = _eer(tr_c, tr_l, tr_c, tr_l)
-    te_acc = _id_acc(tr_c, tr_l, te_c, te_l)
-    te_eer = _eer(tr_c, tr_l, te_c, te_l)
+    tr_c, tr_l = extract_codes(model, tr_ld, device)
+    te_c, te_l = extract_codes(model, te_ld, device)
+    tr_acc = identification_accuracy(tr_c, tr_l, tr_c, tr_l)
+    tr_eer = compute_eer(tr_c, tr_l, tr_c, tr_l)
+    te_acc = identification_accuracy(tr_c, tr_l, te_c, te_l)
+    te_eer = compute_eer(tr_c, tr_l, te_c, te_l)
     return tr_acc, tr_eer, te_acc, te_eer
+
+
+def _print_metrics_row(label, tr_acc, tr_eer, te_acc, te_eer):
+    log.info(
+        f'  {label:22s}'
+        f'  TRAIN  Acc={tr_acc:6.2f}%  EER={tr_eer:5.2f}%'
+        f'   │   TEST   Acc={te_acc:6.2f}%  EER={te_eer:5.2f}%'
+    )
+
+
+def _make_eval_loaders(cfg, tr_idx, te_idx):
+    """Build eval-transform DataLoaders for train and test subsets."""
+    ds = CASIADataset(cfg['data_dir'],
+                      get_transform(False, cfg['img_size']),
+                      cfg['label_pos'], cfg['sep'])
+    tr_ld = DataLoader(Subset(ds, tr_idx), 64,
+                       num_workers=cfg['num_workers'], pin_memory=True)
+    te_ld = DataLoader(Subset(ds, te_idx), 64,
+                       num_workers=cfg['num_workers'], pin_memory=True)
+    return tr_ld, te_ld
 
 
 def _save_csv(rows, save_dir, fname):
@@ -425,42 +529,38 @@ def _save_csv(rows, save_dir, fname):
         w.writeheader(); w.writerows(rows)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
 # TRAINING
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
 def _infinite(loader):
-    """Cycle a DataLoader infinitely — for iteration-based training."""
     while True:
         for batch in loader:
             yield batch
 
 
 def train_teacher(cfg, device):
-    log.info('=' * 65)
-    log.info('STAGE 1 – Teacher (VGG-16 DHN, paper Fig.5)')
-    log.info('=' * 65)
+    log.info('=' * 70)
+    log.info('STAGE 1 – Teacher  (VGG pool4 frozen + conv5/FC  |  Adam lr=0.001)')
+    log.info('=' * 70)
 
-    ds_tr   = CASIADataset(cfg['data_dir'],
-                           get_transform(True, cfg['img_size']),
-                           cfg['label_pos'], cfg['sep'])
-    ds_eval = CASIADataset(cfg['data_dir'],
-                           get_transform(False, cfg['img_size']),
-                           cfg['label_pos'], cfg['sep'])
+    # ── Build datasets
+    ds_tr = CASIADataset(cfg['data_dir'], get_transform(True,  cfg['img_size']),
+                         cfg['label_pos'], cfg['sep'])
     tr_idx, te_idx = split_dataset(ds_tr, cfg['train_ratio'])
-    log.info(f'  {len(ds_tr)} images | {ds_tr.num_classes} subjects')
-    log.info(f'  Train: {len(tr_idx)} images  |  Test: {len(te_idx)} images')
+    print_split_summary(ds_tr, tr_idx, te_idx)
+    tr_ld, te_ld = _make_eval_loaders(cfg, tr_idx, te_idx)
+    num_cl = ds_tr.num_classes
+    B      = cfg['batch_size']
 
-    pairs  = PairDataset(ds_tr, tr_idx, cfg['num_pairs'])
-    loader = DataLoader(pairs, cfg['batch_size'], shuffle=True,
-                        num_workers=cfg['num_workers'], pin_memory=True,
-                        drop_last=True)
-    tr_ld  = DataLoader(Subset(ds_eval, tr_idx), 64,
-                        num_workers=cfg['num_workers'], pin_memory=True)
-    te_ld  = DataLoader(Subset(ds_eval, te_idx), 64,
+    sampler = ClassOrderedBatchSampler(
+        ds_tr.idx_by_label, tr_idx, cfg['num_per'], cfg['n_cls_per_batch'])
+    loader = DataLoader(ds_tr, batch_sampler=sampler,
                         num_workers=cfg['num_workers'], pin_memory=True)
 
-    model = TeacherDHN(cfg['hash_dim'], pretrained=True).to(device)
-    opt   = optim.Adam(model.parameters(), lr=cfg['lr'])
+    model = TeacherDHN(cfg['hash_dim'], cfg['img_size'],
+                       cfg['lrelu_alpha']).to(device)
+    opt   = optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=cfg['lr'])
 
     model.train()
     it      = _infinite(loader)
@@ -468,16 +568,26 @@ def train_teacher(cfg, device):
     history = []
 
     log.info(f'  {"Iter":>6}  {"Loss":>9}  {"Lh":>9}  {"Lq":>9}')
-    log.info('  ' + '─' * 42)
+    log.info('  ' + '─' * 40)
 
     for step in range(1, cfg['teacher_iters'] + 1):
-        x1, x2, s = next(it)
-        x1, x2, s = x1.to(device), x2.to(device), s.to(device)
-        h1, h2 = model(x1), model(x2)
-        loss, Lh, Lq = loss_dhn_paper(h1, h2, s, cfg['margin_t'], cfg['w_quant'])
+        imgs, labels_int = next(it)
+        imgs, labels_int = imgs.to(device), labels_int.to(device)
+        if imgs.shape[0] != B: continue
+
+        loh = make_onehot(labels_int, num_cl, device)
+        h   = model(imgs)
+
+        h1 = h.unsqueeze(1).expand(-1, B, -1).reshape(B * B, -1)
+        h2 = h.unsqueeze(0).expand(B, -1, -1).reshape(B * B, -1)
+        s  = (loh @ loh.t()).reshape(-1)
+        ut = torch.triu(torch.ones(B, B, device=device),
+                        diagonal=1).bool().reshape(-1)
+        h1p, h2p, sp = h1[ut], h2[ut], s[ut]
+
+        loss, Lh, Lq = loss_dhn(h1p, h2p, sp, cfg['margin_t'], cfg['w_quant'])
         opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
+        loss.backward(); opt.step()
 
         if step % cfg['log_every'] == 0 or step == 1:
             log.info(f'  {step:6d}  {loss.item():9.4f}  '
@@ -485,11 +595,11 @@ def train_teacher(cfg, device):
 
         # ── Periodic train + test evaluation
         if cfg['eval_every'] > 0 and step % cfg['eval_every'] == 0:
-            log.info(f'  ── Eval @ iter {step} {"─"*42}')
+            log.info(f'  ── Eval @ iter {step} {"─"*45}')
             tr_acc, tr_eer, te_acc, te_eer = run_metrics(
                 model, tr_ld, te_ld, device)
-            log.info(f'  TRAIN  Acc={tr_acc:6.2f}%  EER={tr_eer:5.2f}%   │   '
-                     f'TEST   Acc={te_acc:6.2f}%  EER={te_eer:5.2f}%')
+            _print_metrics_row(f'Teacher iter {step}',
+                               tr_acc, tr_eer, te_acc, te_eer)
             history.append(dict(iter=step, tr_acc=tr_acc, tr_eer=tr_eer,
                                 te_acc=te_acc, te_eer=te_eer))
             if te_acc > best_te:
@@ -498,23 +608,23 @@ def train_teacher(cfg, device):
                 torch.save(model.state_dict(),
                            os.path.join(cfg['save_dir'], 'teacher.pth'))
                 log.info(f'  ✓ New best teacher  (test Acc={te_acc:.2f}%)')
-            log.info(f'  {"─"*60}')
+            log.info(f'  {"─"*64}')
 
-    # ── Always save at end if eval_every=0 or no save triggered
+    # ── Final save (if eval_every=0 nothing was saved yet)
     os.makedirs(cfg['save_dir'], exist_ok=True)
-    ckpt_path = os.path.join(cfg['save_dir'], 'teacher.pth')
-    if not os.path.exists(ckpt_path):
-        torch.save(model.state_dict(), ckpt_path)
+    final_path = os.path.join(cfg['save_dir'], 'teacher.pth')
+    if not os.path.exists(final_path):
+        torch.save(model.state_dict(), final_path)
 
     # ── Final evaluation
     log.info('')
     log.info('  ── TEACHER FINAL EVALUATION ──')
-    log.info(f'  {"Set":20s}  {"Acc (%)":>10}  {"EER (%)":>10}')
-    log.info('  ' + '─' * 44)
+    log.info(f'  {"Set":22s}  {"Acc (%)":>10}  {"EER (%)":>10}')
+    log.info('  ' + '─' * 46)
     tr_acc, tr_eer, te_acc, te_eer = run_metrics(model, tr_ld, te_ld, device)
-    log.info(f'  {"Training set":20s}  {tr_acc:>10.2f}  {tr_eer:>10.2f}')
-    log.info(f'  {"Test set":20s}  {te_acc:>10.2f}  {te_eer:>10.2f}')
-    log.info(f'  Teacher → {ckpt_path}')
+    log.info(f'  {"Training set":22s}  {tr_acc:>10.2f}  {tr_eer:>10.2f}')
+    log.info(f'  {"Test set":22s}  {te_acc:>10.2f}  {te_eer:>10.2f}')
+    log.info(f'  Teacher checkpoint → {final_path}')
 
     history.append(dict(iter='final', tr_acc=tr_acc, tr_eer=tr_eer,
                         te_acc=te_acc, te_eer=te_eer))
@@ -523,49 +633,48 @@ def train_teacher(cfg, device):
 
 
 def train_student(cfg, device, teacher=None):
-    log.info('=' * 65)
-    log.info('STAGE 2 – Student DDH (Eq.10, α=1, β=0.8)')
-    log.info('=' * 65)
+    log.info('=' * 70)
+    log.info('STAGE 2 – Student DDH  (Adam  |  α=1  β=0.8  |  10 000 iters)')
+    log.info('=' * 70)
 
-    ds_tr   = CASIADataset(cfg['data_dir'],
-                           get_transform(True, cfg['img_size']),
-                           cfg['label_pos'], cfg['sep'])
-    ds_eval = CASIADataset(cfg['data_dir'],
-                           get_transform(False, cfg['img_size']),
-                           cfg['label_pos'], cfg['sep'])
+    # ── Build datasets
+    ds_tr = CASIADataset(cfg['data_dir'], get_transform(True,  cfg['img_size']),
+                         cfg['label_pos'], cfg['sep'])
     tr_idx, te_idx = split_dataset(ds_tr, cfg['train_ratio'])
-    log.info(f'  Train: {len(tr_idx)} images  |  Test: {len(te_idx)} images')
+    print_split_summary(ds_tr, tr_idx, te_idx)
+    tr_ld, te_ld = _make_eval_loaders(cfg, tr_idx, te_idx)
+    num_cl = ds_tr.num_classes
+    B      = cfg['batch_size']
+    omega  = B // 2
 
-    pairs  = PairDataset(ds_tr, tr_idx, cfg['num_pairs'])
-    loader = DataLoader(pairs, cfg['batch_size'], shuffle=True,
-                        num_workers=cfg['num_workers'], pin_memory=True,
-                        drop_last=True)
-    tr_ld  = DataLoader(Subset(ds_eval, tr_idx), 64,
-                        num_workers=cfg['num_workers'], pin_memory=True)
-    te_ld  = DataLoader(Subset(ds_eval, te_idx), 64,
+    sampler = ClassOrderedBatchSampler(
+        ds_tr.idx_by_label, tr_idx, cfg['num_per'], cfg['n_cls_per_batch'])
+    loader = DataLoader(ds_tr, batch_sampler=sampler,
                         num_workers=cfg['num_workers'], pin_memory=True)
 
+    # ── Load teacher
     if teacher is None:
-        teacher = TeacherDHN(cfg['hash_dim'], pretrained=False).to(device)
+        teacher = TeacherDHN(cfg['hash_dim'], cfg['img_size'],
+                             cfg['lrelu_alpha']).to(device)
         ckpt = os.path.join(cfg['save_dir'], 'teacher.pth')
         teacher.load_state_dict(torch.load(ckpt, map_location=device))
         log.info(f'  Teacher loaded from {ckpt}')
     teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
+    for p in teacher.parameters(): p.requires_grad_(False)
 
-    # ── Teacher baseline before student training
-    log.info('  ── Teacher baseline ──')
-    log.info(f'  {"Set":20s}  {"Acc (%)":>10}  {"EER (%)":>10}')
-    log.info('  ' + '─' * 44)
+    # ── Baseline: teacher performance before student training starts
+    log.info('  ── Teacher baseline (before student training) ──')
+    log.info(f'  {"Set":22s}  {"Acc (%)":>10}  {"EER (%)":>10}')
+    log.info('  ' + '─' * 46)
     tch_tr_acc, tch_tr_eer, tch_te_acc, tch_te_eer = run_metrics(
         teacher, tr_ld, te_ld, device)
-    log.info(f'  {"Training set":20s}  {tch_tr_acc:>10.2f}  {tch_tr_eer:>10.2f}')
-    log.info(f'  {"Test set":20s}  {tch_te_acc:>10.2f}  {tch_te_eer:>10.2f}')
+    log.info(f'  {"Training set":22s}  {tch_tr_acc:>10.2f}  {tch_tr_eer:>10.2f}')
+    log.info(f'  {"Test set":22s}  {tch_te_acc:>10.2f}  {tch_te_eer:>10.2f}')
     log.info('')
 
-    student = StudentDHN(cfg['hash_dim'], cfg['img_size']).to(device)
-    opt     = optim.Adam(student.parameters(), lr=cfg['lr'])
+    student = StudentDHN(cfg['hash_dim'], cfg['img_size'],
+                         cfg['lrelu_alpha']).to(device)
+    opt = optim.Adam(student.parameters(), lr=cfg['lr'])
 
     student.train()
     it      = _infinite(loader)
@@ -574,23 +683,32 @@ def train_student(cfg, device, teacher=None):
 
     log.info(f'  {"Iter":>6}  {"Loss":>9}  {"DHN":>9}  '
              f'{"Lrela":>9}  {"Lhard":>9}')
-    log.info('  ' + '─' * 54)
+    log.info('  ' + '─' * 55)
 
     for step in range(1, cfg['student_iters'] + 1):
-        x1, x2, s = next(it)
-        x1, x2, s = x1.to(device), x2.to(device), s.to(device)
+        imgs, labels_int = next(it)
+        imgs, labels_int = imgs.to(device), labels_int.to(device)
+        if imgs.shape[0] != B: continue
+
+        loh = make_onehot(labels_int, num_cl, device)
 
         with torch.no_grad():
-            bT1, bT2 = teacher(x1), teacher(x2)
-        bS1, bS2 = student(x1), student(x2)
+            h_T = teacher(imgs)
+        _, t_aa, t_as = loss_dhn_batch(
+            h_T, loh, B, omega, cfg['margin_t'], cfg['w_quant'])
 
-        loss, Ldhn, Lrela, Lhard = loss_student_total(
-            bT1, bT2, bS1, bS2, s, cfg)
+        h_S = student(imgs)
+        dhn_s, s_aa, s_as = loss_dhn_batch(
+            h_S, loh, B, omega, cfg['margin_t'], cfg['w_quant'])
 
-        # Guard: skip batch if non-finite
+        Lrela = loss_rela(s_aa, s_as, t_aa, t_as)
+        Lhard = loss_hard(h_T, h_S, loh, B, cfg['num_per'])
+        loss  = dhn_s + cfg['alpha'] * Lrela + cfg['beta'] * Lhard
+
+        # Guard: skip batch and warn if any loss component is NaN/Inf
         if not torch.isfinite(loss):
             log.warning(f'  iter {step}: non-finite loss '
-                        f'(DHN={Ldhn.item():.4f} '
+                        f'(DHN={dhn_s.item():.4f} '
                         f'Lrela={Lrela.item():.4f} '
                         f'Lhard={Lhard.item():.4f}) — skipping batch')
             opt.zero_grad(set_to_none=True)
@@ -598,22 +716,24 @@ def train_student(cfg, device, teacher=None):
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
+        # Clip gradients — large initial Lrela/Lhard can spike before
+        # student weights settle; clipping prevents that spike going NaN
         torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=5.0)
         opt.step()
 
         if step % cfg['log_every'] == 0 or step == 1:
             log.info(f'  {step:6d}  {loss.item():9.4f}  '
-                     f'{Ldhn.item():9.4f}  '
+                     f'{dhn_s.item():9.4f}  '
                      f'{Lrela.item():9.4f}  '
                      f'{Lhard.item():9.4f}')
 
         # ── Periodic train + test evaluation
         if cfg['eval_every'] > 0 and step % cfg['eval_every'] == 0:
-            log.info(f'  ── Eval @ iter {step} {"─"*42}')
+            log.info(f'  ── Eval @ iter {step} {"─"*45}')
             tr_acc, tr_eer, te_acc, te_eer = run_metrics(
                 student, tr_ld, te_ld, device)
-            log.info(f'  TRAIN  Acc={tr_acc:6.2f}%  EER={tr_eer:5.2f}%   │   '
-                     f'TEST   Acc={te_acc:6.2f}%  EER={te_eer:5.2f}%')
+            _print_metrics_row(f'Student iter {step}',
+                               tr_acc, tr_eer, te_acc, te_eer)
             history.append(dict(iter=step, tr_acc=tr_acc, tr_eer=tr_eer,
                                 te_acc=te_acc, te_eer=te_eer))
             if te_acc > best_te:
@@ -622,20 +742,21 @@ def train_student(cfg, device, teacher=None):
                 torch.save(student.state_dict(),
                            os.path.join(cfg['save_dir'], 'student.pth'))
                 log.info(f'  ✓ New best student  (test Acc={te_acc:.2f}%)')
-            log.info(f'  {"─"*60}')
+            log.info(f'  {"─"*64}')
 
-    # ── Save at end if nothing was saved yet
+    # ── Final save
     os.makedirs(cfg['save_dir'], exist_ok=True)
     stu_path = os.path.join(cfg['save_dir'], 'student.pth')
     if not os.path.exists(stu_path):
         torch.save(student.state_dict(), stu_path)
 
-    # ── Final comparison table: Teacher vs DDH
+    # ── Final comparison table: Teacher vs Student/DDH
     log.info('')
-    log.info('  ══ FINAL RESULTS ══════════════════════════════════════════')
+    log.info('  ══ FINAL RESULTS  ══════════════════════════════════════════')
     log.info(f'  {"Model":22s}  {"Train Acc":>10}  {"Train EER":>10}  '
              f'{"Test Acc":>10}  {"Test EER":>10}')
     log.info('  ' + '─' * 68)
+
     all_results = []
     for name, m in [('Teacher', teacher), ('DDH (Student)', student)]:
         tr_acc, tr_eer, te_acc, te_eer = run_metrics(m, tr_ld, te_ld, device)
@@ -650,76 +771,45 @@ def train_student(cfg, device, teacher=None):
                             tr_acc=tr_acc, tr_eer=tr_eer,
                             te_acc=te_acc, te_eer=te_eer))
 
-    log.info(f'  Student → {stu_path}')
+    log.info(f'  Student checkpoint → {stu_path}')
     _save_csv(all_results, cfg['save_dir'], 'results_final.csv')
     _save_csv(history,     cfg['save_dir'], 'student_history.csv')
     log.info(f"  CSV → {os.path.join(cfg['save_dir'], 'results_final.csv')}")
     return student
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# EVALUATION
-# ─────────────────────────────────────────────────────────────────────────────
-@torch.no_grad()
-def extract_codes(model, loader, device):
-    model.eval()
-    codes, labels = [], []
-    for imgs, lbls in loader:
-        h = model(imgs.to(device))
-        codes.append(torch.sign(h).cpu().numpy().astype(np.int8))
-        labels.append(lbls.numpy())
-    return np.vstack(codes), np.concatenate(labels)
-
-
-def identification_accuracy(tr_codes, tr_labels, te_codes, te_labels):
-    """1-NN identification by Hamming distance (Section V-C)."""
-    correct = 0
-    for code, true_lbl in zip(te_codes, te_labels):
-        ham     = np.sum(code != tr_codes, axis=1)
-        correct += int(tr_labels[np.argmin(ham)] == true_lbl)
-    return correct / len(te_labels) * 100.0
-
-
-def compute_eer(tr_codes, tr_labels, te_codes, te_labels):
-    """EER via sklearn roc_curve (Section V-D)."""
-    scores, truth = [], []
-    for code, lbl in zip(te_codes, te_labels):
-        sim = -np.sum(code != tr_codes, axis=1).astype(np.float32)
-        scores.extend(sim.tolist())
-        truth.extend((tr_labels == lbl).tolist())
-    fpr, tpr, _ = roc_curve(truth, scores)
-    fnr = 1.0 - tpr
-    idx = np.argmin(np.abs(fpr - fnr))
-    return (fpr[idx] + fnr[idx]) / 2.0 * 100.0
-
-
+# ─────────────────────────────────────────────────────────────────
+# STANDALONE EVALUATION  (--stage eval)
+# ─────────────────────────────────────────────────────────────────
 def evaluate(cfg, device):
-    log.info('=' * 65)
+    log.info('=' * 70)
     log.info('EVALUATION  (loading saved checkpoints)')
-    log.info('=' * 65)
-    ds = CASIADataset(cfg['data_dir'],
-                      get_transform(False, cfg['img_size']),
+    log.info('=' * 70)
+
+    ds = CASIADataset(cfg['data_dir'], get_transform(False, cfg['img_size']),
                       cfg['label_pos'], cfg['sep'])
     tr_idx, te_idx = split_dataset(ds, cfg['train_ratio'])
-    log.info(f'  Train: {len(tr_idx)} images  |  Test: {len(te_idx)} images')
-    tr_ld = DataLoader(Subset(ds, tr_idx), 64, num_workers=cfg['num_workers'])
-    te_ld = DataLoader(Subset(ds, te_idx), 64, num_workers=cfg['num_workers'])
+    print_split_summary(ds, tr_idx, te_idx)
+    tr_ld, te_ld = _make_eval_loaders(cfg, tr_idx, te_idx)
 
     log.info(f'  {"Model":22s}  {"Train Acc":>10}  {"Train EER":>10}  '
              f'{"Test Acc":>10}  {"Test EER":>10}')
     log.info('  ' + '─' * 68)
 
     results = []
-    for name, ckpt_fn, make_model in [
+    for name, ckpt_fn, make_m in [
         ('Teacher',       'teacher.pth',
-         lambda: TeacherDHN(cfg['hash_dim'], pretrained=False)),
+         lambda: TeacherDHN(cfg['hash_dim'], cfg['img_size'],
+                            cfg['lrelu_alpha'])),
         ('DDH (Student)', 'student.pth',
-         lambda: StudentDHN(cfg['hash_dim'], cfg['img_size'])),
+         lambda: StudentDHN(cfg['hash_dim'], cfg['img_size'],
+                            cfg['lrelu_alpha'])),
     ]:
         ckpt = os.path.join(cfg['save_dir'], ckpt_fn)
         if not os.path.exists(ckpt):
-            log.warning(f'  {name}: checkpoint not found, skipping'); continue
-        m = make_model().to(device)
+            log.warning(f'  {name}: checkpoint not found, skipping')
+            continue
+        m = make_m().to(device)
         m.load_state_dict(torch.load(ckpt, map_location=device))
 
         tr_c, tr_l = extract_codes(m, tr_ld, device)
@@ -742,37 +832,53 @@ def evaluate(cfg, device):
     log.info(f"  CSV → {os.path.join(cfg['save_dir'], 'results_eval.csv')}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
 # MAIN
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
 def main():
-    p = argparse.ArgumentParser(description='DDH – paper equations')
-    p.add_argument('--data_dir',   default=CFG['data_dir'])
-    p.add_argument('--stage',      default='all',
+    p = argparse.ArgumentParser(description='DDH – best synthesis')
+    p.add_argument('--data_dir',  default=CFG['data_dir'])
+    p.add_argument('--stage',     default='all',
                    choices=['all', 'teacher', 'student', 'eval'])
-    p.add_argument('--label_pos',  type=int, default=CFG['label_pos'],
-                   help='token index of subject ID in filename')
-    p.add_argument('--sep',        default=CFG['sep'],
-                   help='filename separator')
+    p.add_argument('--label_pos', type=int, default=CFG['label_pos'])
+    p.add_argument('--sep',       default=CFG['sep'])
+    p.add_argument('--num_per',   type=int, default=CFG['num_per'])
+    p.add_argument('--n_cls',     type=int, default=CFG['n_cls_per_batch'])
     args = p.parse_args()
-    CFG.update(data_dir=args.data_dir, label_pos=args.label_pos, sep=args.sep)
+    CFG.update(data_dir=args.data_dir, label_pos=args.label_pos,
+               sep=args.sep, num_per=args.num_per,
+               n_cls_per_batch=args.n_cls)
+    CFG['batch_size'] = CFG['num_per'] * CFG['n_cls_per_batch']
 
     os.makedirs(CFG['save_dir'], exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    log.info(f'Device : {device}')
-    log.info(f'Script : ddh_paper.py  (paper equations only)')
-    log.info(f'α={CFG["alpha"]}  β={CFG["beta"]}  t={CFG["margin_t"]}  '
-             f'lr={CFG["lr"]}  iters={CFG["teacher_iters"]}')
+
+    log.info('')
+    log.info('╔══════════════════════════════════════════════════════════════╗')
+    log.info('║           DDH – paper + released code synthesis             ║')
+    log.info('╠══════════════════════════════════════════════════════════════╣')
+    log.info(f'║  Device     : {str(device):<48}║')
+    log.info(f'║  Data dir   : {CFG["data_dir"]:<48}║')
+    log.info(f'║  Stage      : {args.stage:<48}║')
+    log.info(f'║  Split      : {TRAIN_RATIO:.0%} train / '
+             f'{1-TRAIN_RATIO:.0%} test  (paper Section V-B 50/50)   ║')
+    log.info(f'║  Batch      : {CFG["num_per"]} per class × {CFG["n_cls_per_batch"]} classes = {CFG["batch_size"]}'
+             f'{"":>{30 - len(str(CFG["batch_size"]))}}║')
+    log.info(f'║  α={CFG["alpha"]}  β={CFG["beta"]}  t={CFG["margin_t"]}  lr={CFG["lr"]}'
+             f'{"":>33}║')
+    log.info(f'║  Eval every : {CFG["eval_every"]} iters'
+             f'{"":>{48-len(str(CFG["eval_every"]))}}║')
+    log.info('╚══════════════════════════════════════════════════════════════╝')
+    log.info('')
 
     teacher = None
     if args.stage in ('all', 'teacher'):
-        teacher = train_teacher(CFG, device)
+        teacher = train_teacher(cfg=CFG, device=device)
     if args.stage in ('all', 'student'):
-        train_student(CFG, device, teacher)
+        train_student(cfg=CFG, device=device, teacher=teacher)
     if args.stage in ('all', 'eval'):
-        evaluate(CFG, device)
+        evaluate(cfg=CFG, device=device)
 
 
 if __name__ == '__main__':
     main()
-  
