@@ -11,15 +11,23 @@ ddh_best.py  — Best synthesis of paper + released code
 ║     as test set."                                            ║
 ║                                                              ║
 ║  CASIA-MS palmprint database facts:                          ║
-║    • 5,502 images total                                      ║
-║    • 624 hands (subjects / classes)                          ║
-║    • ~8–9 images per hand (two sessions, ~4–5 each)          ║
+║    • 5,502 images total  (full database)                     ║
+║    • 624 hands  (full database)                              ║
+║                                                              ║
+║  YOUR dataset (100 subjects × 2 hands):                      ║
+║    • 100 subjects, left + right hand treated separately      ║
+║    • 200 independent classes  (each hand = one class)        ║
+║    • ~8–9 images per hand  →  ~4 train / ~4-5 test           ║
+║                                                              ║
+║  Class label = subject_id + hand_side  (e.g. '001_L')        ║
+║  Controlled by LABEL_POS=0 and HAND_POS=1 below.            ║
 ║                                                              ║
 ║  Applied split  (TRAIN_RATIO = 0.5):                         ║
-║    • First 50% of each subject's images  →  TRAIN            ║
-║    • Remaining 50%                       →  TEST             ║
-║    • Subject with 8 images: 4 train / 4 test                 ║
-║    • Subject with 9 images: 4 train / 5 test                 ║
+║    • First 50% of each hand's images  →  TRAIN               ║
+║    • Remaining 50%                    →  TEST                ║
+║    • Hand with 8 images: 4 train / 4 test                    ║
+║    • Hand with 9 images: 4 train / 5 test                    ║
+║    • 200 classes × ~4 train  =  ~800 total train images      ║
 ║                                                              ║
 ║  To change: edit TRAIN_RATIO below, e.g. 0.6 for 60/40.     ║
 ╚══════════════════════════════════════════════════════════════╝
@@ -80,7 +88,7 @@ SEP         = '_'        # Filename token separator.
 # ── Train / Test split ───────────────────────────────────────────
 # Paper Section V-B: "half … training set, remaining half … test set"
 # CASIA-MS: ~8-9 images per hand → ~4 train / ~4-5 test per class.
-TRAIN_RATIO = 0.8        # 0.5 = 50% train / 50% test  (paper default)
+TRAIN_RATIO = 0.5        # 0.5 = 50% train / 50% test  (paper default)
                          # Change to e.g. 0.6 for 60/40.
 
 # ── Regularisation ───────────────────────────────────────────────
@@ -944,3 +952,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+  
