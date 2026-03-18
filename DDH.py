@@ -88,7 +88,7 @@ SEP         = '_'        # Filename token separator.
 # ── Train / Test split ───────────────────────────────────────────
 # Paper Section V-B: "half … training set, remaining half … test set"
 # CASIA-MS: ~8-9 images per hand → ~4 train / ~4-5 test per class.
-TRAIN_RATIO = 0.5        # 0.5 = 50% train / 50% test  (paper default)
+TRAIN_RATIO = 0.8        # 0.5 = 50% train / 50% test  (paper default)
                          # Change to e.g. 0.6 for 60/40.
 
 # ── Regularisation ───────────────────────────────────────────────
