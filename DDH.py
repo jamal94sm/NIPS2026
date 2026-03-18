@@ -63,53 +63,51 @@ log = logging.getLogger()
 DATA_DIR    = '/home/pai-ng/Jamal/CASIA-MS-ROI'
                          # Path to the folder of pre-cropped 128×128 ROI images.
                          # Supports two layouts:
-                         #   (a) Subdirectory per subject:  DATA_DIR/001/img1.bmp
-                         #   (b) Flat folder, label in name: DATA_DIR/001_L_01.bmp
+                         #   (a) Subdirectory per subject+hand: DATA_DIR/001_L/img.bmp
+                         #   (b) Flat folder, label in name:   DATA_DIR/001_L_01.bmp
 
-LABEL_POS   = 0          # Which token in the filename is the subject ID.
+LABEL_POS   = 0          # Token index of the SUBJECT ID in the filename.
                          # e.g. '001_L_01.bmp' split by '_' → token 0 = '001'
+
+HAND_POS    = 1          # Token index of the HAND SIDE in the filename.
+                         # e.g. '001_L_01.bmp' split by '_' → token 1 = 'L'
+                         # Class = subject + hand  →  200 classes for CASIA-MS
+                         # (100 subjects × 2 hands = 200 independent palms).
+                         # Set HAND_POS = None to use subject-only labels (100 classes).
 
 SEP         = '_'        # Filename token separator.
 
 # ── Train / Test split ───────────────────────────────────────────
 # Paper Section V-B: "half … training set, remaining half … test set"
-# CASIA-MS has ~8-9 images per hand → 4 train / 4-5 test per subject.
-TRAIN_RATIO = 0.8        # 0.5 = 50% train / 50% test  (paper default)
+# CASIA-MS: ~8-9 images per hand → ~4 train / ~4-5 test per class.
+TRAIN_RATIO = 0.5        # 0.5 = 50% train / 50% test  (paper default)
                          # Change to e.g. 0.6 for 60/40.
 
 # ── Regularisation ───────────────────────────────────────────────
-# CASIA-MS has ~35-46 train images per subject, which causes severe
-# overfitting when the FC head has no dropout.  These two controls
-# are the single most important change for generalisation.
 DROPOUT_TEACHER = 0.5    # dropout rate for teacher FC layers
 DROPOUT_STUDENT = 0.4    # dropout rate for student FC layer
 WEIGHT_DECAY    = 1e-4   # L2 regularisation on all trainable weights
 
-# ── Batch composition ────────────────────────────────────────────
-# With ~35-46 train images per subject we can afford more per-class
-# images and more classes per batch, giving a richer contrastive signal.
-# batch_size = NUM_PER × N_CLS_PER_BATCH
-NUM_PER         = 6      # images per class per batch  (≤ min train per subj)
-N_CLS_PER_BATCH = 25     # classes per batch  →  batch = 6 × 25 = 150
+# ── Batch size ───────────────────────────────────────────────────
+# Images are sampled randomly — no class ordering required.
+# Just set how many images per batch.
+BATCH_SIZE = 128     # standard random batch size
 
-# ── Training ─────────────────────────────────────────────────────
-# With a larger dataset (35-46 train images vs the paper's 4-10),
-# more iterations are needed for the model to see enough variety.
-TEACHER_ITERS = 40000    # increased from 10,000
-STUDENT_ITERS = 40000    # increased from 10,000
-LR            = 1e-3     # Adam initial learning rate
-# LR is annealed via cosine schedule down to LR_MIN over all iters
-LR_MIN        = 1e-5     # cosine schedule final LR
+# ── Training (epoch-based) ────────────────────────────────────────
+# One epoch = one full pass through all training batches.
+# With 200 classes and batch covering 25 classes, one epoch ≈ 8 batches.
+TEACHER_EPOCHS = 200     # epochs for teacher training
+STUDENT_EPOCHS = 200     # epochs for DDH student training
+LR             = 1e-3    # Adam initial learning rate
+LR_MIN         = 1e-5    # cosine schedule final LR (reached at last epoch)
 
-# ── Mid-training evaluation frequency ────────────────────────────
-# Every EVAL_EVERY_K iterations, Acc + EER are computed and printed
-# for BOTH the training set and test set.  This is the only place
-# metrics are printed during training — NOT at every loss step.
-# Set to 0 to skip mid-training eval (final table is always printed).
-EVAL_EVERY_K = 4000     # ← change K here  (e.g. 2000, 8000, …)
+# ── Mid-training evaluation frequency (in EPOCHS) ────────────────
+# Acc + EER on train and test sets are printed every EVAL_EVERY_EPOCHS.
+# Set to 0 to only show the final evaluation table.
+EVAL_EVERY_EPOCHS = 50   # ← change here  (e.g. 25, 100, …)
 
-# ── Loss-print frequency ─────────────────────────────────────────
-LOG_EVERY  = 1000
+# ── Loss-print frequency (in EPOCHS) ─────────────────────────────
+LOG_EVERY_EPOCHS  = 10
 
 # ── Output directory ─────────────────────────────────────────────
 SAVE_DIR = './ckpt_best'
@@ -121,6 +119,7 @@ SAVE_DIR = './ckpt_best'
 CFG = dict(
     data_dir        = DATA_DIR,
     label_pos       = LABEL_POS,
+    hand_pos        = HAND_POS,
     sep             = SEP,
     train_ratio     = TRAIN_RATIO,
     hash_dim        = 128,
@@ -134,14 +133,12 @@ CFG = dict(
     dropout_student = DROPOUT_STUDENT,
     weight_decay    = WEIGHT_DECAY,
     lr_min          = LR_MIN,
-    num_per         = NUM_PER,
-    n_cls_per_batch = N_CLS_PER_BATCH,
-    batch_size      = NUM_PER * N_CLS_PER_BATCH,
-    teacher_iters   = TEACHER_ITERS,
-    student_iters   = STUDENT_ITERS,
+    batch_size      = BATCH_SIZE,
+    teacher_epochs  = TEACHER_EPOCHS,
+    student_epochs  = STUDENT_EPOCHS,
     lr              = LR,
-    eval_every      = EVAL_EVERY_K,
-    log_every       = LOG_EVERY,
+    eval_every      = EVAL_EVERY_EPOCHS,
+    log_every       = LOG_EVERY_EPOCHS,
     num_workers     = 4,
     save_dir        = SAVE_DIR,
 )
@@ -150,9 +147,17 @@ CFG = dict(
 # DATASET
 # ─────────────────────────────────────────────────────────────────
 class CASIADataset(Dataset):
+    """
+    Supports two folder layouts:
+      (a) Subdirectory per class:  root/001_L/img.bmp  → class = folder name
+      (b) Flat folder, tokens in filename: root/001_L_01.bmp
+          class key = tokens[label_pos] + '_' + tokens[hand_pos]
+          e.g. '001_L_01.bmp' → '001_L'  (200 classes for CASIA-MS)
+          Set hand_pos=None to use subject token only (100 classes).
+    """
     EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.pgm', '.tiff'}
 
-    def __init__(self, root, transform=None, label_pos=0, sep='_'):
+    def __init__(self, root, transform=None, label_pos=0, sep='_', hand_pos=1):
         self.transform    = transform
         self.paths        = []
         self.labels       = []
@@ -161,6 +166,7 @@ class CASIADataset(Dataset):
         subdirs = sorted(d for d in os.listdir(root)
                          if os.path.isdir(os.path.join(root, d)))
         if subdirs:
+            # Subdirectory layout: folder name IS the class key
             lbl_map = {s: i for i, s in enumerate(subdirs)}
             for subj in subdirs:
                 for fn in sorted(os.listdir(os.path.join(root, subj))):
@@ -171,15 +177,24 @@ class CASIADataset(Dataset):
                         self.labels.append(lbl)
                         self.idx_by_label[lbl].append(i)
         else:
+            # Flat layout: build class key from filename tokens
             files = sorted(fn for fn in os.listdir(root)
                            if os.path.splitext(fn)[1].lower() in self.EXTS)
             if not files:
                 raise RuntimeError(f'No images found in {root!r}')
-            subjects = sorted({fn.split(sep)[label_pos] for fn in files})
-            lbl_map  = {s: i for i, s in enumerate(subjects)}
+
+            def _class_key(fn):
+                tokens = fn.split(sep)
+                subj   = tokens[label_pos]
+                if hand_pos is not None and hand_pos < len(tokens):
+                    return f'{subj}{sep}{tokens[hand_pos]}'   # e.g. '001_L'
+                return subj                                    # e.g. '001'
+
+            class_keys = sorted({_class_key(fn) for fn in files})
+            lbl_map    = {k: i for i, k in enumerate(class_keys)}
             for fn in files:
-                sid = fn.split(sep)[label_pos]
-                lbl = lbl_map[sid]
+                key = _class_key(fn)
+                lbl = lbl_map[key]
                 i   = len(self.paths)
                 self.paths.append(os.path.join(root, fn))
                 self.labels.append(lbl)
@@ -439,38 +454,53 @@ def loss_rela(s_aa, s_as, t_aa, t_as):
             torch.mean((s_as - t_as) ** 2))
 
 
-def loss_hard(feat_T, feat_S, label_oh, batch_size, num_per):
-    T_d   = _l2_dist(feat_T)   # eps already inside sqrt — no NaN gradient
-    S_d   = _l2_dist(feat_S)
-    lbl_m = label_oh @ label_oh.t()
-    T_pos = lbl_m * T_d;  T_neg = (1.0 - lbl_m) * T_d
-    S_pos = lbl_m * S_d;  S_neg = (1.0 - lbl_m) * S_d
+def loss_hard(feat_T, feat_S, labels_int):
+    """
+    L_hard for random batches — iterates over each unique class present
+    in the batch rather than assuming fixed-size contiguous class blocks.
+
+    For each class c in the batch:
+      genuine:  indices of samples belonging to c
+      imposter: indices of all other samples
+      pos_loss = clamp(max_S(genuine_dists) − min_T(genuine_dists), 0)
+      neg_loss = clamp(max_T(imposter_dists) − min_S(imposter_dists), 0)
+
+    Classes with only 1 sample are skipped (need ≥2 for a genuine pair).
+    """
+    T_d = _l2_dist(feat_T)   # [B, B]
+    S_d = _l2_dist(feat_S)   # [B, B]
+
     pos_l, neg_l = [], []
-    n_blk = batch_size // num_per
 
-    # Pre-build diagonal mask for genuine blocks (size num_per × num_per).
-    # The diagonal is the self-distance ≈ 0 (eps only).
-    # Without masking, T_blk.min() = 0 always → genuine constraint is
-    # always violated → loss is always large → gradients explode.
-    diag_mask = torch.eye(num_per, dtype=torch.bool, device=feat_T.device)
+    for lbl in labels_int.unique():
+        idx  = (labels_int == lbl).nonzero(as_tuple=True)[0]   # genuine indices
+        if len(idx) < 2:
+            continue   # need at least 2 for a genuine pair
 
-    for i in range(n_blk):
-        s, e = i * num_per, (i + 1) * num_per
-
-        # ── Genuine block: off-diagonal pairs only
-        T_blk = T_pos[s:e, s:e]
-        S_blk = S_pos[s:e, s:e]
-        # Mask diagonal out of min/max so self-distances don't dominate
-        T_blk_od = T_blk.masked_fill(diag_mask, float('inf'))   # for min
-        S_blk_od = S_blk.masked_fill(diag_mask, 0.0)            # for max
+        # ── Genuine distances (off-diagonal within this class)
+        T_blk = T_d[idx][:, idx]   # [k, k]
+        S_blk = S_d[idx][:, idx]
+        k  = len(idx)
+        dm = torch.eye(k, dtype=torch.bool, device=feat_T.device)
+        T_blk_od = T_blk.masked_fill(dm, float('inf'))   # inf on diagonal → ignored by min
+        S_blk_od = S_blk.masked_fill(dm, 0.0)            # 0  on diagonal → ignored by max
         pos_l.append(torch.clamp(S_blk_od.max() - T_blk_od.min(), min=0.0))
 
-        # ── Imposter block: all columns outside class i
-        T_n = torch.cat([T_neg[s:e, :s], T_neg[s:e, e:]], dim=1)
-        S_n = torch.cat([S_neg[s:e, :s], S_neg[s:e, e:]], dim=1)
+        # ── Imposter distances (this class vs all others in batch)
+        other = (labels_int != lbl)
+        if other.sum() == 0:
+            continue
+        T_n = T_d[idx][:, other]
+        S_n = S_d[idx][:, other]
         neg_l.append(torch.clamp(T_n.max() - S_n.min(), min=0.0))
 
-    return torch.stack(pos_l).mean() + torch.stack(neg_l).mean()
+    if not pos_l:
+        return feat_T.new_zeros(())
+
+    result = torch.stack(pos_l).mean()
+    if neg_l:
+        result = result + torch.stack(neg_l).mean()
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -540,7 +570,7 @@ def _make_eval_loaders(cfg, tr_idx, te_idx):
     """Build eval-transform DataLoaders for train and test subsets."""
     ds = CASIADataset(cfg['data_dir'],
                       get_transform(False, cfg['img_size']),
-                      cfg['label_pos'], cfg['sep'])
+                      cfg['label_pos'], cfg['sep'], cfg['hand_pos'])
     tr_ld = DataLoader(Subset(ds, tr_idx), 64,
                        num_workers=cfg['num_workers'], pin_memory=True)
     te_ld = DataLoader(Subset(ds, te_idx), 64,
@@ -567,22 +597,23 @@ def _infinite(loader):
 
 def train_teacher(cfg, device):
     log.info('=' * 70)
-    log.info('STAGE 1 – Teacher  (VGG pool4 frozen + conv5/FC  |  Adam + cosine LR)')
+    log.info('STAGE 1 – Teacher  (VGG pool4 frozen + conv5/FC  |  epoch-based)')
     log.info('=' * 70)
 
-    # ── Build datasets
-    ds_tr = CASIADataset(cfg['data_dir'], get_transform(True,  cfg['img_size']),
-                         cfg['label_pos'], cfg['sep'])
+    ds_tr = CASIADataset(cfg['data_dir'], get_transform(True, cfg['img_size']),
+                         cfg['label_pos'], cfg['sep'], cfg['hand_pos'])
     tr_idx, te_idx = split_dataset(ds_tr, cfg['train_ratio'])
     print_split_summary(ds_tr, tr_idx, te_idx)
     tr_ld, te_ld = _make_eval_loaders(cfg, tr_idx, te_idx)
-    num_cl = ds_tr.num_classes
-    B      = cfg['batch_size']
+    num_cl  = ds_tr.num_classes
+    B       = cfg['batch_size']
 
-    sampler = ClassOrderedBatchSampler(
-        ds_tr.idx_by_label, tr_idx, cfg['num_per'], cfg['n_cls_per_batch'])
-    loader = DataLoader(ds_tr, batch_sampler=sampler,
-                        num_workers=cfg['num_workers'], pin_memory=True)
+    sampler  = None   # random batches — no class ordering needed
+    loader   = DataLoader(Subset(ds_tr, tr_idx),
+                          batch_size=cfg['batch_size'], shuffle=True,
+                          num_workers=cfg['num_workers'], pin_memory=True,
+                          drop_last=True)
+    n_epochs = cfg['teacher_epochs']
 
     model = TeacherDHN(cfg['hash_dim'], cfg['img_size'],
                        cfg['lrelu_alpha'],
@@ -590,54 +621,55 @@ def train_teacher(cfg, device):
     opt   = optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=cfg['lr'], weight_decay=cfg['weight_decay'])
-    # Cosine LR annealing: smoothly reduces LR from lr to lr_min
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=cfg['teacher_iters'], eta_min=cfg['lr_min'])
+        opt, T_max=n_epochs, eta_min=cfg['lr_min'])
 
-    model.train()
-    it      = _infinite(loader)
+    log.info(f'  {n_epochs} epochs  |  dropout={cfg["dropout_teacher"]}'
+             f'  wd={cfg["weight_decay"]}  lr: {cfg["lr"]}→{cfg["lr_min"]} cosine')
+    log.info(f'  {"Epoch":>6}  {"Loss":>9}  {"Lh":>9}  {"Lq":>9}  {"LR":>10}')
+    log.info('  ' + '─' * 50)
+
     best_te = 0.0
     history = []
 
-    log.info(f'  dropout={cfg["dropout_teacher"]}  weight_decay={cfg["weight_decay"]}'
-             f'  lr: {cfg["lr"]} → {cfg["lr_min"]} (cosine)')
-    log.info(f'  {"Iter":>6}  {"Loss":>9}  {"Lh":>9}  {"Lq":>9}  {"LR":>10}')
-    log.info('  ' + '─' * 50)
+    for epoch in range(1, n_epochs + 1):
+        model.train()
+        ep_loss = ep_lh = ep_lq = 0.0; n_steps = 0
 
-    for step in range(1, cfg['teacher_iters'] + 1):
-        imgs, labels_int = next(it)
-        imgs, labels_int = imgs.to(device), labels_int.to(device)
-        if imgs.shape[0] != B: continue
+        for imgs, labels_int in loader:
+            imgs, labels_int = imgs.to(device), labels_int.to(device)
+            if imgs.shape[0] != B: continue
+            loh = make_onehot(labels_int, num_cl, device)
+            h   = model(imgs)
+            h1  = h.unsqueeze(1).expand(-1, B, -1).reshape(B * B, -1)
+            h2  = h.unsqueeze(0).expand(B, -1, -1).reshape(B * B, -1)
+            s   = (loh @ loh.t()).reshape(-1)
+            ut  = torch.triu(torch.ones(B, B, device=device),
+                             diagonal=1).bool().reshape(-1)
+            h1p, h2p, sp = h1[ut], h2[ut], s[ut]
+            loss, Lh, Lq = loss_dhn(h1p, h2p, sp, cfg['margin_t'], cfg['w_quant'])
+            opt.zero_grad(set_to_none=True)
+            loss.backward(); opt.step()
+            ep_loss += loss.item(); ep_lh += Lh.item()
+            ep_lq   += Lq.item();  n_steps += 1
 
-        loh = make_onehot(labels_int, num_cl, device)
-        h   = model(imgs)
+        scheduler.step()   # once per epoch
+        avg_l  = ep_loss / max(n_steps, 1)
+        avg_lh = ep_lh   / max(n_steps, 1)
+        avg_lq = ep_lq   / max(n_steps, 1)
+        cur_lr = scheduler.get_last_lr()[0]
 
-        h1 = h.unsqueeze(1).expand(-1, B, -1).reshape(B * B, -1)
-        h2 = h.unsqueeze(0).expand(B, -1, -1).reshape(B * B, -1)
-        s  = (loh @ loh.t()).reshape(-1)
-        ut = torch.triu(torch.ones(B, B, device=device),
-                        diagonal=1).bool().reshape(-1)
-        h1p, h2p, sp = h1[ut], h2[ut], s[ut]
+        if epoch % cfg['log_every'] == 0 or epoch == 1:
+            log.info(f'  {epoch:6d}  {avg_l:9.4f}  '
+                     f'{avg_lh:9.4f}  {avg_lq:9.4f}  {cur_lr:10.2e}')
 
-        loss, Lh, Lq = loss_dhn(h1p, h2p, sp, cfg['margin_t'], cfg['w_quant'])
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
-        scheduler.step()
-
-        if step % cfg['log_every'] == 0 or step == 1:
-            current_lr = scheduler.get_last_lr()[0]
-            log.info(f'  {step:6d}  {loss.item():9.4f}  '
-                     f'{Lh.item():9.4f}  {Lq.item():9.4f}  {current_lr:10.2e}')
-
-        # ── Periodic train + test evaluation
-        if cfg['eval_every'] > 0 and step % cfg['eval_every'] == 0:
-            log.info(f'  ── Eval @ iter {step} {"─"*45}')
+        if cfg['eval_every'] > 0 and epoch % cfg['eval_every'] == 0:
+            log.info(f'  ── Eval @ epoch {epoch} {"─"*44}')
             tr_acc, tr_eer, te_acc, te_eer = run_metrics(
                 model, tr_ld, te_ld, device)
-            _print_metrics_row(f'Teacher iter {step}',
+            _print_metrics_row(f'Teacher ep {epoch}',
                                tr_acc, tr_eer, te_acc, te_eer)
-            history.append(dict(iter=step, tr_acc=tr_acc, tr_eer=tr_eer,
+            history.append(dict(epoch=epoch, tr_acc=tr_acc, tr_eer=tr_eer,
                                 te_acc=te_acc, te_eer=te_eer))
             if te_acc > best_te:
                 best_te = te_acc
@@ -647,13 +679,11 @@ def train_teacher(cfg, device):
                 log.info(f'  ✓ New best teacher  (test Acc={te_acc:.2f}%)')
             log.info(f'  {"─"*64}')
 
-    # ── Final save
     os.makedirs(cfg['save_dir'], exist_ok=True)
     final_path = os.path.join(cfg['save_dir'], 'teacher.pth')
     if not os.path.exists(final_path):
         torch.save(model.state_dict(), final_path)
 
-    # ── Final evaluation
     log.info('')
     log.info('  ── TEACHER FINAL EVALUATION ──')
     log.info(f'  {"Set":22s}  {"Acc (%)":>10}  {"EER (%)":>10}')
@@ -662,34 +692,32 @@ def train_teacher(cfg, device):
     log.info(f'  {"Training set":22s}  {tr_acc:>10.2f}  {tr_eer:>10.2f}')
     log.info(f'  {"Test set":22s}  {te_acc:>10.2f}  {te_eer:>10.2f}')
     log.info(f'  Teacher checkpoint → {final_path}')
-
-    history.append(dict(iter='final', tr_acc=tr_acc, tr_eer=tr_eer,
+    history.append(dict(epoch='final', tr_acc=tr_acc, tr_eer=tr_eer,
                         te_acc=te_acc, te_eer=te_eer))
     _save_csv(history, cfg['save_dir'], 'teacher_history.csv')
     return model
 
-
 def train_student(cfg, device, teacher=None):
     log.info('=' * 70)
-    log.info('STAGE 2 – Student DDH  (Adam  |  α=1  β=0.8  |  10 000 iters)')
+    log.info('STAGE 2 – Student DDH  (epoch-based  |  Adam + cosine LR)')
     log.info('=' * 70)
 
-    # ── Build datasets
-    ds_tr = CASIADataset(cfg['data_dir'], get_transform(True,  cfg['img_size']),
-                         cfg['label_pos'], cfg['sep'])
+    ds_tr = CASIADataset(cfg['data_dir'], get_transform(True, cfg['img_size']),
+                         cfg['label_pos'], cfg['sep'], cfg['hand_pos'])
     tr_idx, te_idx = split_dataset(ds_tr, cfg['train_ratio'])
     print_split_summary(ds_tr, tr_idx, te_idx)
     tr_ld, te_ld = _make_eval_loaders(cfg, tr_idx, te_idx)
-    num_cl = ds_tr.num_classes
-    B      = cfg['batch_size']
-    omega  = B // 2
+    num_cl  = ds_tr.num_classes
+    B       = cfg['batch_size']
+    omega   = B // 2
 
-    sampler = ClassOrderedBatchSampler(
-        ds_tr.idx_by_label, tr_idx, cfg['num_per'], cfg['n_cls_per_batch'])
-    loader = DataLoader(ds_tr, batch_sampler=sampler,
-                        num_workers=cfg['num_workers'], pin_memory=True)
+    sampler  = None   # random batches — no class ordering needed
+    loader   = DataLoader(Subset(ds_tr, tr_idx),
+                          batch_size=cfg['batch_size'], shuffle=True,
+                          num_workers=cfg['num_workers'], pin_memory=True,
+                          drop_last=True)
+    n_epochs = cfg['student_epochs']
 
-    # ── Load teacher
     if teacher is None:
         teacher = TeacherDHN(cfg['hash_dim'], cfg['img_size'],
                              cfg['lrelu_alpha'],
@@ -700,14 +728,12 @@ def train_student(cfg, device, teacher=None):
     teacher.eval()
     for p in teacher.parameters(): p.requires_grad_(False)
 
-    # ── Baseline: teacher performance before student training starts
     log.info('  ── Teacher baseline (before student training) ──')
     log.info(f'  {"Set":22s}  {"Acc (%)":>10}  {"EER (%)":>10}')
     log.info('  ' + '─' * 46)
-    tch_tr_acc, tch_tr_eer, tch_te_acc, tch_te_eer = run_metrics(
-        teacher, tr_ld, te_ld, device)
-    log.info(f'  {"Training set":22s}  {tch_tr_acc:>10.2f}  {tch_tr_eer:>10.2f}')
-    log.info(f'  {"Test set":22s}  {tch_te_acc:>10.2f}  {tch_te_eer:>10.2f}')
+    tch_tr, tch_tr_e, tch_te, tch_te_e = run_metrics(teacher, tr_ld, te_ld, device)
+    log.info(f'  {"Training set":22s}  {tch_tr:>10.2f}  {tch_tr_e:>10.2f}')
+    log.info(f'  {"Test set":22s}  {tch_te:>10.2f}  {tch_te_e:>10.2f}')
     log.info('')
 
     student = StudentDHN(cfg['hash_dim'], cfg['img_size'],
@@ -716,69 +742,66 @@ def train_student(cfg, device, teacher=None):
     opt = optim.Adam(student.parameters(),
                      lr=cfg['lr'], weight_decay=cfg['weight_decay'])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=cfg['student_iters'], eta_min=cfg['lr_min'])
+        opt, T_max=n_epochs, eta_min=cfg['lr_min'])
 
-    student.train()
-    it      = _infinite(loader)
-    best_te = 0.0
-    history = []
-
-    log.info(f'  dropout={cfg["dropout_student"]}  weight_decay={cfg["weight_decay"]}'
-             f'  lr: {cfg["lr"]} → {cfg["lr_min"]} (cosine)')
-    log.info(f'  {"Iter":>6}  {"Loss":>9}  {"DHN":>9}  '
+    log.info(f'  {n_epochs} epochs  |  dropout={cfg["dropout_student"]}'
+             f'  wd={cfg["weight_decay"]}  lr: {cfg["lr"]}→{cfg["lr_min"]} cosine')
+    log.info(f'  {"Epoch":>6}  {"Loss":>9}  {"DHN":>9}  '
              f'{"Lrela":>9}  {"Lhard":>9}  {"LR":>10}')
     log.info('  ' + '─' * 65)
 
-    for step in range(1, cfg['student_iters'] + 1):
-        imgs, labels_int = next(it)
-        imgs, labels_int = imgs.to(device), labels_int.to(device)
-        if imgs.shape[0] != B: continue
+    best_te = 0.0
+    history = []
 
-        loh = make_onehot(labels_int, num_cl, device)
+    for epoch in range(1, n_epochs + 1):
+        student.train()
+        ep_loss = ep_dhn = ep_rela = ep_hard = 0.0; n_steps = 0
 
-        with torch.no_grad():
-            h_T = teacher(imgs)
-        _, t_aa, t_as = loss_dhn_batch(
-            h_T, loh, B, omega, cfg['margin_t'], cfg['w_quant'])
+        for imgs, labels_int in loader:
+            imgs, labels_int = imgs.to(device), labels_int.to(device)
+            if imgs.shape[0] != B: continue
+            loh = make_onehot(labels_int, num_cl, device)
 
-        h_S = student(imgs)
-        dhn_s, s_aa, s_as = loss_dhn_batch(
-            h_S, loh, B, omega, cfg['margin_t'], cfg['w_quant'])
+            with torch.no_grad():
+                h_T = teacher(imgs)
+            _, t_aa, t_as = loss_dhn_batch(
+                h_T, loh, B, omega, cfg['margin_t'], cfg['w_quant'])
 
-        Lrela = loss_rela(s_aa, s_as, t_aa, t_as)
-        Lhard = loss_hard(h_T, h_S, loh, B, cfg['num_per'])
-        loss  = dhn_s + cfg['alpha'] * Lrela + cfg['beta'] * Lhard
+            h_S = student(imgs)
+            dhn_s, s_aa, s_as = loss_dhn_batch(
+                h_S, loh, B, omega, cfg['margin_t'], cfg['w_quant'])
 
-        # Guard: skip batch and warn if any loss component is NaN/Inf
-        if not torch.isfinite(loss):
-            log.warning(f'  iter {step}: non-finite loss '
-                        f'(DHN={dhn_s.item():.4f} '
-                        f'Lrela={Lrela.item():.4f} '
-                        f'Lhard={Lhard.item():.4f}) — skipping batch')
+            Lrela = loss_rela(s_aa, s_as, t_aa, t_as)
+            Lhard = loss_hard(h_T, h_S, labels_int)
+            loss  = dhn_s + cfg['alpha'] * Lrela + cfg['beta'] * Lhard
+
+            if not torch.isfinite(loss):
+                log.warning(f'  ep {epoch}: non-finite loss — skipping batch')
+                opt.zero_grad(set_to_none=True); continue
+
             opt.zero_grad(set_to_none=True)
-            continue
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=5.0)
+            opt.step()
 
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=5.0)
-        opt.step()
+            ep_loss += loss.item(); ep_dhn  += dhn_s.item()
+            ep_rela += Lrela.item(); ep_hard += Lhard.item(); n_steps += 1
+
         scheduler.step()
+        n = max(n_steps, 1)
+        cur_lr = scheduler.get_last_lr()[0]
 
-        if step % cfg['log_every'] == 0 or step == 1:
-            current_lr = scheduler.get_last_lr()[0]
-            log.info(f'  {step:6d}  {loss.item():9.4f}  '
-                     f'{dhn_s.item():9.4f}  '
-                     f'{Lrela.item():9.4f}  '
-                     f'{Lhard.item():9.4f}  {current_lr:10.2e}')
+        if epoch % cfg['log_every'] == 0 or epoch == 1:
+            log.info(f'  {epoch:6d}  {ep_loss/n:9.4f}  {ep_dhn/n:9.4f}  '
+                     f'{ep_rela/n:9.4f}  {ep_hard/n:9.4f}  {cur_lr:10.2e}')
 
-        # ── Periodic train + test evaluation
-        if cfg['eval_every'] > 0 and step % cfg['eval_every'] == 0:
-            log.info(f'  ── Eval @ iter {step} {"─"*45}')
+        if cfg['eval_every'] > 0 and epoch % cfg['eval_every'] == 0:
+            log.info(f'  ── Eval @ epoch {epoch} {"─"*44}')
             tr_acc, tr_eer, te_acc, te_eer = run_metrics(
                 student, tr_ld, te_ld, device)
-            _print_metrics_row(f'Student iter {step}',
+            _print_metrics_row(f'Student ep {epoch}',
                                tr_acc, tr_eer, te_acc, te_eer)
-            history.append(dict(iter=step, tr_acc=tr_acc, tr_eer=tr_eer,
+            history.append(dict(epoch=epoch, tr_acc=tr_acc, tr_eer=tr_eer,
                                 te_acc=te_acc, te_eer=te_eer))
             if te_acc > best_te:
                 best_te = te_acc
@@ -788,19 +811,16 @@ def train_student(cfg, device, teacher=None):
                 log.info(f'  ✓ New best student  (test Acc={te_acc:.2f}%)')
             log.info(f'  {"─"*64}')
 
-    # ── Final save
     os.makedirs(cfg['save_dir'], exist_ok=True)
     stu_path = os.path.join(cfg['save_dir'], 'student.pth')
     if not os.path.exists(stu_path):
         torch.save(student.state_dict(), stu_path)
 
-    # ── Final comparison table: Teacher vs Student/DDH
     log.info('')
     log.info('  ══ FINAL RESULTS  ══════════════════════════════════════════')
     log.info(f'  {"Model":22s}  {"Train Acc":>10}  {"Train EER":>10}  '
              f'{"Test Acc":>10}  {"Test EER":>10}')
     log.info('  ' + '─' * 68)
-
     all_results = []
     for name, m in [('Teacher', teacher), ('DDH (Student)', student)]:
         tr_acc, tr_eer, te_acc, te_eer = run_metrics(m, tr_ld, te_ld, device)
@@ -811,10 +831,9 @@ def train_student(cfg, device, teacher=None):
                                 train_eer=round(tr_eer, 2),
                                 test_acc=round(te_acc, 2),
                                 test_eer=round(te_eer, 2)))
-        history.append(dict(iter=f'final_{name}',
+        history.append(dict(epoch=f'final_{name}',
                             tr_acc=tr_acc, tr_eer=tr_eer,
                             te_acc=te_acc, te_eer=te_eer))
-
     log.info(f'  Student checkpoint → {stu_path}')
     _save_csv(all_results, cfg['save_dir'], 'results_final.csv')
     _save_csv(history,     cfg['save_dir'], 'student_history.csv')
@@ -822,16 +841,13 @@ def train_student(cfg, device, teacher=None):
     return student
 
 
-# ─────────────────────────────────────────────────────────────────
-# STANDALONE EVALUATION  (--stage eval)
-# ─────────────────────────────────────────────────────────────────
 def evaluate(cfg, device):
     log.info('=' * 70)
     log.info('EVALUATION  (loading saved checkpoints)')
     log.info('=' * 70)
 
     ds = CASIADataset(cfg['data_dir'], get_transform(False, cfg['img_size']),
-                      cfg['label_pos'], cfg['sep'])
+                      cfg['label_pos'], cfg['sep'], cfg['hand_pos'])
     tr_idx, te_idx = split_dataset(ds, cfg['train_ratio'])
     print_split_summary(ds, tr_idx, te_idx)
     tr_ld, te_ld = _make_eval_loaders(cfg, tr_idx, te_idx)
@@ -888,13 +904,10 @@ def main():
                    choices=['all', 'teacher', 'student', 'eval'])
     p.add_argument('--label_pos', type=int, default=CFG['label_pos'])
     p.add_argument('--sep',       default=CFG['sep'])
-    p.add_argument('--num_per',   type=int, default=CFG['num_per'])
-    p.add_argument('--n_cls',     type=int, default=CFG['n_cls_per_batch'])
+    p.add_argument('--batch_size', type=int, default=CFG['batch_size'])
     args = p.parse_args()
     CFG.update(data_dir=args.data_dir, label_pos=args.label_pos,
-               sep=args.sep, num_per=args.num_per,
-               n_cls_per_batch=args.n_cls)
-    CFG['batch_size'] = CFG['num_per'] * CFG['n_cls_per_batch']
+               sep=args.sep, batch_size=args.batch_size)
 
     os.makedirs(CFG['save_dir'], exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -908,15 +921,15 @@ def main():
     log.info(f'║  Stage      : {args.stage:<48}║')
     log.info(f'║  Split      : {TRAIN_RATIO:.0%} train / '
              f'{1-TRAIN_RATIO:.0%} test  (paper Section V-B 50/50)   ║')
-    log.info(f'║  Batch      : {CFG["num_per"]} per class × {CFG["n_cls_per_batch"]} classes = {CFG["batch_size"]}'
-             f'{"":>{30 - len(str(CFG["batch_size"]))}}║')
+    log.info(f'║  Batch size : {CFG["batch_size"]} (random shuffle, no class ordering)'
+             f'{"":>5}║')
     log.info(f'║  α={CFG["alpha"]}  β={CFG["beta"]}  t={CFG["margin_t"]}  lr={CFG["lr"]}→{CFG["lr_min"]}'
              f'{"":>22}║')
     log.info(f'║  dropout T={CFG["dropout_teacher"]} S={CFG["dropout_student"]}'
              f'  weight_decay={CFG["weight_decay"]}'
              f'{"":>22}║')
-    log.info(f'║  Eval every : {CFG["eval_every"]} iters  (K={CFG["eval_every"]})'
-             f'{"":>{30-len(str(CFG["eval_every"]))}}║')
+    log.info(f'║  Eval every : {CFG["eval_every"]} epochs'
+             f'{"":>{42-len(str(CFG["eval_every"]))}}║')
     log.info('╚══════════════════════════════════════════════════════════════╝')
     log.info('')
 
