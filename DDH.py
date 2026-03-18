@@ -88,13 +88,22 @@ SEP         = '_'        # Filename token separator.
 # ── Train / Test split ───────────────────────────────────────────
 # Paper Section V-B: "half … training set, remaining half … test set"
 # CASIA-MS: ~8-9 images per hand → ~4 train / ~4-5 test per class.
-TRAIN_RATIO = 0.8        # 0.5 = 50% train / 50% test  (paper default)
+TRAIN_RATIO = 0.5        # 0.5 = 50% train / 50% test  (paper default)
                          # Change to e.g. 0.6 for 60/40.
 
 # ── Regularisation ───────────────────────────────────────────────
 DROPOUT_TEACHER = 0.5    # dropout rate for teacher FC layers
 DROPOUT_STUDENT = 0.4    # dropout rate for student FC layer
 WEIGHT_DECAY    = 1e-4   # L2 regularisation on all trainable weights
+
+# ── Quantization loss weight ─────────────────────────────────────
+# L_DHN = Lh + W_QUANT * Lq
+# Lq = mean((|h| - 1)²) pushes hash codes toward ±1 (near-binary).
+# If Lq is too small relative to Lh the codes stay soft and matching
+# quality degrades after sign() binarisation.
+# Rule of thumb: aim for W_QUANT * Lq ≈ 10–20% of Lh at early training.
+# Example: Lh=5.6, Lq=0.1 → W_QUANT=10 makes Lq contribute 1.0 (~15%).
+W_QUANT = 10.0           # increased from 0.5 (original) to balance losses
 
 # ── Batch size ───────────────────────────────────────────────────
 # Images are sampled randomly — no class ordering required.
@@ -134,7 +143,7 @@ CFG = dict(
     img_size        = 128,
     lrelu_alpha     = 0.2,
     margin_t        = 180.0,
-    w_quant         = 0.5,
+    w_quant         = W_QUANT,
     alpha           = 1.0,
     beta            = 0.8,
     dropout_teacher = DROPOUT_TEACHER,
@@ -637,8 +646,8 @@ def train_teacher(cfg, device):
 
     log.info(f'  {n_epochs} epochs  |  dropout={cfg["dropout_teacher"]}'
              f'  wd={cfg["weight_decay"]}  lr: {cfg["lr"]}→{cfg["lr_min"]} cosine')
-    log.info(f'  {"Epoch":>6}  {"Loss":>9}  {"Lh":>9}  {"Lq":>9}  {"LR":>10}')
-    log.info('  ' + '─' * 50)
+    log.info(f'  {"Epoch":>6}  {"Loss":>9}  {"Lh":>9}  {"Lq":>9}  {"w*Lq":>9}  {"LR":>10}')
+    log.info('  ' + '─' * 60)
 
     best_te = 0.0
     history = []
@@ -672,7 +681,9 @@ def train_teacher(cfg, device):
 
         if epoch % cfg['log_every'] == 0 or epoch == 1:
             log.info(f'  {epoch:6d}  {avg_l:9.4f}  '
-                     f'{avg_lh:9.4f}  {avg_lq:9.4f}  {cur_lr:10.2e}')
+                     f'Lh={avg_lh:7.4f}  '
+                     f'Lq={avg_lq:7.4f}  '
+                     f'w*Lq={cfg["w_quant"]*avg_lq:7.4f}  {cur_lr:10.2e}')
 
         if cfg['eval_every'] > 0 and epoch % cfg['eval_every'] == 0:
             log.info(f'  ── Eval @ epoch {epoch} {"─"*44}')
