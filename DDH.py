@@ -90,10 +90,11 @@ STUDENT_ITERS = 10000    # Table XV: 10,000 iterations for student/DDH
 LR            = 1e-3     # Adam learning rate (paper Section V-B)
 
 # ── Mid-training evaluation frequency ────────────────────────────
-# At every EVAL_EVERY iterations the model is evaluated on BOTH the
-# training set and test set, and Acc + EER are printed for each.
-# Set to 0 to disable mid-training evaluation (only final is shown).
-EVAL_EVERY = 2000
+# Every EVAL_EVERY_K iterations, Acc + EER are computed and printed
+# for BOTH the training set and test set.  This is the only place
+# metrics are printed during training — NOT at every loss step.
+# Set to 0 to skip mid-training eval (final table is always printed).
+EVAL_EVERY_K = 2000     # ← change K here  (e.g. 1000, 5000, …)
 
 # ── Loss-print frequency ─────────────────────────────────────────
 LOG_EVERY  = 500
@@ -123,7 +124,7 @@ CFG = dict(
     teacher_iters   = TEACHER_ITERS,
     student_iters   = STUDENT_ITERS,
     lr              = LR,
-    eval_every      = EVAL_EVERY,
+    eval_every      = EVAL_EVERY_K,
     log_every       = LOG_EVERY,
     num_workers     = 4,
     save_dir        = SAVE_DIR,
@@ -393,8 +394,8 @@ def loss_dhn_batch(h, label_oh, batch_size, omega, t=180.0, w=0.5):
     la, ls   = label_oh[:omega], label_oh[omega:]
     d_aa_sq  = _sq_dist(f_a)
     d_as_sq  = _sq_dist(f_a, f_s)
-    d_aa_l2  = d_aa_sq.sqrt()
-    d_as_l2  = d_as_sq.sqrt()
+    d_aa_l2  = (d_aa_sq + 1e-8).sqrt()   # eps inside sqrt — prevents NaN
+    d_as_l2  = (d_as_sq + 1e-8).sqrt()   # gradient when distances are ~0
     sim_aa   = la @ la.t()
     sim_as   = la @ ls.t()
 
@@ -866,8 +867,8 @@ def main():
              f'{"":>{30 - len(str(CFG["batch_size"]))}}║')
     log.info(f'║  α={CFG["alpha"]}  β={CFG["beta"]}  t={CFG["margin_t"]}  lr={CFG["lr"]}'
              f'{"":>33}║')
-    log.info(f'║  Eval every : {CFG["eval_every"]} iters'
-             f'{"":>{48-len(str(CFG["eval_every"]))}}║')
+    log.info(f'║  Eval every : {CFG["eval_every"]} iters  (K={CFG["eval_every"]})'
+             f'{"":>{30-len(str(CFG["eval_every"]))}}║')
     log.info('╚══════════════════════════════════════════════════════════════╝')
     log.info('')
 
