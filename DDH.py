@@ -74,30 +74,42 @@ SEP         = '_'        # Filename token separator.
 # ── Train / Test split ───────────────────────────────────────────
 # Paper Section V-B: "half … training set, remaining half … test set"
 # CASIA-MS has ~8-9 images per hand → 4 train / 4-5 test per subject.
-TRAIN_RATIO = 0.5        # 0.5 = 50% train / 50% test  (paper default)
+TRAIN_RATIO = 0.8        # 0.5 = 50% train / 50% test  (paper default)
                          # Change to e.g. 0.6 for 60/40.
 
+# ── Regularisation ───────────────────────────────────────────────
+# CASIA-MS has ~35-46 train images per subject, which causes severe
+# overfitting when the FC head has no dropout.  These two controls
+# are the single most important change for generalisation.
+DROPOUT_TEACHER = 0.5    # dropout rate for teacher FC layers
+DROPOUT_STUDENT = 0.4    # dropout rate for student FC layer
+WEIGHT_DECAY    = 1e-4   # L2 regularisation on all trainable weights
+
 # ── Batch composition ────────────────────────────────────────────
+# With ~35-46 train images per subject we can afford more per-class
+# images and more classes per batch, giving a richer contrastive signal.
 # batch_size = NUM_PER × N_CLS_PER_BATCH
-# Rule: NUM_PER must be ≤ your per-subject TRAIN count.
-# CASIA-MS at 50/50 split → ~4 train per subject → NUM_PER = 4
-NUM_PER         = 4      # images per class per batch
-N_CLS_PER_BATCH = 12     # classes per batch  →  batch = 4 × 12 = 48
+NUM_PER         = 6      # images per class per batch  (≤ min train per subj)
+N_CLS_PER_BATCH = 25     # classes per batch  →  batch = 6 × 25 = 150
 
 # ── Training ─────────────────────────────────────────────────────
-TEACHER_ITERS = 10000    # Table XV: 10,000 iterations for teacher
-STUDENT_ITERS = 10000    # Table XV: 10,000 iterations for student/DDH
-LR            = 1e-3     # Adam learning rate (paper Section V-B)
+# With a larger dataset (35-46 train images vs the paper's 4-10),
+# more iterations are needed for the model to see enough variety.
+TEACHER_ITERS = 40000    # increased from 10,000
+STUDENT_ITERS = 40000    # increased from 10,000
+LR            = 1e-3     # Adam initial learning rate
+# LR is annealed via cosine schedule down to LR_MIN over all iters
+LR_MIN        = 1e-5     # cosine schedule final LR
 
 # ── Mid-training evaluation frequency ────────────────────────────
 # Every EVAL_EVERY_K iterations, Acc + EER are computed and printed
 # for BOTH the training set and test set.  This is the only place
 # metrics are printed during training — NOT at every loss step.
 # Set to 0 to skip mid-training eval (final table is always printed).
-EVAL_EVERY_K = 2000     # ← change K here  (e.g. 1000, 5000, …)
+EVAL_EVERY_K = 4000     # ← change K here  (e.g. 2000, 8000, …)
 
 # ── Loss-print frequency ─────────────────────────────────────────
-LOG_EVERY  = 500
+LOG_EVERY  = 1000
 
 # ── Output directory ─────────────────────────────────────────────
 SAVE_DIR = './ckpt_best'
@@ -118,6 +130,10 @@ CFG = dict(
     w_quant         = 0.5,
     alpha           = 1.0,
     beta            = 0.8,
+    dropout_teacher = DROPOUT_TEACHER,
+    dropout_student = DROPOUT_STUDENT,
+    weight_decay    = WEIGHT_DECAY,
+    lr_min          = LR_MIN,
     num_per         = NUM_PER,
     n_cls_per_batch = N_CLS_PER_BATCH,
     batch_size      = NUM_PER * N_CLS_PER_BATCH,
@@ -221,9 +237,13 @@ def get_transform(train=True, size=128):
     mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
     ops = [transforms.Resize((size, size))]
     if train:
-        ops += [transforms.RandomHorizontalFlip(0.3),
-                transforms.RandomRotation(5),
-                transforms.ColorJitter(brightness=0.1, contrast=0.1)]
+        ops += [
+            transforms.RandomHorizontalFlip(0.5),
+            transforms.RandomRotation(10),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05),
+                                    scale=(0.95, 1.05)),
+        ]
     ops += [transforms.ToTensor(), transforms.Normalize(mean, std)]
     return transforms.Compose(ops)
 
@@ -275,8 +295,11 @@ class LReLU(nn.Module):
 
 
 class TeacherDHN(nn.Module):
-    """VGG pool4 frozen + trainable conv5 block + FC head."""
-    def __init__(self, hash_dim=128, img_size=128, alpha=0.2):
+    """VGG pool4 frozen + trainable conv5 block + FC head.
+    Dropout added to all intermediate FC layers to prevent overfitting
+    on datasets with many images per subject (e.g. CASIA-MS ~35-46/subj).
+    """
+    def __init__(self, hash_dim=128, img_size=128, alpha=0.2, dropout=0.5):
         super().__init__()
         vgg = models.vgg16(weights='IMAGENET1K_V1')
         self.backbone = nn.Sequential(*list(vgg.features.children())[:24])
@@ -292,13 +315,15 @@ class TeacherDHN(nn.Module):
             nn.MaxPool2d(2, stride=2),
         )
         flat = self._flat(img_size)
+        # Dropout between every intermediate FC layer is the primary
+        # defence against overfitting on large-per-subject datasets.
         self.fc = nn.Sequential(
             nn.Linear(flat, 4096),
-            nn.BatchNorm1d(4096, eps=1e-5), LReLU(alpha),
+            nn.BatchNorm1d(4096, eps=1e-5), LReLU(alpha), nn.Dropout(dropout),
             nn.Linear(4096, 4096),
-            nn.BatchNorm1d(4096, eps=1e-5), LReLU(alpha),
+            nn.BatchNorm1d(4096, eps=1e-5), LReLU(alpha), nn.Dropout(dropout),
             nn.Linear(4096, 2048),
-            nn.BatchNorm1d(2048, eps=1e-5), LReLU(alpha),
+            nn.BatchNorm1d(2048, eps=1e-5), LReLU(alpha), nn.Dropout(dropout),
             nn.Linear(2048, hash_dim), nn.Tanh(),
         )
         self._init()
@@ -326,8 +351,8 @@ class TeacherDHN(nn.Module):
 
 
 class StudentDHN(nn.Module):
-    """Paper Fig.6 + BN/LReLU from released code."""
-    def __init__(self, hash_dim=128, img_size=128, alpha=0.2):
+    """Paper Fig.6 + BN/LReLU from released code + dropout for regularisation."""
+    def __init__(self, hash_dim=128, img_size=128, alpha=0.2, dropout=0.4):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(3,  16, 3, stride=4, padding=0),    # VALID
@@ -339,7 +364,8 @@ class StudentDHN(nn.Module):
         )
         flat = self._flat(img_size)
         self.fc = nn.Sequential(
-            nn.Linear(flat, 512), nn.BatchNorm1d(512, eps=1e-5), LReLU(alpha),
+            nn.Linear(flat, 512), nn.BatchNorm1d(512, eps=1e-5),
+            LReLU(alpha), nn.Dropout(dropout),
             nn.Linear(512, hash_dim), nn.Tanh(),
         )
         self._init()
@@ -541,7 +567,7 @@ def _infinite(loader):
 
 def train_teacher(cfg, device):
     log.info('=' * 70)
-    log.info('STAGE 1 – Teacher  (VGG pool4 frozen + conv5/FC  |  Adam lr=0.001)')
+    log.info('STAGE 1 – Teacher  (VGG pool4 frozen + conv5/FC  |  Adam + cosine LR)')
     log.info('=' * 70)
 
     # ── Build datasets
@@ -559,17 +585,24 @@ def train_teacher(cfg, device):
                         num_workers=cfg['num_workers'], pin_memory=True)
 
     model = TeacherDHN(cfg['hash_dim'], cfg['img_size'],
-                       cfg['lrelu_alpha']).to(device)
+                       cfg['lrelu_alpha'],
+                       dropout=cfg['dropout_teacher']).to(device)
     opt   = optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()), lr=cfg['lr'])
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=cfg['lr'], weight_decay=cfg['weight_decay'])
+    # Cosine LR annealing: smoothly reduces LR from lr to lr_min
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=cfg['teacher_iters'], eta_min=cfg['lr_min'])
 
     model.train()
     it      = _infinite(loader)
     best_te = 0.0
     history = []
 
-    log.info(f'  {"Iter":>6}  {"Loss":>9}  {"Lh":>9}  {"Lq":>9}')
-    log.info('  ' + '─' * 40)
+    log.info(f'  dropout={cfg["dropout_teacher"]}  weight_decay={cfg["weight_decay"]}'
+             f'  lr: {cfg["lr"]} → {cfg["lr_min"]} (cosine)')
+    log.info(f'  {"Iter":>6}  {"Loss":>9}  {"Lh":>9}  {"Lq":>9}  {"LR":>10}')
+    log.info('  ' + '─' * 50)
 
     for step in range(1, cfg['teacher_iters'] + 1):
         imgs, labels_int = next(it)
@@ -588,11 +621,14 @@ def train_teacher(cfg, device):
 
         loss, Lh, Lq = loss_dhn(h1p, h2p, sp, cfg['margin_t'], cfg['w_quant'])
         opt.zero_grad(set_to_none=True)
-        loss.backward(); opt.step()
+        loss.backward()
+        opt.step()
+        scheduler.step()
 
         if step % cfg['log_every'] == 0 or step == 1:
+            current_lr = scheduler.get_last_lr()[0]
             log.info(f'  {step:6d}  {loss.item():9.4f}  '
-                     f'{Lh.item():9.4f}  {Lq.item():9.4f}')
+                     f'{Lh.item():9.4f}  {Lq.item():9.4f}  {current_lr:10.2e}')
 
         # ── Periodic train + test evaluation
         if cfg['eval_every'] > 0 and step % cfg['eval_every'] == 0:
@@ -611,7 +647,7 @@ def train_teacher(cfg, device):
                 log.info(f'  ✓ New best teacher  (test Acc={te_acc:.2f}%)')
             log.info(f'  {"─"*64}')
 
-    # ── Final save (if eval_every=0 nothing was saved yet)
+    # ── Final save
     os.makedirs(cfg['save_dir'], exist_ok=True)
     final_path = os.path.join(cfg['save_dir'], 'teacher.pth')
     if not os.path.exists(final_path):
@@ -656,7 +692,8 @@ def train_student(cfg, device, teacher=None):
     # ── Load teacher
     if teacher is None:
         teacher = TeacherDHN(cfg['hash_dim'], cfg['img_size'],
-                             cfg['lrelu_alpha']).to(device)
+                             cfg['lrelu_alpha'],
+                             dropout=cfg['dropout_teacher']).to(device)
         ckpt = os.path.join(cfg['save_dir'], 'teacher.pth')
         teacher.load_state_dict(torch.load(ckpt, map_location=device))
         log.info(f'  Teacher loaded from {ckpt}')
@@ -674,17 +711,23 @@ def train_student(cfg, device, teacher=None):
     log.info('')
 
     student = StudentDHN(cfg['hash_dim'], cfg['img_size'],
-                         cfg['lrelu_alpha']).to(device)
-    opt = optim.Adam(student.parameters(), lr=cfg['lr'])
+                         cfg['lrelu_alpha'],
+                         dropout=cfg['dropout_student']).to(device)
+    opt = optim.Adam(student.parameters(),
+                     lr=cfg['lr'], weight_decay=cfg['weight_decay'])
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=cfg['student_iters'], eta_min=cfg['lr_min'])
 
     student.train()
     it      = _infinite(loader)
     best_te = 0.0
     history = []
 
+    log.info(f'  dropout={cfg["dropout_student"]}  weight_decay={cfg["weight_decay"]}'
+             f'  lr: {cfg["lr"]} → {cfg["lr_min"]} (cosine)')
     log.info(f'  {"Iter":>6}  {"Loss":>9}  {"DHN":>9}  '
-             f'{"Lrela":>9}  {"Lhard":>9}')
-    log.info('  ' + '─' * 55)
+             f'{"Lrela":>9}  {"Lhard":>9}  {"LR":>10}')
+    log.info('  ' + '─' * 65)
 
     for step in range(1, cfg['student_iters'] + 1):
         imgs, labels_int = next(it)
@@ -717,16 +760,16 @@ def train_student(cfg, device, teacher=None):
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        # Clip gradients — large initial Lrela/Lhard can spike before
-        # student weights settle; clipping prevents that spike going NaN
         torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=5.0)
         opt.step()
+        scheduler.step()
 
         if step % cfg['log_every'] == 0 or step == 1:
+            current_lr = scheduler.get_last_lr()[0]
             log.info(f'  {step:6d}  {loss.item():9.4f}  '
                      f'{dhn_s.item():9.4f}  '
                      f'{Lrela.item():9.4f}  '
-                     f'{Lhard.item():9.4f}')
+                     f'{Lhard.item():9.4f}  {current_lr:10.2e}')
 
         # ── Periodic train + test evaluation
         if cfg['eval_every'] > 0 and step % cfg['eval_every'] == 0:
@@ -801,10 +844,12 @@ def evaluate(cfg, device):
     for name, ckpt_fn, make_m in [
         ('Teacher',       'teacher.pth',
          lambda: TeacherDHN(cfg['hash_dim'], cfg['img_size'],
-                            cfg['lrelu_alpha'])),
+                            cfg['lrelu_alpha'],
+                            dropout=cfg['dropout_teacher'])),
         ('DDH (Student)', 'student.pth',
          lambda: StudentDHN(cfg['hash_dim'], cfg['img_size'],
-                            cfg['lrelu_alpha'])),
+                            cfg['lrelu_alpha'],
+                            dropout=cfg['dropout_student'])),
     ]:
         ckpt = os.path.join(cfg['save_dir'], ckpt_fn)
         if not os.path.exists(ckpt):
@@ -865,8 +910,11 @@ def main():
              f'{1-TRAIN_RATIO:.0%} test  (paper Section V-B 50/50)   ║')
     log.info(f'║  Batch      : {CFG["num_per"]} per class × {CFG["n_cls_per_batch"]} classes = {CFG["batch_size"]}'
              f'{"":>{30 - len(str(CFG["batch_size"]))}}║')
-    log.info(f'║  α={CFG["alpha"]}  β={CFG["beta"]}  t={CFG["margin_t"]}  lr={CFG["lr"]}'
-             f'{"":>33}║')
+    log.info(f'║  α={CFG["alpha"]}  β={CFG["beta"]}  t={CFG["margin_t"]}  lr={CFG["lr"]}→{CFG["lr_min"]}'
+             f'{"":>22}║')
+    log.info(f'║  dropout T={CFG["dropout_teacher"]} S={CFG["dropout_student"]}'
+             f'  weight_decay={CFG["weight_decay"]}'
+             f'{"":>22}║')
     log.info(f'║  Eval every : {CFG["eval_every"]} iters  (K={CFG["eval_every"]})'
              f'{"":>{30-len(str(CFG["eval_every"]))}}║')
     log.info('╚══════════════════════════════════════════════════════════════╝')
