@@ -88,7 +88,7 @@ SEP         = '_'        # Filename token separator.
 # ── Train / Test split ───────────────────────────────────────────
 # Paper Section V-B: "half … training set, remaining half … test set"
 # CASIA-MS: ~8-9 images per hand → ~4 train / ~4-5 test per class.
-TRAIN_RATIO = 0.8        # 0.5 = 50% train / 50% test  (paper default)
+TRAIN_RATIO = 0.5        # 0.5 = 50% train / 50% test  (paper default)
                          # Change to e.g. 0.6 for 60/40.
 
 # ── Regularisation ───────────────────────────────────────────────
@@ -318,9 +318,16 @@ class LReLU(nn.Module):
 
 
 class TeacherDHN(nn.Module):
-    """VGG pool4 frozen + trainable conv5 block + FC head.
-    Dropout added to all intermediate FC layers to prevent overfitting
-    on datasets with many images per subject (e.g. CASIA-MS ~35-46/subj).
+    """
+    VGG pool4 frozen + trainable conv5 block + compact FC head.
+
+    FC head is intentionally smaller than the original paper's 4096→4096→2048
+    because CASIA-MS with 200 classes has only ~800 training images total
+    (~4 per class). The original head had ~59M trainable parameters which
+    is ~74k params/sample — guaranteed overfitting.
+
+    Reduced head (flat→1024→512→128) has ~9M params (~11k params/sample),
+    which is still large but manageable with dropout=0.5 and weight decay.
     """
     def __init__(self, hash_dim=128, img_size=128, alpha=0.2, dropout=0.5):
         super().__init__()
@@ -338,16 +345,12 @@ class TeacherDHN(nn.Module):
             nn.MaxPool2d(2, stride=2),
         )
         flat = self._flat(img_size)
-        # Dropout between every intermediate FC layer is the primary
-        # defence against overfitting on large-per-subject datasets.
         self.fc = nn.Sequential(
-            nn.Linear(flat, 4096),
-            nn.BatchNorm1d(4096, eps=1e-5), LReLU(alpha), nn.Dropout(dropout),
-            nn.Linear(4096, 4096),
-            nn.BatchNorm1d(4096, eps=1e-5), LReLU(alpha), nn.Dropout(dropout),
-            nn.Linear(4096, 2048),
-            nn.BatchNorm1d(2048, eps=1e-5), LReLU(alpha), nn.Dropout(dropout),
-            nn.Linear(2048, hash_dim), nn.Tanh(),
+            nn.Linear(flat, 1024),
+            nn.BatchNorm1d(1024, eps=1e-5), LReLU(alpha), nn.Dropout(dropout),
+            nn.Linear(1024, 512),
+            nn.BatchNorm1d(512,  eps=1e-5), LReLU(alpha), nn.Dropout(dropout),
+            nn.Linear(512, hash_dim), nn.Tanh(),
         )
         self._init()
 
@@ -952,4 +955,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-  
