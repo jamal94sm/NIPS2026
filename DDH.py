@@ -81,7 +81,7 @@ log = logging.getLogger()
 # CONFIG — mirrors released code constants exactly
 # ─────────────────────────────────────────────────────────────────────────────
 CFG = dict(
-    data_dir            = "/home/pai-ng/Jamal/CASIA-MS-ROI",
+    data_dir            = './casia_ms',
     label_pos           = 0,
     sep                 = '_',
     train_ratio         = 0.5,
@@ -115,6 +115,7 @@ CFG = dict(
     rms_alpha           = 0.9,      # RMSProp alpha in all scripts
     num_workers         = 4,
     log_every           = 200,
+    eval_every_epochs   = 50,       # evaluate train+test every N epochs
     save_dir            = './ckpt_released',
 )
 
@@ -489,11 +490,6 @@ def hard_loss_fn(feat_T, feat_S, label_oh, batch_size, num_per):
     NO clamp anywhere (as in the original code).
 
     Batch must be organised as [class_0×num_per, class_1×num_per, …].
-
-    FIX: diagonal self-distances (always 0) are masked out of the genuine
-    block min/max.  Without masking, T_blk.min() = 0 always (self-distance),
-    so the genuine constraint degenerates to S_blk.max() - 0, which is
-    always large and produces oversized gradients every step.
     """
     T_dist = _sq_dist_matrix(feat_T)     # [B, B] squared dists
     S_dist = _sq_dist_matrix(feat_S)
@@ -503,9 +499,7 @@ def hard_loss_fn(feat_T, feat_S, label_oh, batch_size, num_per):
     T_pos = lbl_m * T_dist;  T_neg = (1.0 - lbl_m) * T_dist
     S_pos = lbl_m * S_dist;  S_neg = (1.0 - lbl_m) * S_dist
 
-    # Diagonal mask built once; reused across all class blocks
-    diag_mask = torch.eye(num_per, dtype=torch.bool, device=feat_T.device)
-
+    # Replicate TF's mutable tensor loop
     pos_losses = []
     neg_losses = []
     n_blk = batch_size // num_per
@@ -513,20 +507,91 @@ def hard_loss_fn(feat_T, feat_S, label_oh, batch_size, num_per):
     for i in range(n_blk):
         s, e = i * num_per, (i + 1) * num_per
 
-        # genuine block — exclude diagonal (self-distance = 0)
+        # genuine block
         T_blk = T_pos[s:e, s:e]
         S_blk = S_pos[s:e, s:e]
-        T_blk_od = T_blk.masked_fill(diag_mask, float('inf'))  # for .min()
-        S_blk_od = S_blk.masked_fill(diag_mask, 0.0)           # for .max()
-        pos_losses.append(S_blk_od.max() - T_blk_od.min())     # NO clamp
+        pos_losses.append(S_blk.max() - T_blk.min())   # NO clamp
 
         # imposter from this class to all others
         T_n = torch.cat([T_neg[s:e, :s], T_neg[s:e, e:]], dim=1)
         S_n = torch.cat([S_neg[s:e, :s], S_neg[s:e, e:]], dim=1)
-        neg_losses.append(T_n.max() - S_n.min())                # NO clamp
+        neg_losses.append(T_n.max() - S_n.min())        # NO clamp
 
     return (torch.stack(pos_losses).mean() +
             torch.stack(neg_losses).mean())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EVALUATION HELPERS  (used during training + at end)
+# ─────────────────────────────────────────────────────────────────────────────
+@torch.no_grad()
+def _extract_codes_internal(model, loader, device):
+    """Extract binary codes; preserves model.training state."""
+    was_training = model.training
+    model.eval()
+    codes, labels = [], []
+    for imgs, lbls in loader:
+        h = model(imgs.to(device))
+        codes.append(torch.sign(h).cpu().numpy().astype(np.float32))
+        labels.append(lbls.numpy())
+    if was_training:
+        model.train()
+    return np.vstack(codes), np.concatenate(labels)
+
+
+def _id_acc(tr_codes, tr_labels, te_codes, te_labels):
+    """1-NN by L2 distance (eval.py metric)."""
+    correct = 0
+    for code, true_lbl in zip(te_codes, te_labels):
+        l2 = np.sqrt(np.sum((code - tr_codes) ** 2, axis=1))
+        correct += int(tr_labels[np.argmin(l2)] == true_lbl)
+    return correct / len(te_labels) * 100.0
+
+
+def _eer(tr_codes, tr_labels, te_codes, te_labels):
+    """EER via threshold sweep 10–50 (Draw_DET.py logic)."""
+    all_c = np.vstack([tr_codes, te_codes])
+    all_l = np.concatenate([tr_labels, te_labels])
+    n_tr  = len(tr_labels)
+    tlist, flist = [], []
+    for i in range(n_tr, len(all_c)):
+        for j in range(len(all_c)):
+            if i == j: continue
+            d = float(np.sqrt(np.sum((all_c[i] - all_c[j]) ** 2)))
+            if all_l[i] == all_l[j]: tlist.append(d)
+            else:                     flist.append(d)
+    ta = np.array(tlist, dtype=np.float32)
+    fa = np.array(flist, dtype=np.float32)
+    if len(ta) == 0 or len(fa) == 0: return 50.0
+    best, bd = 1.0, 1.0
+    for thr in range(10, 50):
+        frr = float(np.mean(ta > thr))
+        far = float(np.mean(fa <= thr))
+        if abs(frr - far) < bd:
+            bd = abs(frr - far); best = (frr + far) / 2.0
+    return best * 100.0
+
+
+def run_metrics(model, tr_ld, te_ld, device):
+    """
+    Returns (train_acc, train_eer, test_acc, test_eer).
+    Train set is used as gallery for both train and test queries.
+    """
+    tr_c, tr_l = _extract_codes_internal(model, tr_ld, device)
+    te_c, te_l = _extract_codes_internal(model, te_ld, device)
+    tr_acc = _id_acc(tr_c, tr_l, tr_c, tr_l)
+    tr_eer = _eer(tr_c, tr_l, tr_c, tr_l)
+    te_acc = _id_acc(tr_c, tr_l, te_c, te_l)
+    te_eer = _eer(tr_c, tr_l, te_c, te_l)
+    return tr_acc, tr_eer, te_acc, te_eer
+
+
+def _save_csv(rows, save_dir, fname):
+    if not rows: return
+    os.makedirs(save_dir, exist_ok=True)
+    with open(os.path.join(save_dir, fname), 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader(); w.writerows(rows)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -538,20 +603,39 @@ def _infinite(loader):
 
 
 def train_teacher(cfg, device):
-    log.info('=' * 60)
+    log.info('=' * 65)
     log.info('STAGE 1 – Teacher  (RMSProp lr=0.001, epoch=500)')
-    log.info('=' * 60)
-    ds = CASIADataset(cfg['data_dir'], get_transform(cfg['img_size']),
-                      cfg['label_pos'], cfg['sep'])
-    log.info(f'  {len(ds)} images | {ds.num_classes} subjects')
-    tr_idx, _ = split_dataset(ds, cfg['train_ratio'])
-    num_cl = ds.num_classes
+    log.info('=' * 65)
 
-    # Shuffle=True (train_teacher.py)
-    pairs  = PairDataset(ds, tr_idx, num_pairs=60000)
-    loader = DataLoader(pairs, cfg['teacher_batch'], shuffle=True,
-                        num_workers=cfg['num_workers'], pin_memory=True,
-                        drop_last=True)
+    # ── Build datasets (train transform for training, eval transform for metrics)
+    ds_tr   = CASIADataset(cfg['data_dir'], get_transform(cfg['img_size']),
+                           cfg['label_pos'], cfg['sep'])
+    ds_eval = CASIADataset(cfg['data_dir'], get_transform(cfg['img_size']),
+                           cfg['label_pos'], cfg['sep'])
+    tr_idx, te_idx = split_dataset(ds_tr, cfg['train_ratio'])
+    num_cl = ds_tr.num_classes
+    log.info(f'  {len(ds_tr)} images | {num_cl} subjects')
+    log.info(f'  Train: {len(tr_idx)} images  |  Test: {len(te_idx)} images')
+
+    # ── CORRECT batch structure for Hash_loss:
+    # Released code: train_teacher.py uses batch=20, omega=10.
+    # Hash_loss splits batch into archer[:omega] and sabor[omega:].
+    # With batch=20, omega=10 → 2 classes × 10 images each.
+    # The pair-based approach is WRONG here because it produces fake
+    # one-hot labels that break the archer/sabor similarity matrix.
+    # We must use ClassOrderedBatchSampler just like train_DDH.py.
+    num_per_teacher = cfg['teacher_batch'] // (cfg['teacher_batch'] // cfg['teacher_omega'])
+    sampler = ClassOrderedBatchSampler(
+        ds_tr.idx_by_label, tr_idx,
+        num_per=num_per_teacher,          # images per class = omega (10)
+        batch_size=cfg['teacher_batch'])  # total batch = 20
+    loader = DataLoader(ds_tr, batch_sampler=sampler,
+                        num_workers=cfg['num_workers'], pin_memory=True)
+
+    tr_ld = DataLoader(Subset(ds_eval, tr_idx), 64,
+                       num_workers=cfg['num_workers'], pin_memory=True)
+    te_ld = DataLoader(Subset(ds_eval, te_idx), 64,
+                       num_workers=cfg['num_workers'], pin_memory=True)
 
     model = TeacherDHN(cfg['hash_dim'], cfg['lrelu_alpha']).to(device)
     opt   = optim.RMSprop(
@@ -559,82 +643,124 @@ def train_teacher(cfg, device):
         lr=cfg['teacher_lr'], alpha=cfg['rms_alpha'])
 
     model.train()
-    step = 0
-    for epoch in range(cfg['teacher_epochs']):
-        for x1, x2, s in loader:
-            x1, x2 = x1.to(device), x2.to(device)
-            s       = s.to(device)
-            B       = x1.shape[0]
-            h1      = model(x1)
-            h2      = model(x2)
+    step    = 0
+    best_te = 0.0
+    history = []
 
-            # Build a 2B batch with one-hot labels from similarity vector
-            # (teacher training uses Hash_loss with archer/sabor split)
-            h    = torch.cat([h1, h2], 0)          # [2B, D]
-            lbls = torch.cat([
-                torch.arange(B, device=device),
-                torch.where(s.bool(),
-                            torch.arange(B, device=device),
-                            torch.arange(B, 2 * B, device=device))
-            ], 0)
-            n_cls = 2 * B
-            loh   = make_onehot(lbls, n_cls, device)
-            hl_v, _, _ = hash_loss(h, loh, 2 * B, B, cfg['margin_t'])
-            ql_v       = q_loss(h)
-            loss       = hl_v + cfg['w_quant'] * ql_v
+    log.info(f'  {"Ep":>4}  {"Step":>7}  {"Loss":>9}')
+    log.info('  ' + '─' * 26)
+
+    for epoch in range(cfg['teacher_epochs']):
+        for imgs, labels_int in loader:
+            imgs, labels_int = imgs.to(device), labels_int.to(device)
+            B = imgs.shape[0]
+            if B != cfg['teacher_batch']: continue
+
+            loh  = make_onehot(labels_int, num_cl, device)
+            h    = model(imgs)
+            hl_v, _, _ = hash_loss(h, loh, B, cfg['teacher_omega'],
+                                   cfg['margin_t'])
+            ql_v = q_loss(h)
+            loss = hl_v + cfg['w_quant'] * ql_v
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
             step += 1
-            if step % cfg['log_every'] == 0:
-                log.info(f'  Ep {epoch+1:3d}  step {step:6d} | '
-                         f'loss={loss.item():.4f}')
 
+            if step % cfg['log_every'] == 0:
+                log.info(f'  {epoch+1:4d}  {step:7d}  {loss.item():9.4f}')
+
+        # ── Evaluate at end of every epoch (matches original epoch structure)
+        if (epoch + 1) % cfg['eval_every_epochs'] == 0:
+            tr_acc, tr_eer, te_acc, te_eer = run_metrics(
+                model, tr_ld, te_ld, device)
+            log.info(f'  ── Ep {epoch+1} eval ──  '
+                     f'TRAIN  Acc={tr_acc:.2f}%  EER={tr_eer:.2f}%   │   '
+                     f'TEST   Acc={te_acc:.2f}%  EER={te_eer:.2f}%')
+            history.append(dict(epoch=epoch+1, step=step,
+                                tr_acc=tr_acc, tr_eer=tr_eer,
+                                te_acc=te_acc, te_eer=te_eer))
+            if te_acc > best_te:
+                best_te = te_acc
+                os.makedirs(cfg['save_dir'], exist_ok=True)
+                torch.save(model.state_dict(),
+                           os.path.join(cfg['save_dir'], 'teacher.pth'))
+                log.info(f'  ✓ New best teacher  (test Acc={te_acc:.2f}%)')
+            model.train()
+
+    # ── Save final if eval never triggered a save
     os.makedirs(cfg['save_dir'], exist_ok=True)
-    path = os.path.join(cfg['save_dir'], 'teacher.pth')
-    torch.save(model.state_dict(), path)
-    log.info(f'  Teacher saved → {path}')
+    final_path = os.path.join(cfg['save_dir'], 'teacher.pth')
+    if not os.path.exists(final_path):
+        torch.save(model.state_dict(), final_path)
+
+    # ── Final evaluation table
+    log.info('')
+    log.info('  ── TEACHER FINAL EVALUATION ──')
+    log.info(f'  {"Set":20s}  {"Acc (%)":>10}  {"EER (%)":>10}')
+    log.info('  ' + '─' * 44)
+    tr_acc, tr_eer, te_acc, te_eer = run_metrics(model, tr_ld, te_ld, device)
+    log.info(f'  {"Training set":20s}  {tr_acc:>10.2f}  {tr_eer:>10.2f}')
+    log.info(f'  {"Test set":20s}  {te_acc:>10.2f}  {te_eer:>10.2f}')
+    log.info(f'  Teacher → {final_path}')
+
+    history.append(dict(epoch='final', step=step,
+                        tr_acc=tr_acc, tr_eer=tr_eer,
+                        te_acc=te_acc, te_eer=te_eer))
+    _save_csv(history, cfg['save_dir'], 'teacher_history.csv')
     return model
 
 
 def train_student_standalone(cfg, device):
     """
     Mirrors train_student.py: student trained with DHN loss only (no teacher).
-    Not strictly needed for DDH but matches the original pipeline.
+    Uses class-ordered batches (batch=20, omega=10 → 2 classes × 10 images).
     """
-    log.info('=' * 60)
+    log.info('=' * 65)
     log.info('STAGE 2a – Student standalone (RMSProp lr=0.001, epoch=500)')
-    log.info('=' * 60)
-    ds = CASIADataset(cfg['data_dir'], get_transform(cfg['img_size']),
-                      cfg['label_pos'], cfg['sep'])
-    tr_idx, _ = split_dataset(ds, cfg['train_ratio'])
-    num_cl = ds.num_classes
+    log.info('=' * 65)
 
+    ds_tr   = CASIADataset(cfg['data_dir'], get_transform(cfg['img_size']),
+                           cfg['label_pos'], cfg['sep'])
+    ds_eval = CASIADataset(cfg['data_dir'], get_transform(cfg['img_size']),
+                           cfg['label_pos'], cfg['sep'])
+    tr_idx, te_idx = split_dataset(ds_tr, cfg['train_ratio'])
+    num_cl = ds_tr.num_classes
+    log.info(f'  Train: {len(tr_idx)} images  |  Test: {len(te_idx)} images')
+
+    num_per_stu = cfg['student_batch'] // (cfg['student_batch'] // cfg['student_omega'])
     sampler = ClassOrderedBatchSampler(
-        ds.idx_by_label, tr_idx,
-        cfg['student_batch'] // 2,   # num_per
-        cfg['student_batch'])
-    loader  = DataLoader(ds, batch_sampler=sampler,
-                         num_workers=cfg['num_workers'], pin_memory=True)
+        ds_tr.idx_by_label, tr_idx,
+        num_per=num_per_stu,
+        batch_size=cfg['student_batch'])
+    loader = DataLoader(ds_tr, batch_sampler=sampler,
+                        num_workers=cfg['num_workers'], pin_memory=True)
+
+    tr_ld = DataLoader(Subset(ds_eval, tr_idx), 64,
+                       num_workers=cfg['num_workers'], pin_memory=True)
+    te_ld = DataLoader(Subset(ds_eval, te_idx), 64,
+                       num_workers=cfg['num_workers'], pin_memory=True)
 
     model = StudentDHN(cfg['hash_dim'], cfg['img_size'],
                        cfg['lrelu_alpha']).to(device)
     opt   = optim.RMSprop(model.parameters(),
                           lr=cfg['student_lr'], alpha=cfg['rms_alpha'])
     model.train()
-    step = 0
+    step    = 0
+    best_te = 0.0
+
     for epoch in range(cfg['student_epochs']):
         for imgs, labels_int in loader:
             imgs, labels_int = imgs.to(device), labels_int.to(device)
-            B     = imgs.shape[0]
+            B = imgs.shape[0]
             if B != cfg['student_batch']: continue
             loh   = make_onehot(labels_int, num_cl, device)
             h     = model(imgs)
             hl_v, _, _ = hash_loss(h, loh, B, cfg['student_omega'],
                                    cfg['margin_t'])
-            ql_v       = q_loss(h)
-            loss       = hl_v + cfg['w_quant'] * ql_v
+            ql_v  = q_loss(h)
+            loss  = hl_v + cfg['w_quant'] * ql_v
             opt.zero_grad(set_to_none=True)
             loss.backward(); opt.step()
             step += 1
@@ -642,9 +768,23 @@ def train_student_standalone(cfg, device):
                 log.info(f'  Ep {epoch+1:3d}  step {step:6d} | '
                          f'loss={loss.item():.4f}')
 
+        if (epoch + 1) % cfg['eval_every_epochs'] == 0:
+            tr_acc, tr_eer, te_acc, te_eer = run_metrics(
+                model, tr_ld, te_ld, device)
+            log.info(f'  ── Ep {epoch+1} eval ──  '
+                     f'TRAIN  Acc={tr_acc:.2f}%  EER={tr_eer:.2f}%   │   '
+                     f'TEST   Acc={te_acc:.2f}%  EER={te_eer:.2f}%')
+            if te_acc > best_te:
+                best_te = te_acc
+                os.makedirs(cfg['save_dir'], exist_ok=True)
+                torch.save(model.state_dict(),
+                           os.path.join(cfg['save_dir'], 'student_standalone.pth'))
+            model.train()
+
     path = os.path.join(cfg['save_dir'], 'student_standalone.pth')
     os.makedirs(cfg['save_dir'], exist_ok=True)
-    torch.save(model.state_dict(), path)
+    if not os.path.exists(path):
+        torch.save(model.state_dict(), path)
     log.info(f'  Standalone student saved → {path}')
     return model
 
@@ -656,19 +796,28 @@ def train_ddh(cfg, device, teacher=None):
     RMSProp(0.0001, 0.9), epoch=680, batch=50, omega=30, num_per=10
     Shuffle=False → ClassOrderedBatchSampler
     """
-    log.info('=' * 60)
+    log.info('=' * 65)
     log.info('STAGE 2b – DDH  (RMSProp lr=0.0001, epoch=680, class-ordered)')
-    log.info('=' * 60)
-    ds = CASIADataset(cfg['data_dir'], get_transform(cfg['img_size']),
-                      cfg['label_pos'], cfg['sep'])
-    tr_idx, _ = split_dataset(ds, cfg['train_ratio'])
-    num_cl    = ds.num_classes
+    log.info('=' * 65)
+
+    ds_tr   = CASIADataset(cfg['data_dir'], get_transform(cfg['img_size']),
+                           cfg['label_pos'], cfg['sep'])
+    ds_eval = CASIADataset(cfg['data_dir'], get_transform(cfg['img_size']),
+                           cfg['label_pos'], cfg['sep'])
+    tr_idx, te_idx = split_dataset(ds_tr, cfg['train_ratio'])
+    num_cl = ds_tr.num_classes
+    log.info(f'  Train: {len(tr_idx)} images  |  Test: {len(te_idx)} images')
 
     sampler = ClassOrderedBatchSampler(
-        ds.idx_by_label, tr_idx,
+        ds_tr.idx_by_label, tr_idx,
         cfg['ddh_num_per'], cfg['ddh_batch'])
-    loader  = DataLoader(ds, batch_sampler=sampler,
-                         num_workers=cfg['num_workers'], pin_memory=True)
+    loader = DataLoader(ds_tr, batch_sampler=sampler,
+                        num_workers=cfg['num_workers'], pin_memory=True)
+
+    tr_ld = DataLoader(Subset(ds_eval, tr_idx), 64,
+                       num_workers=cfg['num_workers'], pin_memory=True)
+    te_ld = DataLoader(Subset(ds_eval, te_idx), 64,
+                       num_workers=cfg['num_workers'], pin_memory=True)
 
     if teacher is None:
         teacher = TeacherDHN(cfg['hash_dim'], cfg['lrelu_alpha']).to(device)
@@ -678,13 +827,30 @@ def train_ddh(cfg, device, teacher=None):
     teacher.eval()
     for p in teacher.parameters(): p.requires_grad_(False)
 
+    # ── Teacher baseline before DDH training
+    log.info('  ── Teacher baseline ──')
+    log.info(f'  {"Set":20s}  {"Acc (%)":>10}  {"EER (%)":>10}')
+    log.info('  ' + '─' * 44)
+    tch_tr_acc, tch_tr_eer, tch_te_acc, tch_te_eer = run_metrics(
+        teacher, tr_ld, te_ld, device)
+    log.info(f'  {"Training set":20s}  {tch_tr_acc:>10.2f}  {tch_tr_eer:>10.2f}')
+    log.info(f'  {"Test set":20s}  {tch_te_acc:>10.2f}  {tch_te_eer:>10.2f}')
+    log.info('')
+
     student = StudentDHN(cfg['hash_dim'], cfg['img_size'],
                          cfg['lrelu_alpha']).to(device)
     opt = optim.RMSprop(student.parameters(),
                         lr=cfg['ddh_lr'], alpha=cfg['rms_alpha'])
 
     student.train()
-    step = 0
+    step    = 0
+    best_te = 0.0
+    history = []
+
+    log.info(f'  {"Ep":>4}  {"Step":>7}  {"Loss":>9}  '
+             f'{"rela":>9}  {"hard":>9}  {"DHN":>9}')
+    log.info('  ' + '─' * 60)
+
     for epoch in range(cfg['ddh_epochs']):
         for imgs, labels_int in loader:
             imgs, labels_int = imgs.to(device), labels_int.to(device)
@@ -693,12 +859,10 @@ def train_ddh(cfg, device, teacher=None):
 
             loh = make_onehot(labels_int, num_cl, device)
 
-            # Student features
             h_s = student(imgs)
             dhn_s, s_aa, s_as = dhn_loss(
                 h_s, loh, B, cfg['ddh_omega'], cfg['w_quant'], cfg['margin_t'])
 
-            # Teacher features (frozen)
             with torch.no_grad():
                 h_t = teacher(imgs)
             _, t_aa, t_as = dhn_loss(
@@ -706,38 +870,80 @@ def train_ddh(cfg, device, teacher=None):
 
             rl   = rela_loss_fn(s_aa, s_as, t_aa, t_as)
             hl   = hard_loss_fn(h_t, h_s, loh, B, cfg['ddh_num_per'])
-            # Exact train_DDH.py: loss = rela_loss + hard_loss + DHN_loss
             loss = rl + hl + dhn_s
 
-            # Guard: skip batch if any component is non-finite
+            # Guard: skip if non-finite
             if not torch.isfinite(loss):
-                log.warning(f'  Ep {epoch+1} step {step}: non-finite loss '
+                log.warning(f'  Ep {epoch+1} step {step}: non-finite '
                             f'(rela={rl.item():.4f} hard={hl.item():.4f} '
-                            f'DHN={dhn_s.item():.4f}) — skipping batch')
+                            f'DHN={dhn_s.item():.4f}) — skipping')
                 opt.zero_grad(set_to_none=True)
                 continue
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            # Clip gradients — hard_loss can spike at early iterations
             torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=5.0)
             opt.step()
             step += 1
-            if step % cfg['log_every'] == 0:
-                log.info(f'  Ep {epoch+1:3d}  step {step:6d} | '
-                         f'loss={loss.item():.4f}  '
-                         f'rela={rl.item():.4f}  hard={hl.item():.4f}  '
-                         f'DHN={dhn_s.item():.4f}')
 
-    path = os.path.join(cfg['save_dir'], 'student_ddh.pth')
+            if step % cfg['log_every'] == 0:
+                log.info(f'  {epoch+1:4d}  {step:7d}  {loss.item():9.4f}  '
+                         f'{rl.item():9.4f}  {hl.item():9.4f}  '
+                         f'{dhn_s.item():9.4f}')
+
+        # ── Periodic evaluation
+        if (epoch + 1) % cfg['eval_every_epochs'] == 0:
+            log.info(f'  ── Ep {epoch+1} eval ──')
+            tr_acc, tr_eer, te_acc, te_eer = run_metrics(
+                student, tr_ld, te_ld, device)
+            log.info(f'  TRAIN  Acc={tr_acc:.2f}%  EER={tr_eer:.2f}%   │   '
+                     f'TEST   Acc={te_acc:.2f}%  EER={te_eer:.2f}%')
+            history.append(dict(epoch=epoch+1, step=step,
+                                tr_acc=tr_acc, tr_eer=tr_eer,
+                                te_acc=te_acc, te_eer=te_eer))
+            if te_acc > best_te:
+                best_te = te_acc
+                os.makedirs(cfg['save_dir'], exist_ok=True)
+                torch.save(student.state_dict(),
+                           os.path.join(cfg['save_dir'], 'student_ddh.pth'))
+                log.info(f'  ✓ New best DDH student  (test Acc={te_acc:.2f}%)')
+            student.train()
+
+    # ── Final save
     os.makedirs(cfg['save_dir'], exist_ok=True)
-    torch.save(student.state_dict(), path)
-    log.info(f'  DDH student saved → {path}')
+    stu_path = os.path.join(cfg['save_dir'], 'student_ddh.pth')
+    if not os.path.exists(stu_path):
+        torch.save(student.state_dict(), stu_path)
+
+    # ── Final comparison table
+    log.info('')
+    log.info('  ══ FINAL RESULTS ══════════════════════════════════════════')
+    log.info(f'  {"Model":22s}  {"Train Acc":>10}  {"Train EER":>10}  '
+             f'{"Test Acc":>10}  {"Test EER":>10}')
+    log.info('  ' + '─' * 68)
+    all_results = []
+    for name, m in [('Teacher', teacher), ('DDH (Student)', student)]:
+        tr_acc, tr_eer, te_acc, te_eer = run_metrics(m, tr_ld, te_ld, device)
+        log.info(f'  {name:22s}  {tr_acc:>10.2f}  {tr_eer:>10.2f}  '
+                 f'{te_acc:>10.2f}  {te_eer:>10.2f}')
+        all_results.append(dict(model=name,
+                                train_acc=round(tr_acc, 2),
+                                train_eer=round(tr_eer, 2),
+                                test_acc=round(te_acc, 2),
+                                test_eer=round(te_eer, 2)))
+        history.append(dict(epoch=f'final_{name}', step=step,
+                            tr_acc=tr_acc, tr_eer=tr_eer,
+                            te_acc=te_acc, te_eer=te_eer))
+
+    log.info(f'  DDH student → {stu_path}')
+    _save_csv(all_results, cfg['save_dir'], 'results_final.csv')
+    _save_csv(history,     cfg['save_dir'], 'ddh_history.csv')
+    log.info(f"  CSV → {os.path.join(cfg['save_dir'], 'results_final.csv')}")
     return student
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EVALUATION — translated from eval.py
+# EVALUATION — translated from eval.py  (standalone --stage eval)
 # ─────────────────────────────────────────────────────────────────────────────
 @torch.no_grad()
 def extract_codes(model, loader, device):
@@ -751,24 +957,19 @@ def extract_codes(model, loader, device):
 
 
 def identification_accuracy(tr_codes, tr_labels, te_codes, te_labels):
-    """
-    1-NN using L2 distance on binary codes (eval.py uses sqrt(sum(sq_diff))).
-    """
+    """1-NN using L2 distance on binary codes (eval.py)."""
     correct = 0
     for code, true_lbl in zip(te_codes, te_labels):
-        l2    = np.sqrt(np.sum((code - tr_codes) ** 2, axis=1))
+        l2 = np.sqrt(np.sum((code - tr_codes) ** 2, axis=1))
         correct += int(tr_labels[np.argmin(l2)] == true_lbl)
     return correct / len(te_labels) * 100.0
 
 
-def compute_eer(tr_codes, tr_labels, te_codes, te_labels, num_per=None):
-    """
-    EER via threshold sweep 10–50 on L2 distances (Draw_DET.py logic).
-    """
+def compute_eer(tr_codes, tr_labels, te_codes, te_labels):
+    """EER via threshold sweep 10–50 on L2 distances (Draw_DET.py logic)."""
     all_codes  = np.vstack([tr_codes, te_codes])
     all_labels = np.concatenate([tr_labels, te_labels])
     n_train    = len(tr_labels)
-
     true_list, false_list = [], []
     for i in range(n_train, len(all_codes)):
         for j in range(len(all_codes)):
@@ -776,11 +977,9 @@ def compute_eer(tr_codes, tr_labels, te_codes, te_labels, num_per=None):
             d = float(np.sqrt(np.sum((all_codes[i] - all_codes[j]) ** 2)))
             if all_labels[i] == all_labels[j]: true_list.append(d)
             else:                               false_list.append(d)
-
     true_arr  = np.array(true_list,  dtype=np.float32)
     false_arr = np.array(false_list, dtype=np.float32)
     best_eer, best_diff = 1.0, 1.0
-
     for thr in range(10, 50):
         frr = float(np.mean(true_arr  >  thr))
         far = float(np.mean(false_arr <= thr))
@@ -788,17 +987,21 @@ def compute_eer(tr_codes, tr_labels, te_codes, te_labels, num_per=None):
         if diff < best_diff:
             best_diff = diff
             best_eer  = (frr + far) / 2.0
-
     return best_eer * 100.0
 
 
 def evaluate(cfg, device):
-    log.info('=' * 60); log.info('EVALUATION'); log.info('=' * 60)
+    log.info('=' * 65); log.info('EVALUATION'); log.info('=' * 65)
     ds = CASIADataset(cfg['data_dir'], get_transform(cfg['img_size']),
                       cfg['label_pos'], cfg['sep'])
     tr_idx, te_idx = split_dataset(ds, cfg['train_ratio'])
-    tr_ld = DataLoader(Subset(ds, tr_idx), 32, num_workers=cfg['num_workers'])
-    te_ld = DataLoader(Subset(ds, te_idx), 32, num_workers=cfg['num_workers'])
+    log.info(f'  Train: {len(tr_idx)} images  |  Test: {len(te_idx)} images')
+    tr_ld = DataLoader(Subset(ds, tr_idx), 64, num_workers=cfg['num_workers'])
+    te_ld = DataLoader(Subset(ds, te_idx), 64, num_workers=cfg['num_workers'])
+
+    log.info(f'  {"Model":22s}  {"Train Acc":>10}  {"Train EER":>10}  '
+             f'{"Test Acc":>10}  {"Test EER":>10}')
+    log.info('  ' + '─' * 68)
 
     results = []
     for name, ckpt_fn, make_m in [
@@ -813,20 +1016,25 @@ def evaluate(cfg, device):
             log.warning(f'  {name}: checkpoint not found, skipping'); continue
         m = make_m().to(device)
         m.load_state_dict(torch.load(ckpt, map_location=device))
+
         tr_c, tr_l = extract_codes(m, tr_ld, device)
         te_c, te_l = extract_codes(m, te_ld, device)
-        acc = identification_accuracy(tr_c, tr_l, te_c, te_l)
-        eer = compute_eer(tr_c, tr_l, te_c, te_l)
-        log.info(f'  {name:10s}  Acc={acc:.2f}%   EER={eer:.2f}%')
-        results.append({'model': name, 'acc_%': round(acc, 2),
-                        'eer_%': round(eer, 2)})
 
-    os.makedirs(cfg['save_dir'], exist_ok=True)
-    csv_p = os.path.join(cfg['save_dir'], 'results.csv')
-    with open(csv_p, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=['model', 'acc_%', 'eer_%'])
-        w.writeheader(); w.writerows(results)
-    log.info(f'  Results → {csv_p}')
+        tr_acc = identification_accuracy(tr_c, tr_l, tr_c, tr_l)
+        tr_eer = compute_eer(tr_c, tr_l, tr_c, tr_l)
+        te_acc = identification_accuracy(tr_c, tr_l, te_c, te_l)
+        te_eer = compute_eer(tr_c, tr_l, te_c, te_l)
+
+        log.info(f'  {name:22s}  {tr_acc:>10.2f}  {tr_eer:>10.2f}  '
+                 f'{te_acc:>10.2f}  {te_eer:>10.2f}')
+        results.append(dict(model=name,
+                            train_acc=round(tr_acc, 2),
+                            train_eer=round(tr_eer, 2),
+                            test_acc=round(te_acc, 2),
+                            test_eer=round(te_eer, 2)))
+
+    _save_csv(results, cfg['save_dir'], 'results_eval.csv')
+    log.info(f"  CSV → {os.path.join(cfg['save_dir'], 'results_eval.csv')}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
