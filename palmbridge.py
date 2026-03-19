@@ -102,7 +102,7 @@ GABOR_KERNEL_SIZE = 15    # spatial size of each Gabor kernel (px)
 # time PalmBridge activates, L_con is already near-zero — no amplification
 # needed.  ALPHA=10 caused a sudden loss spike at epoch 21 (8.18 vs 0.26)
 # because the misaligned codebook produced L_con~0.79 × 10 = 7.9 added to bak.
-ALPHA      = 1.0    # weight of L_con  (codebook pre-aligned → no amplification needed)
+ALPHA      = 0.1    # weight of L_con  (codebook pre-aligned → no amplification needed)
 BETA       = 1.0    # weight of L_o    (orthogonality regularisation)
 LAMBDA_CON = 0.25   # λ inside L_con   (Eq. 6, §III-C-1)
 
