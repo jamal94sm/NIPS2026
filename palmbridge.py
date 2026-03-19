@@ -42,8 +42,8 @@ from torchvision import transforms
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
 # ── Data ─────────────────────────────────────────────────────────────────────
-DATA_ROOT   = "data/CASIA_MS_ROI"   # folder containing all ROI .jpg files
-SPECTRA     = ["460", "630", "700", "850"]  # spectral channels to include
+DATA_ROOT   = "/home/pai-ng/Jamal/CASIA-MS-ROI"  # folder containing all ROI .jpg files
+SPECTRA     = ["460", "630", "700", "850", "940", "WHT"]  # spectral channels to include
 IMG_SIZE    = 128                   # ROIs are resized to (IMG_SIZE × IMG_SIZE)
 
 # ── Protocol selection ────────────────────────────────────────────────────────
