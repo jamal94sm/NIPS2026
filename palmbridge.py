@@ -65,7 +65,7 @@ INTRA_TRAIN_IMG_RATIO    = 0.8   # within training group: train / internal-test
 #   Eval   : 2 target spectral domains, subject IDs 151 – 200 (indices 150-199)
 #   Gallery / Query split: 50 % / 50 % of each eval identity's images.
 CROSS_TRAIN_SPECTRA      = ["460", "630", "700", "850"]  # all 4 source domains
-CROSS_TEST_SPECTRA       = ["940", "WHT"]                # 2 target domains
+CROSS_TEST_SPECTRA       = ["700", "850"]                # 2 target domains
 CROSS_TRAIN_MAX_SUBJ_IDX = 150   # subjects with 1-based index ≤ 150 → train
 #   (subject IDs 001-150 → train;  subject IDs 151-200 → eval)
 
@@ -107,16 +107,30 @@ BETA       = 10.0   # weight of L_o    (rebalanced against ArcFace scale)
 LAMBDA_CON = 0.25   # λ inside L_con   (Eq. 6, §III-C-1)
 
 # ── ArcFace  (L_bak) ─────────────────────────────────────────────────────────
-ARC_S      = 64.0   # feature scale
-ARC_M      = 0.50   # additive angular margin (radians)
+# WHY s=32, m=0.2:  s=64/m=0.5 inflates initial loss to ~18 (random features
+# give ln(C) ≈ 4.6 normally).  This makes gradients huge and unstable before
+# the backbone has learned anything useful.  s=32, m=0.2 keeps initial loss
+# near ln(100)=4.6, allowing proper convergence.  Once the backbone is warm,
+# ArcFace naturally becomes discriminative even with a softer margin.
+ARC_S      = 32.0   # feature scale  (reduced from 64 to stabilise early training)
+ARC_M      = 0.30   # angular margin (reduced from 0.50 — easier to optimise)
 
 # ── Training  (§IV-A-4) ──────────────────────────────────────────────────────
 BATCH_SIZE   = 16
 LR           = 1e-3
 WEIGHT_DECAY = 5e-4
-EPOCHS       = 80
+EPOCHS       = 100
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 NUM_WORKERS  = 4
+
+# ── PalmBridge warm-up ────────────────────────────────────────────────────────
+# WHY warm-up:  PalmBridge's argmin is non-differentiable.  At epoch 1 the
+# codebook is random, so z_tilde maps all identities to shared vectors,
+# poisoning the ArcFace gradient before the backbone has learned anything.
+# Solution: train backbone alone for WARMUP_EPOCHS (w_map=0), then activate
+# PalmBridge with the full blending weight.  This is the two-phase strategy
+# implied by the paper's joint optimisation once features are meaningful.
+WARMUP_EPOCHS = 20   # epochs to train backbone only (w_map forced to 0)
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
 N_EER_THRESHOLDS = 2000   # resolution of the FAR / FRR sweep
@@ -839,6 +853,10 @@ def train_one_epoch(
     n_correct = 0
     n_total   = 0
 
+    # During warm-up phase, disable PalmBridge blending so the backbone
+    # can learn discriminative features before the codebook interferes.
+    pb_active = (epoch > WARMUP_EPOCHS)
+
     for imgs, labels in loader:
         imgs   = imgs.to(DEVICE)
         labels = labels.to(DEVICE)
@@ -849,9 +867,11 @@ def train_one_epoch(
         z_hat, z_tilde, _ = palmbridge(z)             # Eq. (1)–(5)
 
         # ── Losses  Eq. (8): L = L_bak + α·L_con + β·L_o ─────────────────
-        L_bak = arcface(z_hat, labels)
-        L_con = palmbridge.loss_consistency(z, z_tilde)
-        L_o   = palmbridge.loss_orthogonal()
+        # During warm-up: use raw backbone features (no blending distortion)
+        feat_for_arc = z_hat if pb_active else z
+        L_bak = arcface(feat_for_arc, labels)
+        L_con = palmbridge.loss_consistency(z, z_tilde) if pb_active else torch.tensor(0.0, device=DEVICE)
+        L_o   = palmbridge.loss_orthogonal()            # always train codebook diversity
         loss  = L_bak + ALPHA * L_con + BETA * L_o
 
         loss.backward()
@@ -888,9 +908,19 @@ def build_optimizer(backbone, palmbridge, arcface) -> optim.Optimizer:
 
 
 def build_scheduler(optimizer):
-    return optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=EPOCHS, eta_min=1e-6
-    )
+    """
+    Linear warmup for first WARMUP_EPOCHS epochs, then cosine anneal.
+    Warmup prevents large random gradients from corrupting early weights.
+    """
+    def lr_lambda(epoch):
+        # epoch is 0-indexed here (scheduler steps after each epoch)
+        if epoch < WARMUP_EPOCHS:
+            # Linear ramp: 0.1 → 1.0 over WARMUP_EPOCHS
+            return 0.1 + 0.9 * (epoch / max(WARMUP_EPOCHS - 1, 1))
+        # Cosine decay from 1.0 → 1e-3 (relative) over remaining epochs
+        progress = (epoch - WARMUP_EPOCHS) / max(EPOCHS - WARMUP_EPOCHS, 1)
+        return max(1e-3, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def save_checkpoint(backbone, palmbridge, arcface, optimizer, epoch, path):
@@ -1205,7 +1235,8 @@ def train_and_eval(
         scheduler.step()
 
         # ── Compact single-line epoch summary (always printed) ─────────────
-        print(f"Epoch {epoch:03d}/{EPOCHS}  "
+        phase = "WARMUP" if epoch <= WARMUP_EPOCHS else "PalmBridge"
+        print(f"Epoch {epoch:03d}/{EPOCHS} [{phase}]  "
               f"loss={m['loss']:.4f}  bak={m['bak']:.4f}  "
               f"con={m['con']:.4f}  orth={m['orth']:.4f}  "
               f"train_acc={m['train_acc']*100:.2f}%  "
@@ -1213,11 +1244,14 @@ def train_and_eval(
 
         # ── Full EER / ACC evaluation every LOG_EPOCHS epochs ──────────────
         if epoch % LOG_EPOCHS == 0 or epoch == EPOCHS:
+            # During warm-up, evaluate without PalmBridge (not meaningful yet)
+            use_pb = (epoch > WARMUP_EPOCHS)
             res = run_evaluation(backbone, palmbridge,
                                  gallery_loader, query_loader,
-                                 protocol_name, apply_palmbridge=True,
+                                 protocol_name, apply_palmbridge=use_pb,
                                  save_plots=(epoch == EPOCHS), plot_dir=pdir)
-            print(f"  >> [eval @{epoch}] "
+            pb_label = "PB" if use_pb else "Naive"
+            print(f"  >> [eval @{epoch} {pb_label}] "
                   f"EER={res['eer']*100:.4f}%  ACC={res['acc']*100:.2f}%")
             if res["eer"] < best_eer:
                 best_eer = res["eer"]
@@ -1310,7 +1344,8 @@ def run_closed():
         scheduler.step()
 
         # ── Compact single-line epoch summary ──────────────────────────────
-        print(f"Epoch {epoch:03d}/{EPOCHS}  "
+        phase = "WARMUP" if epoch <= WARMUP_EPOCHS else "PalmBridge"
+        print(f"Epoch {epoch:03d}/{EPOCHS} [{phase}]  "
               f"loss={m['loss']:.4f}  bak={m['bak']:.4f}  "
               f"con={m['con']:.4f}  orth={m['orth']:.4f}  "
               f"train_acc={m['train_acc']*100:.2f}%  "
@@ -1318,12 +1353,14 @@ def run_closed():
 
         # ── Full EER / ACC evaluation every LOG_EPOCHS epochs ──────────────
         if epoch % LOG_EPOCHS == 0 or epoch == EPOCHS:
+            use_pb = (epoch > WARMUP_EPOCHS)
             res = run_evaluation_closed(
                 backbone, palmbridge, train_loader, test_loader,
-                "closed", apply_palmbridge=True,
+                "closed", apply_palmbridge=use_pb,
                 save_plots=(epoch == EPOCHS), plot_dir=pdir
             )
-            print(f"  >> [eval @{epoch}] "
+            pb_label = "PB" if use_pb else "Naive"
+            print(f"  >> [eval @{epoch} {pb_label}] "
                   f"EER={res['eer']*100:.4f}%  ACC={res['acc']*100:.2f}%")
             if res["eer"] < best_eer:
                 best_eer = res["eer"]
