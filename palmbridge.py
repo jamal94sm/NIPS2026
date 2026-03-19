@@ -97,13 +97,13 @@ NUM_GABOR_FILTERS = 32    # orientations in the learnable Gabor bank
 GABOR_KERNEL_SIZE = 15    # spatial size of each Gabor kernel (px)
 
 # ── Loss weights  (Eq. 8) ────────────────────────────────────────────────────
-# WHY ALPHA/BETA = 10:  ArcFace uses scale s=64, so L_bak (cross-entropy) is
-# naturally ~64× larger than L_con / L_o (unit-sphere MSE).  With α=β=1 the
-# gradient signal from con and orth is negligible.  Setting α=β=10 rebalances
-# their contribution to roughly 10-20 % of total gradient magnitude, consistent
-# with the paper's intent that all three terms meaningfully shape the embedding.
-ALPHA      = 10.0   # weight of L_con  (rebalanced against ArcFace scale)
-BETA       = 10.0   # weight of L_o    (rebalanced against ArcFace scale)
+# WHY ALPHA=1, BETA=1:  The codebook is pre-aligned during warmup (L_con is
+# trained from epoch 1 even though z_hat is not used for ArcFace yet).  By the
+# time PalmBridge activates, L_con is already near-zero — no amplification
+# needed.  ALPHA=10 caused a sudden loss spike at epoch 21 (8.18 vs 0.26)
+# because the misaligned codebook produced L_con~0.79 × 10 = 7.9 added to bak.
+ALPHA      = 1.0    # weight of L_con  (codebook pre-aligned → no amplification needed)
+BETA       = 1.0    # weight of L_o    (orthogonality regularisation)
 LAMBDA_CON = 0.25   # λ inside L_con   (Eq. 6, §III-C-1)
 
 # ── ArcFace  (L_bak) ─────────────────────────────────────────────────────────
@@ -113,7 +113,7 @@ LAMBDA_CON = 0.25   # λ inside L_con   (Eq. 6, §III-C-1)
 # near ln(100)=4.6, allowing proper convergence.  Once the backbone is warm,
 # ArcFace naturally becomes discriminative even with a softer margin.
 ARC_S      = 32.0   # feature scale  (reduced from 64 to stabilise early training)
-ARC_M      = 0.30   # angular margin (reduced from 0.50 — easier to optimise)
+ARC_M      = 0.20   # angular margin (reduced from 0.50 — easier to optimise)
 
 # ── Training  (§IV-A-4) ──────────────────────────────────────────────────────
 BATCH_SIZE   = 16
@@ -867,11 +867,19 @@ def train_one_epoch(
         z_hat, z_tilde, _ = palmbridge(z)             # Eq. (1)–(5)
 
         # ── Losses  Eq. (8): L = L_bak + α·L_con + β·L_o ─────────────────
-        # During warm-up: use raw backbone features (no blending distortion)
+        # During warm-up:
+        #   - ArcFace uses raw z (not blended z_hat) so backbone trains cleanly
+        #   - L_con IS computed so the codebook silently aligns with backbone
+        #     features. By epoch WARMUP_EPOCHS, L_con is near-zero, meaning
+        #     PalmBridge activation at epoch 21 causes no loss spike.
+        #   - L_o always trains to keep codebook vectors diverse
+        # After warm-up:
+        #   - ArcFace uses blended z_hat (full PalmBridge pipeline)
+        #   - All three loss terms contribute normally
         feat_for_arc = z_hat if pb_active else z
         L_bak = arcface(feat_for_arc, labels)
-        L_con = palmbridge.loss_consistency(z, z_tilde) if pb_active else torch.tensor(0.0, device=DEVICE)
-        L_o   = palmbridge.loss_orthogonal()            # always train codebook diversity
+        L_con = palmbridge.loss_consistency(z, z_tilde)  # always — pre-aligns during warmup
+        L_o   = palmbridge.loss_orthogonal()              # always — keeps codebook diverse
         loss  = L_bak + ALPHA * L_con + BETA * L_o
 
         loss.backward()
