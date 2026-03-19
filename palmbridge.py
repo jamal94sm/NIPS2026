@@ -112,8 +112,8 @@ LAMBDA_CON = 0.25   # λ inside L_con   (Eq. 6, §III-C-1)
 # the backbone has learned anything useful.  s=32, m=0.2 keeps initial loss
 # near ln(100)=4.6, allowing proper convergence.  Once the backbone is warm,
 # ArcFace naturally becomes discriminative even with a softer margin.
-ARC_S      = 32.0   # feature scale  (reduced from 64 to stabilise early training)
-ARC_M      = 0.20   # angular margin (reduced from 0.50 — easier to optimise)
+ARC_S      = 48.0   # feature scale  (reduced from 64 to stabilise early training)
+ARC_M      = 0.40   # angular margin (reduced from 0.50 — easier to optimise)
 
 # ── Training  (§IV-A-4) ──────────────────────────────────────────────────────
 BATCH_SIZE   = 16
@@ -130,7 +130,7 @@ NUM_WORKERS  = 4
 # Solution: train backbone alone for WARMUP_EPOCHS (w_map=0), then activate
 # PalmBridge with the full blending weight.  This is the two-phase strategy
 # implied by the paper's joint optimisation once features are meaningful.
-WARMUP_EPOCHS = 20   # epochs to train backbone only (w_map forced to 0)
+WARMUP_EPOCHS = 10   # epochs to train backbone only (w_map forced to 0)
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
 N_EER_THRESHOLDS = 2000   # resolution of the FAR / FRR sweep
