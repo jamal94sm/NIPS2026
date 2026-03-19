@@ -43,7 +43,7 @@ from torchvision import transforms
 
 # ── Data ─────────────────────────────────────────────────────────────────────
 DATA_ROOT   = "data/CASIA_MS_ROI"   # folder containing all ROI .jpg files
-SPECTRA     = ["460", "630", "700", "850", "940", "WHT"]  # spectral channels to include
+SPECTRA     = ["460", "630", "700", "850"]  # spectral channels to include
 IMG_SIZE    = 128                   # ROIs are resized to (IMG_SIZE × IMG_SIZE)
 
 # ── Protocol selection ────────────────────────────────────────────────────────
@@ -51,10 +51,30 @@ IMG_SIZE    = 128                   # ROIs are resized to (IMG_SIZE × IMG_SIZE)
 PROTOCOL    = "all"
 
 # ── Protocol-specific split settings (§IV-A-6) ───────────────────────────────
-INTRA_TRAIN_ID_RATIO     = 0.5   # fraction of identities used for training
-CLOSED_TRAIN_IMGS_PER_ID = 6     # first N images/identity → training (closed-set)
-CROSS_TRAIN_SPECTRA      = ["460", "630"]   # source domain spectra
-CROSS_TEST_SPECTRA       = ["700", "850"]   # target domain spectra
+#
+# INTRA-DATASET OPEN-SET
+#   All identities split 50/50 into two non-overlapping groups (no ID overlap).
+#   Group 1 (training IDs) : images split 80 % train / 20 % internal-test.
+#   Group 2 (open-set IDs) : images split 50 % gallery / 50 % query.
+INTRA_TRAIN_ID_RATIO     = 0.5   # fraction of identities → training group
+INTRA_TRAIN_IMG_RATIO    = 0.8   # within training group: train / internal-test
+
+#
+# CROSS-DATASET OPEN-SET  (adapted for CASIA-MS single-dataset setup)
+#   Train  : ALL 4 spectral domains, subject IDs  1 – 150  (indices 0-149)
+#   Eval   : 2 target spectral domains, subject IDs 151 – 200 (indices 150-199)
+#   Gallery / Query split: 50 % / 50 % of each eval identity's images.
+CROSS_TRAIN_SPECTRA      = ["460", "630", "700", "850"]  # all 4 source domains
+CROSS_TEST_SPECTRA       = ["700", "850"]                # 2 target domains
+CROSS_TRAIN_MAX_SUBJ_IDX = 150   # subjects with 1-based index ≤ 150 → train
+#   (subject IDs 001-150 → train;  subject IDs 151-200 → eval)
+
+#
+# CLOSED-SET
+#   All 200 identities included (no cross-dataset separation).
+#   First 80 % of each identity's images → training.
+#   Remaining 20 % split 50 % gallery / 50 % query.
+CLOSED_TRAIN_IMG_RATIO   = 0.8   # 80 % of images/identity → training
 
 # ── Feature blending  (Eq. 4, Fig. 4 optimal) ────────────────────────────────
 W_MAP       = 0.3   # weight of the mapped PalmBridge vector  z̃
@@ -206,98 +226,198 @@ def make_loader(
 
 def build_intra_dataset_splits() -> Tuple[List, List, List, List]:
     """
-    Splits identities 50/50 into non-overlapping training and open-set groups.
-    Within the open-set group: 50 % gallery / 50 % query per identity.
-    Returns: train_samples, val_samples, gallery_samples, query_samples
+    Paper §IV-A-6 — Intra-dataset open-set evaluation:
+
+    "For each dataset, all identities are evenly divided into two groups
+     with no identity overlap.
+     In the first group, images of each identity are further split into
+     training and testing subsets for model optimization and internal
+     evaluation.
+     In the second group, images are equally partitioned into gallery
+     and query subsets for open-set verification."
+
+    Concretely for CASIA-MS:
+      • All identity keys (subject_hand) are shuffled and split 50 / 50
+        into Group A (training) and Group B (open-set) — zero overlap.
+      • Group A: 80 % of each identity's images → training,
+                 20 % → internal test/val (not used in open-set scoring).
+      • Group B: 50 % of each identity's images → gallery,
+                 50 % → query          (used for open-set EER / ACC).
+
+    Returns
+    -------
+    train_samples, val_samples, gallery_samples, query_samples
     """
     rng   = np.random.default_rng(SEED)
     index = build_index(DATA_ROOT, SPECTRA)
     ids   = sorted(index.keys())
 
+    # ── Step 1: 50/50 identity-level split (no identity overlap) ──────────
     perm      = rng.permutation(len(ids))
-    n_train   = int(len(ids) * INTRA_TRAIN_ID_RATIO)
-    train_ids = {ids[i] for i in perm[:n_train]}
-    open_ids  = {ids[i] for i in perm[n_train:]}
+    n_train   = int(len(ids) * INTRA_TRAIN_ID_RATIO)   # e.g. 50 % → Group A
+    train_ids = [ids[i] for i in sorted(perm[:n_train])]
+    open_ids  = [ids[i] for i in sorted(perm[n_train:])]
 
-    train_label = {iid: idx for idx, iid in enumerate(sorted(train_ids))}
-    open_label  = {iid: idx for idx, iid in enumerate(sorted(open_ids))}
+    # Label spaces are entirely separate
+    train_label = {iid: idx for idx, iid in enumerate(train_ids)}
+    open_label  = {iid: idx for idx, iid in enumerate(open_ids)}
 
     train_s, val_s, gallery_s, query_s = [], [], [], []
 
-    for iid in sorted(train_ids):
-        files = index[iid]
-        split = max(1, int(len(files) * 0.8))
-        for f in files[:split]: train_s.append((f, train_label[iid]))
-        for f in files[split:]: val_s.append((f, train_label[iid]))
+    # ── Step 2: Group A → train / internal-test split ─────────────────────
+    for iid in train_ids:
+        files    = index[iid]
+        n        = len(files)
+        n_tr     = max(1, int(n * INTRA_TRAIN_IMG_RATIO))   # 80 % train
+        for f in files[:n_tr]: train_s.append((f, train_label[iid]))
+        for f in files[n_tr:]: val_s.append((f,   train_label[iid]))
 
-    for iid in sorted(open_ids):
+    # ── Step 3: Group B → gallery / query split (50 / 50) ─────────────────
+    for iid in open_ids:
         files = index[iid]
-        split = max(1, len(files) // 2)
-        for f in files[:split]: gallery_s.append((f, open_label[iid]))
-        for f in files[split:]: query_s.append((f, open_label[iid]))
+        n     = len(files)
+        half  = max(1, n // 2)                              # 50 % gallery
+        for f in files[:half]: gallery_s.append((f, open_label[iid]))
+        for f in files[half:]: query_s.append((f,  open_label[iid]))
 
-    print(f"[Intra]  Train IDs:{len(train_ids)}  Open IDs:{len(open_ids)}"
-          f"  Gallery:{len(gallery_s)}  Query:{len(query_s)}")
+    print(
+        f"[Intra]  "
+        f"Group A (train) IDs: {len(train_ids)} | "
+        f"  train imgs: {len(train_s)}  val imgs: {len(val_s)}\n"
+        f"         "
+        f"Group B (open)  IDs: {len(open_ids)}  | "
+        f"  gallery: {len(gallery_s)}  query: {len(query_s)}"
+    )
     return train_s, val_s, gallery_s, query_s
 
 
-# ── Protocol 2: Cross-Spectrum Open-Set  (§IV-A-6, Table V) ────────────────
+# ── Protocol 2: Cross-Dataset Open-Set  (§IV-A-6, Table V) ─────────────────
+
+def _subject_index(identity_key: str) -> int:
+    """
+    Extracts the 1-based integer subject index from an identity key.
+    Identity key = "{subject}_{hand}", e.g. "001_L" → subject index 1.
+    CASIA-MS subjects are zero-padded, so int("001") = 1.
+    """
+    subject_str = identity_key.split("_")[0]
+    return int(subject_str)
+
 
 def build_cross_dataset_splits() -> Tuple[List, List, List]:
     """
-    Source domain → CROSS_TRAIN_SPECTRA (460 nm, 630 nm)
-    Target domain → CROSS_TEST_SPECTRA  (700 nm, 850 nm)
-    Returns: train_samples, gallery_samples, query_samples
-    """
-    train_index = build_index(DATA_ROOT, CROSS_TRAIN_SPECTRA)
-    train_ids   = sorted(train_index.keys())
-    train_label = {iid: idx for idx, iid in enumerate(train_ids)}
-    train_s     = [(f, train_label[iid])
-                   for iid in train_ids for f in train_index[iid]]
+    Paper §IV-A-6 — Cross-dataset open-set evaluation (CASIA-MS adaptation):
 
-    test_index  = build_index(DATA_ROOT, CROSS_TEST_SPECTRA)
-    test_ids    = sorted(test_index.keys())
-    test_label  = {iid: idx for idx, iid in enumerate(test_ids)}
+    "In each evaluation round, one dataset is used exclusively for model
+     training and validation, while the remaining datasets are reserved
+     solely for gallery–query verification."
+
+    Adapted for single-dataset CASIA-MS (4 spectral domains as proxy datasets):
+      • Train  : ALL 4 spectral domains, subject indices 1 – 150
+                 (CROSS_TRAIN_SPECTRA = ["460","630","700","850"],
+                  CROSS_TRAIN_MAX_SUBJ_IDX = 150)
+      • Eval   : 2 target spectral domains (CROSS_TEST_SPECTRA),
+                 subject indices 151 – 200 → split 50/50 gallery / query.
+      • Zero identity overlap between train and eval sets.
+
+    Returns
+    -------
+    train_samples, gallery_samples, query_samples
+    """
+    # ── Training set: all 4 spectra, subjects 1-150 ───────────────────────
+    full_train_index = build_index(DATA_ROOT, CROSS_TRAIN_SPECTRA)
+    train_ids = sorted(
+        iid for iid in full_train_index
+        if _subject_index(iid) <= CROSS_TRAIN_MAX_SUBJ_IDX
+    )
+    train_label = {iid: idx for idx, iid in enumerate(train_ids)}
+    train_s = [
+        (f, train_label[iid])
+        for iid in train_ids
+        for f in full_train_index[iid]
+    ]
+
+    # ── Eval set: 2 target spectra, subjects 151-200 ──────────────────────
+    full_eval_index = build_index(DATA_ROOT, CROSS_TEST_SPECTRA)
+    eval_ids = sorted(
+        iid for iid in full_eval_index
+        if _subject_index(iid) > CROSS_TRAIN_MAX_SUBJ_IDX
+    )
+    eval_label = {iid: idx for idx, iid in enumerate(eval_ids)}
 
     gallery_s, query_s = [], []
-    for iid in test_ids:
-        files = test_index[iid]
-        split = max(1, len(files) // 2)
-        for f in files[:split]: gallery_s.append((f, test_label[iid]))
-        for f in files[split:]: query_s.append((f, test_label[iid]))
+    for iid in eval_ids:
+        files = full_eval_index[iid]
+        n     = len(files)
+        half  = max(1, n // 2)                              # 50 % gallery
+        for f in files[:half]: gallery_s.append((f, eval_label[iid]))
+        for f in files[half:]: query_s.append((f,  eval_label[iid]))
 
-    print(f"[Cross]  Train spectra:{CROSS_TRAIN_SPECTRA}  "
-          f"Train IDs:{len(train_ids)}  "
-          f"Test spectra:{CROSS_TEST_SPECTRA}  Test IDs:{len(test_ids)}")
+    print(
+        f"[Cross]  "
+        f"Train  : spectra={CROSS_TRAIN_SPECTRA}  "
+        f"subjects 1-{CROSS_TRAIN_MAX_SUBJ_IDX}  "
+        f"IDs: {len(train_ids)}  imgs: {len(train_s)}\n"
+        f"         "
+        f"Eval   : spectra={CROSS_TEST_SPECTRA}  "
+        f"subjects {CROSS_TRAIN_MAX_SUBJ_IDX+1}-200  "
+        f"IDs: {len(eval_ids)}  "
+        f"gallery: {len(gallery_s)}  query: {len(query_s)}"
+    )
     return train_s, gallery_s, query_s
 
 
 # ── Protocol 3: Closed-Set  (§IV-A-6, Tables VI–VII) ───────────────────────
 
-def build_closed_set_splits() -> Tuple[List, List, List]:
+def build_closed_set_splits() -> Tuple[List, List]:
     """
-    All identities included.
-    First CLOSED_TRAIN_IMGS_PER_ID images per identity → training.
-    Remaining: 50 % gallery / 50 % query.
-    Returns: train_samples, gallery_samples, query_samples
+    Paper §IV-A-6 — Closed-set evaluation:
+
+    "In the closed-set scenario, all identities within each dataset are
+     preserved without cross-dataset separation.
+     In CASIA-MS, all 200 identities are included, with the first 80 %
+     of images per identity used for training, and the remaining images
+     used for testing and verification."
+
+    There is NO separate gallery / query split in the closed-set protocol.
+    The training embeddings (80 %) act as the enrolled templates (gallery),
+    and the test embeddings (20 %) are the probes.  Both sets share the
+    same identity label space (0 … N_identities-1), so every test sample
+    has at least one matching training sample to compare against.
+
+    Evaluation:
+      • Rank-1 ACC — each test embed is matched to its nearest training embed.
+      • EER        — computed over all genuine/impostor (test vs train) pairs.
+
+    Returns
+    -------
+    train_samples : list of (path, label)  — 80 % per identity (enrolled templates)
+    test_samples  : list of (path, label)  — 20 % per identity (probes)
     """
     index     = build_index(DATA_ROOT, SPECTRA)
     ids       = sorted(index.keys())
     label_map = {iid: idx for idx, iid in enumerate(ids)}
 
-    train_s, gallery_s, query_s = [], [], []
+    train_s, test_s = [], []
+
     for iid in ids:
         files   = index[iid]
+        n       = len(files)
         lbl     = label_map[iid]
-        test_fs = files[CLOSED_TRAIN_IMGS_PER_ID:]
-        split   = max(1, len(test_fs) // 2)
-        for f in files[:CLOSED_TRAIN_IMGS_PER_ID]: train_s.append((f, lbl))
-        for f in test_fs[:split]:                  gallery_s.append((f, lbl))
-        for f in test_fs[split:]:                  query_s.append((f, lbl))
+        n_train = max(1, int(n * CLOSED_TRAIN_IMG_RATIO))   # 80 % enrolled
+        for f in files[:n_train]: train_s.append((f, lbl))
+        for f in files[n_train:]: test_s.append((f,  lbl))
 
-    print(f"[Closed] IDs:{len(ids)}  Train/ID:{CLOSED_TRAIN_IMGS_PER_ID}"
-          f"  Gallery:{len(gallery_s)}  Query:{len(query_s)}")
-    return train_s, gallery_s, query_s
+    n_subj = len(set(iid.split("_")[0] for iid in ids))
+    print(
+        f"[Closed] "
+        f"Subjects: {n_subj}  Identity keys: {len(ids)}  "
+        f"(all 4 spectra x both hands)\n"
+        f"         "
+        f"Train (enrolled): {len(train_s)} imgs  "
+        f"Test  (probes)  : {len(test_s)} imgs  "
+        f"({int(CLOSED_TRAIN_IMG_RATIO*100)}/{int((1-CLOSED_TRAIN_IMG_RATIO)*100)} split)"
+    )
+    return train_s, test_s
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -806,6 +926,55 @@ def run_evaluation(
             "thresholds": thresh, "genuine": genuine, "impostor": impostor}
 
 
+def run_evaluation_closed(
+    backbone:         CompNet,
+    palmbridge:       PalmBridge,
+    train_loader:     DataLoader,
+    test_loader:      DataLoader,
+    tag:              str,
+    apply_palmbridge: bool = True,
+    save_plots:       bool = True,
+    plot_dir:         str  = PLOT_DIR,
+) -> dict:
+    """
+    Closed-set evaluation: compare test (probe) embeddings against
+    training (enrolled template) embeddings within the SAME identity space.
+
+    No gallery/query split — training features ARE the enrolled gallery.
+    Metrics:
+      • Rank-1 ACC  — nearest-neighbour identity prediction.
+      • EER         — FAR/FRR sweep over all genuine and impostor
+                      (test-vs-train) similarity pairs.
+    """
+    # Extract embeddings from both sets
+    enroll_feats, enroll_labels = extract_features(
+        backbone, palmbridge, train_loader, apply_palmbridge
+    )
+    probe_feats, probe_labels = extract_features(
+        backbone, palmbridge, test_loader, apply_palmbridge
+    )
+
+    # Rank-1 ACC: each probe matched to its nearest enrolled template
+    acc = compute_rank1_acc(probe_feats, enroll_feats, probe_labels, enroll_labels)
+
+    # EER: probe vs enrolled similarity scores split into genuine / impostor
+    eer, far, tpr, thresh, genuine, impostor = compute_eer(
+        probe_feats, enroll_feats, probe_labels, enroll_labels
+    )
+
+    stats = palmbridge.codebook_usage()
+    print(f"  [{tag}] EER={eer*100:.4f}%  ACC={acc*100:.2f}%  "
+          f"Enrolled:{len(enroll_feats)}  Probes:{len(probe_feats)}  "
+          f"Genuine pairs:{len(genuine)}  Impostor pairs:{len(impostor)}  "
+          f"cb_cos={stats['mean_cosine']:.3f}")
+
+    if save_plots:
+        plot_roc_and_gi(far, tpr, eer, genuine, impostor, tag, plot_dir)
+
+    return {"eer": eer, "acc": acc, "far": far, "tpr": tpr,
+            "thresholds": thresh, "genuine": genuine, "impostor": impostor}
+
+
 def blending_sweep(
     backbone:       CompNet,
     palmbridge:     PalmBridge,
@@ -964,9 +1133,84 @@ def run_cross():
 
 
 def run_closed():
-    """Closed-set verification — Tables VI–VII equivalent."""
-    train_s, gallery_s, query_s = build_closed_set_splits()
-    return train_and_eval(train_s, gallery_s, query_s, "closed", "best_closed.pt")
+    """
+    Closed-set verification — Tables VI-VII equivalent.
+
+    Training (80 %) embeddings = enrolled templates (gallery).
+    Test     (20 %) embeddings = probes.
+    Both sets share the same identity label space — no open-set identities.
+    Evaluation via run_evaluation_closed (not the open-set run_evaluation).
+    """
+    train_s, test_s = build_closed_set_splits()
+    num_classes     = len(set(lbl for _, lbl in train_s))
+    pdir            = os.path.join(PLOT_DIR, "closed")
+    os.makedirs(pdir,     exist_ok=True)
+    os.makedirs(SAVE_DIR, exist_ok=True)
+
+    train_loader = make_loader(train_s, train=True,  shuffle=True)
+    test_loader  = make_loader(test_s,  train=False, shuffle=False)
+
+    backbone   = CompNet(num_classes).to(DEVICE)
+    palmbridge = PalmBridge().to(DEVICE)
+    arcface    = ArcFaceLoss(num_classes).to(DEVICE)
+
+    # ── Plug-and-play mode ───────────────────────────────────────────────────
+    if PLUG_AND_PLAY and PB_CKPT:
+        print(f"\n[Plug-and-Play] loading PalmBridge codebook from {PB_CKPT}")
+        ckpt = torch.load(PB_CKPT, map_location=DEVICE)
+        palmbridge.load_state_dict(ckpt["palmbridge"])
+        print("-- Naive baseline -----------------------------------------")
+        run_evaluation_closed(backbone, palmbridge, train_loader, test_loader,
+                              "closed_pnp_naive", False, True, pdir)
+        print("-- PalmBridge plug-and-play --------------------------------")
+        return run_evaluation_closed(backbone, palmbridge, train_loader, test_loader,
+                                     "closed_pnp_pb", True, True, pdir)
+
+    # ── Joint training ───────────────────────────────────────────────────────
+    optimizer = build_optimizer(backbone, palmbridge, arcface)
+    scheduler = build_scheduler(optimizer)
+    best_eer  = float("inf")
+    ckpt_path = os.path.join(SAVE_DIR, "best_closed.pt")
+
+    print(f"\n{'='*64}")
+    print(f"  PROTOCOL : CLOSED-SET")
+    print(f"  Device:{DEVICE}  Classes:{num_classes}  Epochs:{EPOCHS}")
+    print(f"  K={NUM_PB_VECTORS}  w_map={W_MAP}  w_ori={W_ORI}")
+    print(f"{'='*64}")
+
+    for epoch in range(1, EPOCHS + 1):
+        m = train_one_epoch(backbone, palmbridge, arcface,
+                            train_loader, optimizer, epoch)
+        scheduler.step()
+        print(f"Epoch {epoch:03d}/{EPOCHS}  loss={m['loss']:.4f}  "
+              f"bak={m['bak']:.4f}  con={m['con']:.4f}  "
+              f"orth={m['orth']:.4f}  lr={scheduler.get_last_lr()[0]:.2e}")
+
+        if epoch % 5 == 0 or epoch == EPOCHS:
+            # Probe embeddings compared against enrolled (training) embeddings
+            res = run_evaluation_closed(
+                backbone, palmbridge, train_loader, test_loader,
+                "closed", apply_palmbridge=True,
+                save_plots=(epoch == EPOCHS), plot_dir=pdir
+            )
+            if res["eer"] < best_eer:
+                best_eer = res["eer"]
+                save_checkpoint(backbone, palmbridge, arcface,
+                                optimizer, epoch, ckpt_path)
+
+    # ── Final: naive baseline vs PalmBridge ─────────────────────────────────
+    print("\n-- Naive baseline (train embeds vs test embeds) ------------------")
+    run_evaluation_closed(backbone, palmbridge, train_loader, test_loader,
+                          "closed_naive", False, True, pdir)
+    print("\n-- PalmBridge ---------------------------------------------------")
+    final = run_evaluation_closed(backbone, palmbridge, train_loader, test_loader,
+                                  "closed_pb", True, True, pdir)
+
+    if RUN_SWEEP:
+        print("\n-- Blending coefficient sweep (Fig. 4) --------------------------")
+        blending_sweep(backbone, palmbridge, train_loader, test_loader, pdir)
+
+    return final
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
