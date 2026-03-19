@@ -65,7 +65,7 @@ INTRA_TRAIN_IMG_RATIO    = 0.8   # within training group: train / internal-test
 #   Eval   : 2 target spectral domains, subject IDs 151 – 200 (indices 150-199)
 #   Gallery / Query split: 50 % / 50 % of each eval identity's images.
 CROSS_TRAIN_SPECTRA      = ["460", "630", "700", "850"]  # all 4 source domains
-CROSS_TEST_SPECTRA       = ["700", "850"]                # 2 target domains
+CROSS_TEST_SPECTRA       = ["940", "WHT"]                # 2 target domains
 CROSS_TRAIN_MAX_SUBJ_IDX = 150   # subjects with 1-based index ≤ 150 → train
 #   (subject IDs 001-150 → train;  subject IDs 151-200 → eval)
 
@@ -159,19 +159,78 @@ def build_index(
     spectra:   List[str],
 ) -> Dict[str, List[str]]:
     """
-    Scans data_root for matching .jpg files.
-    Returns  { "{subject}_{hand}" : [sorted file paths] }
+    Scans data_root (recursively) for image files matching the naming
+    convention {subject}_{hand}_{spectrum}_{iteration}.<ext>.
+
+    Handles:
+      - Flat folder or nested subdirectories  (rglob, not glob)
+      - Case-insensitive extensions           (.jpg / .JPG / .jpeg / .png / .bmp)
+      - Clear diagnostic output if no files are found
+
+    Returns  { "{subject}_{hand}" : [sorted absolute file paths] }
     Left and right palms are treated as separate identities.
     """
+    root = Path(data_root)
+    if not root.exists():
+        raise FileNotFoundError(
+            f"DATA_ROOT does not exist: {data_root!r}\n"
+            f"  Please set DATA_ROOT at the top of the script to the folder "
+            f"containing your CASIA-MS ROI images."
+        )
+
+    # Collect all image files (recursive, case-insensitive extension)
+    EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
+    all_files = [
+        f for f in sorted(root.rglob("*"))
+        if f.is_file() and f.suffix.lower() in EXTS
+    ]
+
+    if not all_files:
+        raise RuntimeError(
+            f"No image files found under {data_root!r}\n"
+            f"  Searched extensions: {sorted(EXTS)}\n"
+            f"  Check that DATA_ROOT points to the correct folder and that "
+            f"image files are present (including in subdirectories)."
+        )
+
     index: Dict[str, List[str]] = defaultdict(list)
-    for f in sorted(Path(data_root).glob("*.jpg")):
+    n_skipped_parse   = 0
+    n_skipped_spectrum = 0
+
+    for f in all_files:
         parsed = _parse_filename(f.name)
         if parsed is None:
+            n_skipped_parse += 1
             continue
         subject, hand, spectrum, _ = parsed
         if spectrum not in spectra:
+            n_skipped_spectrum += 1
             continue
         index[f"{subject}_{hand}"].append(str(f))
+
+    # ── Diagnostic summary ────────────────────────────────────────────────
+    total_matched = sum(len(v) for v in index.values())
+    print(
+        f"[build_index] root='{data_root}'  spectra={spectra}\n"
+        f"  Total files found   : {len(all_files)}\n"
+        f"  Matched (parsed+spectrum): {total_matched}\n"
+        f"  Skipped (parse fail): {n_skipped_parse}  "
+        f"Skipped (wrong spectrum): {n_skipped_spectrum}\n"
+        f"  Unique identity keys: {len(index)}"
+    )
+
+    if not index:
+        # Show a sample of actual filenames to help the user debug
+        samples = [f.name for f in all_files[:8]]
+        raise RuntimeError(
+            f"build_index found {len(all_files)} image files but NONE matched "
+            f"the expected pattern  {{subject}}_{{hand}}_{{spectrum}}_{{iteration}}.<ext>\n"
+            f"  Sample filenames found:\n"
+            + "\n".join(f"    {s}" for s in samples) +
+            f"\n  Expected spectra: {spectra}\n"
+            f"  Please verify DATA_ROOT and filename convention."
+        )
+
     return {k: sorted(v) for k, v in index.items()}
 
 
@@ -211,14 +270,25 @@ def make_loader(
     train:   bool = False,
     shuffle: bool = False,
 ) -> DataLoader:
+    if len(samples) == 0:
+        raise RuntimeError(
+            "make_loader received an empty sample list.\n"
+            "  This usually means build_index found no files, or the "
+            "protocol split left one partition empty.\n"
+            "  Check: (1) DATA_ROOT path, (2) filename convention, "
+            "(3) SPECTRA list matches your actual filenames."
+        )
+    # Clamp batch size so it never exceeds dataset size (avoids drop_last
+    # removing all samples in tiny splits during debugging).
+    effective_bs = min(BATCH_SIZE, len(samples))
     dataset = PalmprintDataset(samples, transform=get_transform(train))
     return DataLoader(
         dataset,
-        batch_size  = BATCH_SIZE,
+        batch_size  = effective_bs,
         shuffle     = shuffle,
         num_workers = NUM_WORKERS,
         pin_memory  = (DEVICE == "cuda"),
-        drop_last   = train,
+        drop_last   = train and len(samples) > effective_bs,
     )
 
 
@@ -455,28 +525,58 @@ class LearnableGaborLayer(nn.Module):
         self.ks = ks
 
     def _build_filters(self) -> torch.Tensor:
-        filters = []
-        for i in range(NUM_GABOR_FILTERS):
-            theta = self.theta[i]
-            sigma = self.sigma[i].abs().clamp(min=0.5)
-            lambd = self.lambd[i].abs().clamp(min=1.0)
-            psi   = self.psi[i]
-            gamma = self.gamma[i].abs().clamp(min=0.1)
+        """
+        Fully vectorised Gabor filter construction — no Python loop.
+        All F filters are built in parallel using broadcast arithmetic,
+        which also avoids the non-contiguous stride issue in PyTorch 2.x
+        that occurs when stacking tensors built from separate scalar params.
 
-            x_rot =  self.xx * torch.cos(theta) + self.yy * torch.sin(theta)
-            y_rot = -self.xx * torch.sin(theta) + self.yy * torch.cos(theta)
+        Shapes:
+          theta, sigma, lambd, psi, gamma : [F]
+          xx, yy (buffers)               : [k, k]
+          x_rot, y_rot                   : [F, k, k]
+          kernel                         : [F, k, k]
+          return                         : [F, 1, k, k]  contiguous
+        """
+        # Clamp to safe ranges                               [F]
+        theta = self.theta                                   # [F]
+        sigma = self.sigma.abs().clamp(min=0.5)             # [F]
+        lambd = self.lambd.abs().clamp(min=1.0)             # [F]
+        psi   = self.psi                                     # [F]
+        gamma = self.gamma.abs().clamp(min=0.1)             # [F]
 
-            envelope = torch.exp(
-                -(x_rot**2 + gamma**2 * y_rot**2) / (2.0 * sigma**2)
-            )
-            kernel = envelope * torch.cos(2.0 * math.pi * x_rot / lambd + psi)
-            kernel = kernel - kernel.mean()         # zero-mean (remove DC)
-            filters.append(kernel.unsqueeze(0))     # [1, k, k]
+        # Broadcast grid to [F, k, k] by inserting a leading dim
+        xx = self.xx.unsqueeze(0)   # [1, k, k]
+        yy = self.yy.unsqueeze(0)   # [1, k, k]
 
-        return torch.stack(filters).unsqueeze(1)    # [F, 1, k, k]
+        # Reshape params to [F, 1, 1] for broadcasting
+        cos_t = torch.cos(theta).view(-1, 1, 1)
+        sin_t = torch.sin(theta).view(-1, 1, 1)
+        sigma = sigma.view(-1, 1, 1)
+        lambd = lambd.view(-1, 1, 1)
+        psi   = psi.view(-1, 1, 1)
+        gamma = gamma.view(-1, 1, 1)
+
+        # Rotated coordinates                               [F, k, k]
+        x_rot =  xx * cos_t + yy * sin_t
+        y_rot = -xx * sin_t + yy * cos_t
+
+        # Gabor = Gaussian envelope × cosine carrier       [F, k, k]
+        envelope = torch.exp(
+            -(x_rot**2 + gamma**2 * y_rot**2) / (2.0 * sigma**2)
+        )
+        kernel = envelope * torch.cos(2.0 * math.pi * x_rot / lambd + psi)
+
+        # Zero-mean per filter (suppress DC component)
+        kernel = kernel - kernel.mean(dim=(1, 2), keepdim=True)
+
+        # [F, 1, k, k]  — .contiguous() ensures valid strides for conv2d
+        return kernel.unsqueeze(1).contiguous()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.conv2d(x, self._build_filters(), padding=self.ks // 2)
+        # x: [B, 1, H, W]  →  [B, F, H, W]
+        filters = self._build_filters()             # [F, 1, k, k]  contiguous
+        return F.conv2d(x, filters, padding=self.ks // 2)
 
 
 class CompetitivePool(nn.Module):
