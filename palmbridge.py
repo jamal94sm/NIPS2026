@@ -97,8 +97,13 @@ NUM_GABOR_FILTERS = 32    # orientations in the learnable Gabor bank
 GABOR_KERNEL_SIZE = 15    # spatial size of each Gabor kernel (px)
 
 # ── Loss weights  (Eq. 8) ────────────────────────────────────────────────────
-ALPHA      = 1.0    # weight of L_con  (feature-consistency loss)
-BETA       = 1.0    # weight of L_o    (orthogonality loss)
+# WHY ALPHA/BETA = 10:  ArcFace uses scale s=64, so L_bak (cross-entropy) is
+# naturally ~64× larger than L_con / L_o (unit-sphere MSE).  With α=β=1 the
+# gradient signal from con and orth is negligible.  Setting α=β=10 rebalances
+# their contribution to roughly 10-20 % of total gradient magnitude, consistent
+# with the paper's intent that all three terms meaningfully shape the embedding.
+ALPHA      = 10.0   # weight of L_con  (rebalanced against ArcFace scale)
+BETA       = 10.0   # weight of L_o    (rebalanced against ArcFace scale)
 LAMBDA_CON = 0.25   # λ inside L_con   (Eq. 6, §III-C-1)
 
 # ── ArcFace  (L_bak) ─────────────────────────────────────────────────────────
@@ -120,7 +125,7 @@ N_EER_THRESHOLDS = 2000   # resolution of the FAR / FRR sweep
 SEED         = 42
 SAVE_DIR     = "checkpoints"
 PLOT_DIR     = "plots"
-LOG_INTERVAL = 10          # print training stats every N batches
+LOG_EPOCHS   = 5           # evaluate and print EER/ACC every N epochs
 
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
@@ -825,20 +830,25 @@ def train_one_epoch(
     optimizer:  optim.Optimizer,
     epoch:      int,
 ) -> dict:
+    """
+    One training epoch.  No per-batch printing — caller decides when to log.
+    Returns mean losses + train classification accuracy (from ArcFace logits).
+    """
     backbone.train(); palmbridge.train(); arcface.train()
     totals = {"loss": 0.0, "bak": 0.0, "con": 0.0, "orth": 0.0}
-    nb = 0
+    n_correct = 0
+    n_total   = 0
 
-    for i, (imgs, labels) in enumerate(loader):
+    for imgs, labels in loader:
         imgs   = imgs.to(DEVICE)
         labels = labels.to(DEVICE)
         optimizer.zero_grad()
 
-        # Forward
-        z                 = backbone(imgs)           # [B, D]  Eq. (9)
-        z_hat, z_tilde, _ = palmbridge(z)            # Eq. (1)–(5)
+        # ── Forward ───────────────────────────────────────────────────────
+        z                 = backbone(imgs)            # [B, D]  Eq. (9)
+        z_hat, z_tilde, _ = palmbridge(z)             # Eq. (1)–(5)
 
-        # Eq. (8)  L = L_bak + α·L_con + β·L_o
+        # ── Losses  Eq. (8): L = L_bak + α·L_con + β·L_o ─────────────────
         L_bak = arcface(z_hat, labels)
         L_con = palmbridge.loss_consistency(z, z_tilde)
         L_o   = palmbridge.loss_orthogonal()
@@ -851,16 +861,23 @@ def train_one_epoch(
         )
         optimizer.step()
 
-        totals["loss"] += loss.item(); totals["bak"] += L_bak.item()
-        totals["con"]  += L_con.item(); totals["orth"] += L_o.item()
-        nb += 1
+        # ── Track train classification accuracy from ArcFace logits ───────
+        with torch.no_grad():
+            W       = F.normalize(arcface.weight, p=2, dim=1)
+            logits  = ARC_S * (z_hat @ W.t())         # [B, C] cosine logits
+            preds   = logits.argmax(dim=1)
+            n_correct += (preds == labels).sum().item()
+            n_total   += labels.size(0)
 
-        if (i + 1) % LOG_INTERVAL == 0:
-            print(f"  Ep{epoch:03d} [{i+1:4d}/{len(loader)}] "
-                  f"loss={loss.item():.4f}  bak={L_bak.item():.4f}  "
-                  f"con={L_con.item():.4f}  orth={L_o.item():.4f}")
+        totals["loss"] += loss.item()
+        totals["bak"]  += L_bak.item()
+        totals["con"]  += L_con.item()
+        totals["orth"] += L_o.item()
 
-    return {k: v / max(nb, 1) for k, v in totals.items()}
+    nb = max(len(loader), 1)
+    metrics = {k: v / nb for k, v in totals.items()}
+    metrics["train_acc"] = n_correct / max(n_total, 1)
+    return metrics
 
 
 def build_optimizer(backbone, palmbridge, arcface) -> optim.Optimizer:
@@ -1186,28 +1203,37 @@ def train_and_eval(
         m = train_one_epoch(backbone, palmbridge, arcface,
                             train_loader, optimizer, epoch)
         scheduler.step()
-        print(f"Epoch {epoch:03d}/{EPOCHS}  loss={m['loss']:.4f}  "
-              f"bak={m['bak']:.4f}  con={m['con']:.4f}  "
-              f"orth={m['orth']:.4f}  lr={scheduler.get_last_lr()[0]:.2e}")
 
-        if epoch % 5 == 0 or epoch == EPOCHS:
+        # ── Compact single-line epoch summary (always printed) ─────────────
+        print(f"Epoch {epoch:03d}/{EPOCHS}  "
+              f"loss={m['loss']:.4f}  bak={m['bak']:.4f}  "
+              f"con={m['con']:.4f}  orth={m['orth']:.4f}  "
+              f"train_acc={m['train_acc']*100:.2f}%  "
+              f"lr={scheduler.get_last_lr()[0]:.2e}")
+
+        # ── Full EER / ACC evaluation every LOG_EPOCHS epochs ──────────────
+        if epoch % LOG_EPOCHS == 0 or epoch == EPOCHS:
             res = run_evaluation(backbone, palmbridge,
                                  gallery_loader, query_loader,
                                  protocol_name, apply_palmbridge=True,
                                  save_plots=(epoch == EPOCHS), plot_dir=pdir)
+            print(f"  >> [eval @{epoch}] "
+                  f"EER={res['eer']*100:.4f}%  ACC={res['acc']*100:.2f}%")
             if res["eer"] < best_eer:
                 best_eer = res["eer"]
                 save_checkpoint(backbone, palmbridge, arcface,
                                 optimizer, epoch, ckpt_path)
 
-    # ── Final: naive baseline vs PalmBridge ─────────────────────────────────
+    # ── Final comparison: naive baseline vs PalmBridge ──────────────────────
     print("\n── Naive baseline ──────────────────────────────────────────────────")
-    run_evaluation(backbone, palmbridge, gallery_loader, query_loader,
-                   f"{protocol_name}_naive", False, True, pdir)
+    naive = run_evaluation(backbone, palmbridge, gallery_loader, query_loader,
+                           f"{protocol_name}_naive", False, True, pdir)
+    print(f"  >> Naive  EER={naive['eer']*100:.4f}%  ACC={naive['acc']*100:.2f}%")
 
     print("\n── PalmBridge ──────────────────────────────────────────────────────")
     final = run_evaluation(backbone, palmbridge, gallery_loader, query_loader,
                            f"{protocol_name}_pb", True, True, pdir)
+    print(f"  >> PalmBridge  EER={final['eer']*100:.4f}%  ACC={final['acc']*100:.2f}%")
 
     if RUN_SWEEP:
         print("\n── Blending coefficient sweep (Fig. 4) ─────────────────────────")
@@ -1282,29 +1308,38 @@ def run_closed():
         m = train_one_epoch(backbone, palmbridge, arcface,
                             train_loader, optimizer, epoch)
         scheduler.step()
-        print(f"Epoch {epoch:03d}/{EPOCHS}  loss={m['loss']:.4f}  "
-              f"bak={m['bak']:.4f}  con={m['con']:.4f}  "
-              f"orth={m['orth']:.4f}  lr={scheduler.get_last_lr()[0]:.2e}")
 
-        if epoch % 5 == 0 or epoch == EPOCHS:
-            # Probe embeddings compared against enrolled (training) embeddings
+        # ── Compact single-line epoch summary ──────────────────────────────
+        print(f"Epoch {epoch:03d}/{EPOCHS}  "
+              f"loss={m['loss']:.4f}  bak={m['bak']:.4f}  "
+              f"con={m['con']:.4f}  orth={m['orth']:.4f}  "
+              f"train_acc={m['train_acc']*100:.2f}%  "
+              f"lr={scheduler.get_last_lr()[0]:.2e}")
+
+        # ── Full EER / ACC evaluation every LOG_EPOCHS epochs ──────────────
+        if epoch % LOG_EPOCHS == 0 or epoch == EPOCHS:
             res = run_evaluation_closed(
                 backbone, palmbridge, train_loader, test_loader,
                 "closed", apply_palmbridge=True,
                 save_plots=(epoch == EPOCHS), plot_dir=pdir
             )
+            print(f"  >> [eval @{epoch}] "
+                  f"EER={res['eer']*100:.4f}%  ACC={res['acc']*100:.2f}%")
             if res["eer"] < best_eer:
                 best_eer = res["eer"]
                 save_checkpoint(backbone, palmbridge, arcface,
                                 optimizer, epoch, ckpt_path)
 
-    # ── Final: naive baseline vs PalmBridge ─────────────────────────────────
+    # ── Final comparison: naive baseline vs PalmBridge ──────────────────────
     print("\n-- Naive baseline (train embeds vs test embeds) ------------------")
-    run_evaluation_closed(backbone, palmbridge, train_loader, test_loader,
-                          "closed_naive", False, True, pdir)
+    naive = run_evaluation_closed(backbone, palmbridge, train_loader, test_loader,
+                                  "closed_naive", False, True, pdir)
+    print(f"  >> Naive  EER={naive['eer']*100:.4f}%  ACC={naive['acc']*100:.2f}%")
+
     print("\n-- PalmBridge ---------------------------------------------------")
     final = run_evaluation_closed(backbone, palmbridge, train_loader, test_loader,
                                   "closed_pb", True, True, pdir)
+    print(f"  >> PalmBridge  EER={final['eer']*100:.4f}%  ACC={final['acc']*100:.2f}%")
 
     if RUN_SWEEP:
         print("\n-- Blending coefficient sweep (Fig. 4) --------------------------")
