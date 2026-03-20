@@ -64,7 +64,7 @@ INTRA_TRAIN_IMG_RATIO    = 0.8   # within training group: train / internal-test
 #   Train  : ALL 4 spectral domains, subject IDs  1 – 150  (indices 0-149)
 #   Eval   : 2 target spectral domains, subject IDs 151 – 200 (indices 150-199)
 #   Gallery / Query split: 50 % / 50 % of each eval identity's images.
-CROSS_TRAIN_SPECTRA      = ["460", "630", "700", "850"]  # all 4 source domains
+CROSS_TRAIN_SPECTRA      = ["460", "630", "WHT", "940"]  # all 4 source domains
 CROSS_TEST_SPECTRA       = ["700", "850"]                # 2 target domains
 CROSS_TRAIN_MAX_SUBJ_IDX = 150   # subjects with 1-based index ≤ 150 → train
 #   (subject IDs 001-150 → train;  subject IDs 151-200 → eval)
@@ -97,21 +97,11 @@ NUM_GABOR_FILTERS = 32    # orientations in the learnable Gabor bank
 GABOR_KERNEL_SIZE = 15    # spatial size of each Gabor kernel (px)
 
 # ── Loss weights  (Eq. 8) ────────────────────────────────────────────────────
-# WHY ALPHA=1, BETA=1:  The codebook is pre-aligned during warmup (L_con is
-# trained from epoch 1 even though z_hat is not used for ArcFace yet).  By the
-# time PalmBridge activates, L_con is already near-zero — no amplification
-# needed.  ALPHA=10 caused a sudden loss spike at epoch 21 (8.18 vs 0.26)
-# because the misaligned codebook produced L_con~0.79 × 10 = 7.9 added to bak.
 ALPHA      = 0.1    # weight of L_con  (codebook pre-aligned → no amplification needed)
 BETA       = 1.0    # weight of L_o    (orthogonality regularisation)
 LAMBDA_CON = 0.25   # λ inside L_con   (Eq. 6, §III-C-1)
 
 # ── ArcFace  (L_bak) ─────────────────────────────────────────────────────────
-# WHY s=32, m=0.2:  s=64/m=0.5 inflates initial loss to ~18 (random features
-# give ln(C) ≈ 4.6 normally).  This makes gradients huge and unstable before
-# the backbone has learned anything useful.  s=32, m=0.2 keeps initial loss
-# near ln(100)=4.6, allowing proper convergence.  Once the backbone is warm,
-# ArcFace naturally becomes discriminative even with a softer margin.
 ARC_S      = 48.0   # feature scale  (reduced from 64 to stabilise early training)
 ARC_M      = 0.40   # angular margin (reduced from 0.50 — easier to optimise)
 
