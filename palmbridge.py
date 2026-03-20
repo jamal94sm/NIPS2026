@@ -133,7 +133,7 @@ NUM_WORKERS  = 4
 # Solution: train backbone alone for WARMUP_EPOCHS (w_map=0), then activate
 # PalmBridge with the full blending weight.  This is the two-phase strategy
 # implied by the paper's joint optimisation once features are meaningful.
-WARMUP_EPOCHS = 10   # epochs to train backbone only (w_map forced to 0)
+WARMUP_EPOCHS = 5   # epochs to train backbone only (w_map forced to 0)
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
 N_EER_THRESHOLDS = 2000   # resolution of the FAR / FRR sweep
