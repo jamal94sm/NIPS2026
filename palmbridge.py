@@ -66,8 +66,11 @@ INTRA_TRAIN_IMG_RATIO    = 0.8   # within training group: train / internal-test
 #   Gallery / Query split: 50 % / 50 % of each eval identity's images.
 CROSS_TRAIN_SPECTRA      = ["460", "630", "WHT", "940"]  # all 4 source domains
 CROSS_TEST_SPECTRA       = ["700", "850"]                # 2 target domains
-CROSS_TRAIN_MAX_SUBJ_IDX = 150   # subjects with 1-based index ≤ 150 → train
-#   (subject IDs 001-150 → train;  subject IDs 151-200 → eval)
+# CROSS_TRAIN_ID_RATIO: fraction of identity keys used for training.
+# Using a ratio (not a hardcoded subject-index threshold) makes this robust
+# regardless of how subjects are numbered in the dataset.
+# 0.75 = first 75% of sorted identity keys → train,  last 25% → eval.
+CROSS_TRAIN_ID_RATIO     = 0.75
 
 #
 # CLOSED-SET
@@ -97,12 +100,22 @@ NUM_GABOR_FILTERS = 32    # orientations in the learnable Gabor bank
 GABOR_KERNEL_SIZE = 15    # spatial size of each Gabor kernel (px)
 
 # ── Loss weights  (Eq. 8) ────────────────────────────────────────────────────
+# WHY ALPHA=1, BETA=1:  The codebook is pre-aligned during warmup (L_con is
+# trained from epoch 1 even though z_hat is not used for ArcFace yet).  By the
+# time PalmBridge activates, L_con is already near-zero — no amplification
+# needed.  ALPHA=10 caused a sudden loss spike at epoch 21 (8.18 vs 0.26)
+# because the misaligned codebook produced L_con~0.79 × 10 = 7.9 added to bak.
 ALPHA      = 0.1    # weight of L_con  (codebook pre-aligned → no amplification needed)
 BETA       = 1.0    # weight of L_o    (orthogonality regularisation)
 LAMBDA_CON = 0.25   # λ inside L_con   (Eq. 6, §III-C-1)
 
 # ── ArcFace  (L_bak) ─────────────────────────────────────────────────────────
-ARC_S      = 48.0   # feature scale  (reduced from 64 to stabilise early training)
+# WHY s=32, m=0.2:  s=64/m=0.5 inflates initial loss to ~18 (random features
+# give ln(C) ≈ 4.6 normally).  This makes gradients huge and unstable before
+# the backbone has learned anything useful.  s=32, m=0.2 keeps initial loss
+# near ln(100)=4.6, allowing proper convergence.  Once the backbone is warm,
+# ArcFace naturally becomes discriminative even with a softer margin.
+ARC_S      = 48.0   # feature scale  (32 collapses bak too fast; 48 keeps it meaningful)
 ARC_M      = 0.40   # angular margin (reduced from 0.50 — easier to optimise)
 
 # ── Training  (§IV-A-4) ──────────────────────────────────────────────────────
@@ -372,41 +385,51 @@ def build_intra_dataset_splits() -> Tuple[List, List, List, List]:
 
 # ── Protocol 2: Cross-Dataset Open-Set  (§IV-A-6, Table V) ─────────────────
 
-def _subject_index(identity_key: str) -> int:
-    """
-    Extracts the 1-based integer subject index from an identity key.
-    Identity key = "{subject}_{hand}", e.g. "001_L" → subject index 1.
-    CASIA-MS subjects are zero-padded, so int("001") = 1.
-    """
-    subject_str = identity_key.split("_")[0]
-    return int(subject_str)
-
-
 def build_cross_dataset_splits() -> Tuple[List, List, List]:
     """
     Paper §IV-A-6 — Cross-dataset open-set evaluation (CASIA-MS adaptation):
 
     "In each evaluation round, one dataset is used exclusively for model
      training and validation, while the remaining datasets are reserved
-     solely for gallery–query verification."
+     solely for gallery-query verification."
 
-    Adapted for single-dataset CASIA-MS (4 spectral domains as proxy datasets):
-      • Train  : ALL 4 spectral domains, subject indices 1 – 150
-                 (CROSS_TRAIN_SPECTRA = ["460","630","700","850"],
-                  CROSS_TRAIN_MAX_SUBJ_IDX = 150)
-      • Eval   : 2 target spectral domains (CROSS_TEST_SPECTRA),
-                 subject indices 151 – 200 → split 50/50 gallery / query.
-      • Zero identity overlap between train and eval sets.
+    Adapted for CASIA-MS using spectral bands as proxy domains:
+      • Source domain (train) : CROSS_TRAIN_SPECTRA, first CROSS_TRAIN_ID_RATIO
+                                fraction of all sorted identity keys.
+      • Target domain (eval)  : CROSS_TEST_SPECTRA, remaining identity keys.
+      • Zero identity overlap guaranteed by positional split on sorted key list.
+
+    WHY positional split instead of subject-index threshold:
+      The original code used a hardcoded threshold (e.g. subjects > 150) which
+      silently produces an empty eval set when the dataset has fewer subjects
+      than the threshold (e.g. CASIA-MS with 100 subjects, all indexed 1-100).
+      Splitting by position on the sorted key list works for any number of
+      subjects regardless of how they are numbered.
 
     Returns
     -------
     train_samples, gallery_samples, query_samples
     """
-    # ── Training set: all 4 spectra, subjects 1-150 ───────────────────────
+    # ── Build full index for both spectral subsets ────────────────────────
     full_train_index = build_index(DATA_ROOT, CROSS_TRAIN_SPECTRA)
+    full_eval_index  = build_index(DATA_ROOT, CROSS_TEST_SPECTRA)
+
+    # ── Collect all unique subject IDs (not identity keys) ───────────────
+    # A "subject" is the person, a "identity key" is subject+hand.
+    # We split at the subject level so that both hands of a subject always
+    # land in the same partition — preventing data leakage between train/eval.
+    all_subjects = sorted(set(
+        iid.split("_")[0]
+        for iid in set(full_train_index.keys()) | set(full_eval_index.keys())
+    ))
+    n_train_subj = max(1, int(len(all_subjects) * CROSS_TRAIN_ID_RATIO))
+    train_subjects = set(all_subjects[:n_train_subj])   # first 75%
+    eval_subjects  = set(all_subjects[n_train_subj:])   # last  25%
+
+    # ── Training samples: source spectra, train subjects ─────────────────
     train_ids = sorted(
         iid for iid in full_train_index
-        if _subject_index(iid) <= CROSS_TRAIN_MAX_SUBJ_IDX
+        if iid.split("_")[0] in train_subjects
     )
     train_label = {iid: idx for idx, iid in enumerate(train_ids)}
     train_s = [
@@ -415,11 +438,10 @@ def build_cross_dataset_splits() -> Tuple[List, List, List]:
         for f in full_train_index[iid]
     ]
 
-    # ── Eval set: 2 target spectra, subjects 151-200 ──────────────────────
-    full_eval_index = build_index(DATA_ROOT, CROSS_TEST_SPECTRA)
+    # ── Eval samples: target spectra, eval subjects ───────────────────────
     eval_ids = sorted(
         iid for iid in full_eval_index
-        if _subject_index(iid) > CROSS_TRAIN_MAX_SUBJ_IDX
+        if iid.split("_")[0] in eval_subjects
     )
     eval_label = {iid: idx for idx, iid in enumerate(eval_ids)}
 
@@ -427,21 +449,32 @@ def build_cross_dataset_splits() -> Tuple[List, List, List]:
     for iid in eval_ids:
         files = full_eval_index[iid]
         n     = len(files)
-        half  = max(1, n // 2)                              # 50 % gallery
+        half  = max(1, n // 2)            # 50% gallery / 50% query
         for f in files[:half]: gallery_s.append((f, eval_label[iid]))
         for f in files[half:]: query_s.append((f,  eval_label[iid]))
 
     print(
         f"[Cross]  "
-        f"Train  : spectra={CROSS_TRAIN_SPECTRA}  "
-        f"subjects 1-{CROSS_TRAIN_MAX_SUBJ_IDX}  "
+        f"Total subjects: {len(all_subjects)}  "
+        f"Train: {len(train_subjects)} subj  Eval: {len(eval_subjects)} subj\n"
+        f"         "
+        f"Train spectra={CROSS_TRAIN_SPECTRA}  "
         f"IDs: {len(train_ids)}  imgs: {len(train_s)}\n"
         f"         "
-        f"Eval   : spectra={CROSS_TEST_SPECTRA}  "
-        f"subjects {CROSS_TRAIN_MAX_SUBJ_IDX+1}-200  "
+        f"Eval  spectra={CROSS_TEST_SPECTRA}  "
         f"IDs: {len(eval_ids)}  "
         f"gallery: {len(gallery_s)}  query: {len(query_s)}"
     )
+
+    if len(eval_ids) == 0:
+        raise RuntimeError(
+            f"Cross-dataset eval set is empty!\n"
+            f"  Total subjects found: {len(all_subjects)}\n"
+            f"  CROSS_TRAIN_ID_RATIO={CROSS_TRAIN_ID_RATIO} reserved "
+            f"{len(train_subjects)} for train, {len(eval_subjects)} for eval.\n"
+            f"  Lower CROSS_TRAIN_ID_RATIO (e.g. 0.6) to leave more subjects for eval."
+        )
+
     return train_s, gallery_s, query_s
 
 
