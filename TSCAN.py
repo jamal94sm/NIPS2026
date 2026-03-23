@@ -4,38 +4,19 @@ TSCAN v7 — Fixed Phase 2 based on training diagnostics.
 Evaluation protocol unchanged from v6 (paper Section 4.2):
   All images per domain, all-vs-all pairs, ACC/EER/TAR@FAR metrics.
 
-Phase 2 fixes (motivated by observed L_sup=15, ΔEER=-13%):
+Backbone freezing:
+  Frozen    : conv1, bn1, relu, maxpool, layer1, layer2, layer3
+  Trainable : layer4  (low LR in Phase 1, lower LR in Phase 2)
+  Trainable : linear(512→256), Tanh  (high LR)
 
+Phase 2 fixes:
   FIX 1 — Source augmentation: strong → weak in Phase 2.
-    Strong aug caused L_sup to jump from 0.01 (Phase 1 end) to 15+.
-    Weak aug keeps the student anchored to the feature space the
-    teacher learned under identical augmentation.
-
-  FIX 2 — Backbone fully frozen in Phase 2 (was partially trainable).
-    Layer3/layer4 conflicting gradients (L_sup + noisy L_uns + L_dis)
-    caused catastrophic forgetting. Only the linear head adapts now.
-
+  FIX 2 — Backbone layer3 frozen in Phase 2 (layer4 still trainable).
   FIX 3 — AdaFace W frozen in Phase 2.
-    W was learned on source. Letting noisy pseudo-labels update W
-    corrupts source identity clusters. W is frozen; only the linear
-    layer is updated by backprop.
-
-  FIX 4 — Loss weights rebalanced.
-    BETA  0.8 → 0.3  (noisy pseudo-labels get less weight)
-    GAMMA 1.0 → 0.3  (restores paper values; domain loss was swamped)
-    ALPHA stays 1.0  (source supervision must dominate)
-
+  FIX 4 — Loss weights: ALPHA=1.0 BETA=0.1 GAMMA=0.3
   FIX 5 — EMA decay 0.99 → 0.999.
-    Fast EMA with degrading student quickly corrupted the teacher.
-    Slow EMA keeps teacher near Phase 1 while absorbing improvements.
-
   FIX 6 — Pseudo-label threshold 0.5 → 0.7.
-    Overfit teacher (EER=0%) is overconfident. Low threshold accepts
-    confidently-wrong labels. Higher threshold is more selective.
-
   FIX 7 — Phase 1 saves best checkpoint by TARGET EER, not source EER.
-    Source EER=0% is overfit. The best teacher for adaptation is the
-    one that generalises best to target, not the one that memorises source.
 """
 
 # =============================================================================
@@ -84,25 +65,26 @@ ADAFACE_S       = 32.0
 
 # ── Stage 1 ───────────────────────────────────────────────────────────────────
 S1_EPOCHS        = 100
-S1_LR_HEAD       = 1e-3
-S1_LR_BACKBONE   = 1e-4
+S1_LR_HEAD       = 1e-3      # linear + hash layer
+S1_LR_LAYER4     = 1e-4      # layer4 gets 10x lower LR than head
 S1_WEIGHT_DECAY  = 5e-4
 S1_BATCH_SIZE    = 64
 S1_WARMUP_EPOCHS = 5
 
 # ── Stage 2 ───────────────────────────────────────────────────────────────────
 S2_EPOCHS        = 60
-S2_LR_HEAD       = 1e-4    # only linear layer trains in Phase 2
+S2_LR_HEAD       = 1e-4      # linear + hash layer
+S2_LR_LAYER4     = 1e-5      # layer4 gets 10x lower LR than head
 S2_WEIGHT_DECAY  = 5e-4
 S2_BATCH_SIZE    = 32
 S2_WARMUP_EPOCHS = 3
 
 # ── Co-learning ───────────────────────────────────────────────────────────────
-EMA_DECAY            = 0.999  # FIX 5: was 0.99 — slow EMA protects teacher
-PSEUDO_LABEL_THRESH  = 0.7    # FIX 6: was 0.5 — stricter to avoid noisy labels
-ALPHA                = 1.0    # source supervision weight (unchanged)
-BETA                 = 0.1    # FIX 4: was 0.8 — less weight on noisy pseudo-labels
-GAMMA_LOSS           = 0.3    # FIX 4: was 1.0 — restore paper value
+EMA_DECAY            = 0.999
+PSEUDO_LABEL_THRESH  = 0.7
+ALPHA                = 1.0
+BETA                 = 0.1
+GAMMA_LOSS           = 0.3
 
 # ── Augmentation ──────────────────────────────────────────────────────────────
 RESIZE_SIZE     = 124
@@ -271,42 +253,54 @@ class UnlabeledTargetDataset(Dataset):
 
 class FeatureEncoder(nn.Module):
     """
-    Phase 1: layer3+layer4 trainable (low LR), linear+Tanh trainable (high LR)
-    Phase 2: ALL backbone layers frozen, only linear+Tanh trainable
+    ResNet18 split into three parts:
+
+      frozen_layers : conv1, bn1, relu, maxpool, layer1, layer2, layer3
+                      → always frozen in both Phase 1 and Phase 2
+      layer4        : trainable in Phase 1 (LR=S1_LR_LAYER4)
+                      trainable in Phase 2 (LR=S2_LR_LAYER4, lower)
+      avgpool       : no parameters
+      linear + Tanh : trainable in both phases (LR=S1/S2_LR_HEAD)
+
+    ResNet18 children indices:
+      0=conv1, 1=bn1, 2=relu, 3=maxpool,
+      4=layer1, 5=layer2, 6=layer3, 7=layer4, 8=avgpool
     """
     def __init__(self, feat_dim=256, pretrained=True):
         super().__init__()
         weights  = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
         backbone = resnet18(weights=weights)
-        self.frozen_layers    = nn.Sequential(*list(backbone.children())[:6])
-        self.trainable_layers = nn.Sequential(*list(backbone.children())[6:9])
-        self.flatten          = nn.Flatten()
-        self.linear           = nn.Linear(512, feat_dim, bias=True)
-        self.hash             = nn.Tanh()
-        # Phase 1 default: freeze early layers only
+        children = list(backbone.children())
+
+        # Frozen: conv1 through layer3  (indices 0–6)
+        self.frozen_layers = nn.Sequential(*children[:7])
+        # Trainable backbone: layer4 + avgpool  (indices 7–8)
+        self.layer4        = children[7]
+        self.avgpool       = children[8]
+
+        self.flatten = nn.Flatten()
+        self.linear  = nn.Linear(512, feat_dim, bias=True)   # trainable
+        self.hash    = nn.Tanh()                              # trainable
+
+        # Freeze conv1..layer3 permanently
         for p in self.frozen_layers.parameters():
             p.requires_grad = False
 
     def forward(self, x):
         with torch.no_grad():
-            x = self.frozen_layers(x)
-        # In Phase 2 trainable_layers are also frozen via requires_grad=False
-        # but we still pass through normally — no extra no_grad needed
-        x    = self.trainable_layers(x)
-        bb   = self.flatten(x)
-        feat = self.hash(self.linear(bb))
+            x = self.frozen_layers(x)   # frozen — no gradient
+        x    = self.layer4(x)           # trainable
+        x    = self.avgpool(x)
+        bb   = self.flatten(x)          # (B, 512)
+        feat = self.hash(self.linear(bb))  # (B, feat_dim)
         return feat, bb
 
-    def freeze_backbone_for_phase2(self):
-        """FIX 2: freeze layer3+layer4 before Phase 2 starts."""
-        for p in self.trainable_layers.parameters():
-            p.requires_grad = False
-        log("  Backbone fully frozen for Phase 2 (layer3+layer4 now frozen)")
-
-    def backbone_parameters(self):
-        return list(self.trainable_layers.parameters())
+    def layer4_parameters(self):
+        """Parameters of layer4 — get lower LR."""
+        return list(self.layer4.parameters())
 
     def head_parameters(self):
+        """Parameters of linear projection — get higher LR."""
         return list(self.linear.parameters())
 
 
@@ -321,14 +315,25 @@ class PalmNet(nn.Module):
     def get_features(self, x):
         return self.encoder(x)[0]
 
-    def backbone_parameters(self):
-        return self.encoder.backbone_parameters()
+    def layer4_parameters(self):
+        return self.encoder.layer4_parameters()
 
     def head_parameters(self):
         return self.encoder.head_parameters()
 
-    def freeze_backbone_for_phase2(self):
-        self.encoder.freeze_backbone_for_phase2()
+    def freeze_layer4(self):
+        """Freeze layer4 — call before Phase 2 if full backbone freeze needed."""
+        for p in self.encoder.layer4.parameters():
+            p.requires_grad = False
+        log("  layer4 frozen")
+
+    def unfreeze_layer4(self):
+        for p in self.encoder.layer4.parameters():
+            p.requires_grad = True
+
+    # Alias for backward compatibility
+    def backbone_parameters(self):
+        return self.encoder.layer4_parameters()
 
 
 # =============================================================================
@@ -370,7 +375,6 @@ class AdaFaceLoss(nn.Module):
                 F.normalize(self.weight, dim=1).T * self.s)
 
     def freeze_weights(self):
-        """FIX 3: freeze W during Phase 2 so noisy pseudo-labels can't corrupt it."""
         self.weight.requires_grad = False
         log("  AdaFace W frozen for Phase 2")
 
@@ -550,6 +554,8 @@ set_seed(SEED)
 
 log("=" * 72)
 log(f"TSCAN v7  |  {SOURCE_SPECTRUM} → {TARGET_SPECTRUM}  |  device={DEVICE}")
+log(f"Frozen    : conv1, bn1, layer1, layer2, layer3  (always)")
+log(f"Trainable : layer4 (low LR) + linear head (high LR)")
 log(f"Evaluation: paper protocol — all-vs-all pairs, ACC/EER/TAR@FAR")
 log("=" * 72)
 
@@ -567,13 +573,11 @@ log(f"Target [{TARGET_SPECTRUM}]: {len(tgt_records)} images")
 
 # ── DataLoaders ───────────────────────────────────────────────────────────────
 
-# Phase 1: weak aug on source
 s1_train_loader = DataLoader(
     SpectrumDataset(SOURCE_SPECTRUM, weak_transform(), LABEL_MAP),
     batch_size=S1_BATCH_SIZE, shuffle=True,
     num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=True)
 
-# Evaluation: deterministic, all images
 src_eval_loader = DataLoader(
     SpectrumDataset(SOURCE_SPECTRUM, eval_transform(), LABEL_MAP),
     batch_size=128, shuffle=False, num_workers=NUM_WORKERS)
@@ -582,7 +586,7 @@ tgt_eval_loader = DataLoader(
     SpectrumDataset(TARGET_SPECTRUM, eval_transform(), LABEL_MAP),
     batch_size=128, shuffle=False, num_workers=NUM_WORKERS)
 
-# Phase 2 source: WEAK aug (FIX 1 — was strong_transform)
+# Phase 2 source: weak aug (FIX 1)
 s2_src_loader = DataLoader(
     SpectrumDataset(SOURCE_SPECTRUM, weak_transform(), LABEL_MAP),
     batch_size=S2_BATCH_SIZE, shuffle=True,
@@ -599,17 +603,19 @@ teacher = PalmNet(feat_dim=FEATURE_DIM, pretrained=True).to(DEVICE)
 adaface = AdaFaceLoss(num_classes=NUM_CLASSES, feat_dim=FEATURE_DIM,
                       m0=ADAFACE_M0, m_min=ADAFACE_MMIN,
                       s=ADAFACE_S).to(DEVICE)
- 
-layer4_p  = sum(p.numel() for p in teacher.layer4_parameters())
-head_p    = sum(p.numel() for p in teacher.head_parameters())
-frozen_p  = sum(p.numel() for p in teacher.encoder.frozen_early.parameters())
-layer3_p  = sum(p.numel() for p in teacher.encoder.layer3.parameters())
-log(f"\nFrozen always   : {(frozen_p+layer3_p)/1e6:.2f}M  "
-    f"(conv1..layer2 + layer3)")
-log(f"Phase1 trainable: layer4={layer4_p/1e6:.2f}M (LR={S1_LR_BACKBONE}) "
-    f"+ head={head_p/1e6:.4f}M (LR={S1_LR_HEAD})")
-log(f"Phase2 trainable: layer4={layer4_p/1e6:.2f}M (LR={S2_LR_LAYER4}) "
-    f"+ head={head_p/1e6:.4f}M (LR={S2_LR_HEAD})  [AdaFace W frozen]")
+
+frozen_p   = sum(p.numel() for p in teacher.encoder.frozen_layers.parameters())
+layer4_p   = sum(p.numel() for p in teacher.layer4_parameters())
+head_p     = sum(p.numel() for p in teacher.head_parameters())
+adaface_p  = sum(p.numel() for p in adaface.parameters())
+
+log(f"\nFrozen (conv1..layer3) : {frozen_p/1e6:.2f}M")
+log(f"Trainable layer4       : {layer4_p/1e6:.2f}M  "
+    f"| Phase1 LR={S1_LR_LAYER4}  Phase2 LR={S2_LR_LAYER4}")
+log(f"Trainable head (linear): {head_p/1e6:.4f}M  "
+    f"| Phase1 LR={S1_LR_HEAD}   Phase2 LR={S2_LR_HEAD}")
+log(f"AdaFace W              : {adaface_p/1e6:.4f}M  "
+    f"| Phase1 LR={S1_LR_HEAD}   Phase2: frozen")
 
 
 # =============================================================================
@@ -618,21 +624,24 @@ log(f"Phase2 trainable: layer4={layer4_p/1e6:.2f}M (LR={S2_LR_LAYER4}) "
 
 log("\n" + "=" * 72)
 log("PHASE 1 — Teacher Initialization")
-log(f"  Saves best checkpoint by TARGET EER  (FIX 7 — avoids overfit teacher)\n")
+log(f"  Trainable: layer4 (LR={S1_LR_LAYER4}) + head (LR={S1_LR_HEAD}) "
+    f"+ AdaFace W (LR={S1_LR_HEAD})")
+log(f"  Best checkpoint saved by TARGET EER\n")
+
 log(f"{'Epoch':>6}  {'Loss':>8}  "
     f"{'Src ACC':>8}  {'Src EER':>8}  {'Src TAR@.1':>10}  "
     f"{'Tgt ACC':>8}  {'Tgt EER':>8}  {'Tgt TAR@.1':>10}")
 log("-" * 80)
 
 s1_optimizer = optim.AdamW([
-    {'params': teacher.backbone_parameters(), 'lr': S1_LR_BACKBONE},
-    {'params': teacher.head_parameters(),     'lr': S1_LR_HEAD},
-    {'params': adaface.parameters(),          'lr': S1_LR_HEAD},
+    {'params': teacher.layer4_parameters(), 'lr': S1_LR_LAYER4},
+    {'params': teacher.head_parameters(),   'lr': S1_LR_HEAD},
+    {'params': adaface.parameters(),        'lr': S1_LR_HEAD},
 ], weight_decay=S1_WEIGHT_DECAY)
 s1_scheduler = make_warmup_cosine_scheduler(
     s1_optimizer, S1_WARMUP_EPOCHS, S1_EPOCHS)
 
-best_s1_tgt_eer = 1.0   # FIX 7: track target EER, not source EER
+best_s1_tgt_eer = 1.0
 best_s1_state   = None
 best_s1_adaface = None
 
@@ -647,7 +656,7 @@ for epoch in range(1, S1_EPOCHS + 1):
         s1_optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(
-            teacher.backbone_parameters() +
+            teacher.layer4_parameters() +
             teacher.head_parameters() +
             list(adaface.parameters()), max_norm=5.0)
         s1_optimizer.step()
@@ -659,7 +668,6 @@ for epoch in range(1, S1_EPOCHS + 1):
         src_m = evaluate(teacher, src_eval_loader, label=f"Src ep{epoch}")
         tgt_m = evaluate(teacher, tgt_eval_loader, label=f"Tgt ep{epoch}")
 
-        # FIX 7: save best by target EER
         marker = "  ★" if tgt_m['eer'] < best_s1_tgt_eer else ""
         log(f"{epoch:>6}  {loss_m.avg:>8.4f}  "
             f"{src_m['acc']*100:>7.2f}%  {src_m['eer']*100:>7.2f}%  "
@@ -690,13 +698,12 @@ p1_tgt_m = evaluate(teacher, tgt_eval_loader, label="P1 Target")
 
 log("\n" + "=" * 72)
 log("PHASE 2 — Teacher-Student Co-Learning")
-log("  FIX 1: source uses weak aug (same as Phase 1)")
-log("  FIX 2: backbone fully frozen — only linear head trains")
-log("  FIX 3: AdaFace W frozen — pseudo-labels cannot corrupt source clusters")
-log(f"  FIX 4: ALPHA={ALPHA} BETA={BETA} GAMMA={GAMMA_LOSS} "
-    f"(was 1.0/0.8/1.0)")
-log(f"  FIX 5: EMA decay={EMA_DECAY}  (was 0.99)")
-log(f"  FIX 6: pseudo threshold={PSEUDO_LABEL_THRESH}  (was 0.5)")
+log(f"  FIX 1: source uses weak aug (same as Phase 1)")
+log(f"  FIX 2: layer3 always frozen; layer4 trainable at LR={S2_LR_LAYER4}")
+log(f"  FIX 3: AdaFace W frozen")
+log(f"  FIX 4: ALPHA={ALPHA}  BETA={BETA}  GAMMA={GAMMA_LOSS}")
+log(f"  FIX 5: EMA decay={EMA_DECAY}")
+log(f"  FIX 6: pseudo threshold={PSEUDO_LABEL_THRESH}")
 log(f"\n  Phase 1 baseline:")
 log(f"    Source → ACC={p1_src_m['acc']*100:.2f}%  "
     f"EER={p1_src_m['eer']*100:.2f}%  "
@@ -711,27 +718,26 @@ log(f"{'Epoch':>6}  {'L_total':>8}  {'L_sup':>7}  "
     f"{'Tgt ACC':>8}  {'Tgt EER':>8}  {'Tgt TAR@.1':>10}")
 log("-" * 90)
 
-# ── Build student from best Phase 1 checkpoint ────────────────────────────────
+# Student starts from best Phase 1 teacher
 student = PalmNet(feat_dim=FEATURE_DIM, pretrained=True).to(DEVICE)
 student.load_state_dict(best_s1_state)
 
-# FIX 2: freeze backbone in both student and teacher for Phase 2
-student.freeze_backbone_for_phase2()
-
-# FIX 3: freeze AdaFace W so pseudo-labels cannot corrupt source clusters
+# FIX 3: freeze AdaFace W
 adaface.freeze_weights()
 
 discriminator = DomainDiscriminator(
     feat_dim=FEATURE_DIM, hidden=128, alpha=1.0).to(DEVICE)
 
-# Teacher: no gradient at all (EMA only)
+# Teacher: EMA only, no gradient
 for p in teacher.parameters():
     p.requires_grad = False
 
-# Optimizer: only student linear head + discriminator (backbone and W frozen)
+# Student optimizer: layer4 (low LR) + head + discriminator
+# layer3 and earlier stay frozen via frozen_layers in FeatureEncoder
 s2_optimizer = optim.AdamW([
-    {'params': student.head_parameters(),  'lr': S2_LR_HEAD},
-    {'params': discriminator.parameters(), 'lr': S2_LR_HEAD},
+    {'params': student.layer4_parameters(), 'lr': S2_LR_LAYER4},
+    {'params': student.head_parameters(),   'lr': S2_LR_HEAD},
+    {'params': discriminator.parameters(),  'lr': S2_LR_HEAD},
 ], weight_decay=S2_WEIGHT_DECAY)
 s2_scheduler = make_warmup_cosine_scheduler(
     s2_optimizer, S2_WARMUP_EPOCHS, S2_EPOCHS)
@@ -742,7 +748,7 @@ global_step     = 0
 
 for epoch in range(1, S2_EPOCHS + 1):
     student.train();  teacher.eval()
-    discriminator.train();  adaface.eval()   # adaface in eval (W frozen)
+    discriminator.train();  adaface.eval()
 
     loss_t_m = AverageMeter();  loss_s_m = AverageMeter()
     loss_u_m = AverageMeter();  loss_d_m = AverageMeter()
@@ -760,29 +766,22 @@ for epoch in range(1, S2_EPOCHS + 1):
         src_imgs = src_imgs.to(DEVICE);  src_lbl  = src_lbl.to(DEVICE)
         tgt_weak = tgt_weak.to(DEVICE);  tgt_str  = tgt_str.to(DEVICE)
 
-        # Pseudo-labels from teacher (no grad)
         pl, mask    = generate_pseudo_labels(
             teacher, tgt_weak, adaface, PSEUDO_LABEL_THRESH)
 
-        # Student forward
         src_feat, _ = student(src_imgs)
         tgt_feat, _ = student(tgt_str)
 
-        # L_sup: source supervised loss (W frozen, only linear head trains)
         L_sup   = adaface(src_feat, src_lbl)
-
-        # L_unsup: pseudo-label loss on confident target samples
         L_unsup = (adaface(tgt_feat[mask], pl[mask]) if mask.any()
                    else torch.tensor(0.0, device=DEVICE))
-
-        # L_dis: adversarial domain alignment via GRL
         L_dis   = domain_loss(discriminator, src_feat, tgt_feat)
-
         L_total = ALPHA * L_sup + BETA * L_unsup + GAMMA_LOSS * L_dis
 
         s2_optimizer.zero_grad()
         L_total.backward()
         nn.utils.clip_grad_norm_(
+            student.layer4_parameters() +
             student.head_parameters() +
             list(discriminator.parameters()), max_norm=5.0)
         s2_optimizer.step()
