@@ -1,16 +1,18 @@
 """
-TSCAN v5
+TSCAN v6 — Paper-faithful evaluation protocol.
 
-Changes from v4:
-  1. Accuracy → Rank-1: for each query sample, find 1-nearest gallery sample
-     by cosine similarity. Rank-1 = fraction where top-1 match is correct identity.
-  2. Pseudo% column removed from all printed output.
-  3. Phase 2 adaptation fixes:
-     - GAMMA_LOSS 0.3 → 1.0  (stronger domain alignment pressure)
-     - EMA_DECAY  0.999 → 0.99 (teacher updates faster from student)
-     - PSEUDO_LABEL_THRESH 0.6 → 0.5 (accept more pseudo-labels early on)
-     - S2_LR_HEAD 5e-5 → 1e-4 (student head learns faster)
-     - Phase 2 now also reports whether target EER improved vs Phase 1 baseline
+Reverted to paper definitions (Section 4.2):
+  - No gallery/query split. No Rank-1.
+  - Both source and target: ALL images in the domain used for pair evaluation.
+  - Pairs: ALL genuine pairs (same identity) + random impostor pairs (different identity).
+  - Metrics: ACC (best threshold), EER (FAR==FRR), TAR@FAR=0.1, TAR@FAR=0.01.
+  - Source training still uses all source images (no 80/20 split).
+
+Phase 1 printed columns (every EVAL_EVERY epochs):
+  Loss | Src ACC | Src EER | Src TAR@0.1 | Tgt ACC | Tgt EER | Tgt TAR@0.1
+
+Phase 2 printed columns (every EVAL_EVERY epochs):
+  L_total | L_sup | L_uns | L_dis | Src ACC | Src EER | Tgt ACC | Tgt EER | Tgt TAR@0.1
 """
 
 # =============================================================================
@@ -49,9 +51,6 @@ SOURCE_SPECTRUM = '460'
 TARGET_SPECTRUM = '630'
 SEPARATE_HANDS  = True
 
-# ── Source split ──────────────────────────────────────────────────────────────
-EVAL_SPLIT      = 0.2
-
 # ── Model ─────────────────────────────────────────────────────────────────────
 FEATURE_DIM     = 256
 
@@ -70,18 +69,18 @@ S1_WARMUP_EPOCHS = 5
 
 # ── Stage 2 ───────────────────────────────────────────────────────────────────
 S2_EPOCHS        = 60
-S2_LR_HEAD       = 1e-4      # was 5e-5 — student needs to learn faster
+S2_LR_HEAD       = 1e-4
 S2_LR_BACKBONE   = 5e-6
 S2_WEIGHT_DECAY  = 5e-4
 S2_BATCH_SIZE    = 32
 S2_WARMUP_EPOCHS = 3
 
 # ── Co-learning ───────────────────────────────────────────────────────────────
-EMA_DECAY            = 0.99   # was 0.999 — faster teacher update from student
-PSEUDO_LABEL_THRESH  = 0.5    # was 0.6 — accept more pseudo-labels
+EMA_DECAY            = 0.99
+PSEUDO_LABEL_THRESH  = 0.5
 ALPHA                = 1.0
 BETA                 = 0.8
-GAMMA_LOSS           = 1.0    # was 0.3 — stronger domain alignment
+GAMMA_LOSS           = 1.0
 
 # ── Augmentation ──────────────────────────────────────────────────────────────
 RESIZE_SIZE     = 124
@@ -93,7 +92,7 @@ NUM_WORKERS     = 8
 PIN_MEMORY      = True
 SEED            = 42
 EVAL_EVERY      = 5
-MAX_PAIRS       = 500_000
+MAX_IMPOSTORS   = 50_000   # cap on impostor pairs to keep eval tractable
 
 
 # =============================================================================
@@ -206,35 +205,22 @@ def build_label_map(records):
             enumerate(sorted(set(r[1] for r in records)))}
 
 
-def stratified_split(records, eval_fraction=0.2):
+class SpectrumDataset(Dataset):
     """
-    Per-identity split: last ceil(eval_fraction * n) images → query.
-    Deterministic (sorted filenames), no randomness.
+    All images from one spectrum, labeled.
+    Used for both training (source) and evaluation (source + target).
     """
-    by_identity = defaultdict(list)
-    for fp, ident in records:
-        by_identity[ident].append(fp)
-    for ident in by_identity:
-        by_identity[ident].sort()
-
-    gallery, query = [], []
-    for ident, fps in sorted(by_identity.items()):
-        n      = len(fps)
-        n_eval = max(1, math.ceil(n * eval_fraction))
-        if n < 2:
-            gallery.extend([(fp, ident) for fp in fps])
-            continue
-        gallery.extend([(fp, ident) for fp in fps[:-n_eval]])
-        query.extend  ([(fp, ident) for fp in fps[-n_eval:]])
-    return gallery, query
-
-
-class RecordDataset(Dataset):
-    def __init__(self, records, transform, label_map):
+    def __init__(self, spectrum, transform, label_map=None):
         self.transform = transform
-        self.label_map = label_map
+        records        = scan_spectrum(spectrum)
+        assert records, f"No images found for spectrum '{spectrum}'"
+        self.label_map = label_map if label_map else build_label_map(records)
         self.records   = [(fp, ident) for fp, ident in records
-                          if ident in label_map]
+                          if ident in self.label_map]
+
+    @property
+    def num_classes(self):
+        return len(self.label_map)
 
     def __len__(self):
         return len(self.records)
@@ -246,9 +232,10 @@ class RecordDataset(Dataset):
 
 
 class UnlabeledTargetDataset(Dataset):
+    """Target domain: (weak_aug, strong_aug) pair, no labels."""
     def __init__(self, spectrum):
-        self.weak   = weak_transform()
-        self.strong = strong_transform()
+        self.weak    = weak_transform()
+        self.strong  = strong_transform()
         self.records = scan_spectrum(spectrum)
         assert self.records, f"No target images: '{spectrum}'"
 
@@ -267,7 +254,8 @@ class UnlabeledTargetDataset(Dataset):
 class FeatureEncoder(nn.Module):
     """
     Frozen  : conv1, bn1, relu, maxpool, layer1, layer2
-    Trainable: layer3, layer4 (low LR) + linear(512→feat_dim) + Tanh (high LR)
+    Trainable: layer3, layer4  (low LR)
+    Trainable: linear(512→feat_dim), Tanh  (high LR)
     """
     def __init__(self, feat_dim=256, pretrained=True):
         super().__init__()
@@ -342,7 +330,8 @@ class AdaFaceLoss(nn.Module):
         cosine  = (feat_n @ w_n.T).clamp(-1 + 1e-7, 1 - 1e-7)
         theta   = torch.acos(cosine)
         m_col   = margins.unsqueeze(1)
-        cos_m_  = cosine * torch.cos(m_col) - torch.sin(theta) * torch.sin(m_col)
+        cos_m_  = (cosine * torch.cos(m_col)
+                   - torch.sin(theta) * torch.sin(m_col))
         one_hot = F.one_hot(labels, self.weight.size(0)).float()
         logits  = self.s * (one_hot * cos_m_ + (1 - one_hot) * cosine)
         return F.cross_entropy(logits, labels)
@@ -434,12 +423,12 @@ def make_warmup_cosine_scheduler(optimizer, warmup_epochs, total_epochs):
 
 
 # =============================================================================
-# EVALUATION
+# EVALUATION  —  Paper Section 4.2
 # =============================================================================
 
 @torch.no_grad()
 def extract_features(model, loader):
-    """Extract L2-normalised features and integer labels from loader."""
+    """Extract L2-normalised 256-dim features for all images in loader."""
     model.eval()
     feats, labs = [], []
     for imgs, labels in loader:
@@ -449,137 +438,119 @@ def extract_features(model, loader):
     return np.concatenate(feats), np.concatenate(labs)
 
 
-def rank1_gallery_query(gallery_feats, gallery_labels,
-                         query_feats,   query_labels):
+def build_pairs(feats, labels):
     """
-    Rank-1 identification accuracy: query → gallery.
+    Build genuine and impostor pair cosine similarity scores.
 
-    For each query sample:
-      1. Compute cosine similarity against every gallery sample.
-      2. Find the gallery sample with highest similarity (rank-1 match).
-      3. Correct if rank-1 gallery label == query label.
+    Genuine  : ALL pairs (i,j) where i<j and labels[i] == labels[j]
+               → every same-identity image combination within the domain
+    Impostor : random pairs where labels[i] != labels[j]
+               capped at MAX_IMPOSTORS to keep eval tractable
 
-    Rank-1 Acc = # correct rank-1 matches / total query samples
+    This matches the paper protocol exactly — no gallery/query distinction,
+    all images from the domain are used symmetrically.
     """
-    # Full similarity matrix: (N_query, N_gallery)
-    sims        = query_feats @ gallery_feats.T       # cosine sim (already L2-normed)
-    top1_idx    = sims.argmax(axis=1)                 # index of best gallery match
-    top1_labels = gallery_labels[top1_idx]            # identity of best match
-    correct     = int((top1_labels == query_labels).sum())
-    total       = len(query_labels)
-    return correct / max(total, 1)
-
-
-def rank1_single_set(feats, labels):
-    """
-    Rank-1 accuracy within a single set (target domain, no separate gallery).
-    For each sample, exclude itself, find nearest neighbour, check identity.
-    """
-    # Full similarity matrix
-    sims = feats @ feats.T                             # (N, N)
-    np.fill_diagonal(sims, -2.0)                      # exclude self-match
-    top1_idx    = sims.argmax(axis=1)
-    top1_labels = labels[top1_idx]
-    correct     = int((top1_labels == labels).sum())
-    return correct / max(len(labels), 1)
-
-
-def compute_eer(scores, is_genuine):
-    """Sweep 1000 thresholds, return EER."""
-    gen = scores[ is_genuine]
-    imp = scores[~is_genuine]
-    far_arr, frr_arr = [], []
-    for thr in np.linspace(-1.0, 1.0, 1000):
-        TP = int((gen >= thr).sum());  FN = int((gen  < thr).sum())
-        FP = int((imp >= thr).sum());  TN = int((imp  < thr).sum())
-        far_arr.append(FP / max(FP + TN, 1))
-        frr_arr.append(FN / max(TP + FN, 1))
-    far_arr = np.array(far_arr);  frr_arr = np.array(frr_arr)
-    eer_idx = np.argmin(np.abs(far_arr - frr_arr))
-    return float((far_arr[eer_idx] + frr_arr[eer_idx]) / 2.0)
-
-
-def build_pairs_gallery_query(g_feats, g_labels, q_feats, q_labels):
-    """
-    Genuine : (query_i, gallery_j) where labels match
-    Impostor: (query_i, gallery_j) where labels differ (random sample)
-    """
-    rng = np.random.RandomState(42)
-    g_by_id = defaultdict(list)
-    for idx, lbl in enumerate(g_labels):
-        g_by_id[lbl].append(idx)
-
-    genuine, impostor = [], []
-    for q_idx, q_lbl in enumerate(q_labels):
-        q_feat = q_feats[q_idx]
-        for g_idx in g_by_id.get(q_lbl, []):
-            genuine.append(float(np.dot(q_feat, g_feats[g_idx])))
-        sampled = rng.choice(len(g_labels), size=min(15, len(g_labels)),
-                              replace=False)
-        for g_idx in sampled:
-            if g_labels[g_idx] != q_lbl:
-                impostor.append(float(np.dot(q_feat, g_feats[g_idx])))
-
-    scores     = np.array(genuine + impostor, dtype=np.float32)
-    is_genuine = np.array([True] * len(genuine) + [False] * len(impostor))
-    return scores, is_genuine
-
-
-def build_pairs_single_set(feats, labels):
-    """All genuine pairs + random impostor pairs within one set."""
-    rng = np.random.RandomState(42)
-    by_id = defaultdict(list)
+    rng    = np.random.RandomState(42)
+    by_id  = defaultdict(list)
     for idx, lbl in enumerate(labels):
         by_id[lbl].append(idx)
 
-    genuine, impostor = [], []
+    # ── All genuine pairs ────────────────────────────────────────────────────
+    genuine = []
     for uid, idxs in by_id.items():
         for i in range(len(idxs)):
             for j in range(i + 1, len(idxs)):
-                genuine.append(float(np.dot(feats[idxs[i]], feats[idxs[j]])))
+                genuine.append(
+                    float(np.dot(feats[idxs[i]], feats[idxs[j]])))
 
-    n_imp = min(len(genuine) * 5, MAX_PAIRS)
-    N, seen = len(labels), 0
-    while len(impostor) < n_imp and seen < n_imp * 3:
+    # ── Random impostor pairs ────────────────────────────────────────────────
+    n_imp  = min(len(genuine) * 5, MAX_IMPOSTORS)
+    N      = len(labels)
+    impostor = []
+    seen   = 0
+    while len(impostor) < n_imp and seen < n_imp * 4:
         i, j = rng.choice(N, 2, replace=False)
         if labels[i] != labels[j]:
             impostor.append(float(np.dot(feats[i], feats[j])))
         seen += 1
 
     scores     = np.array(genuine + impostor, dtype=np.float32)
-    is_genuine = np.array([True] * len(genuine) + [False] * len(impostor))
+    is_genuine = np.array([True]  * len(genuine) +
+                           [False] * len(impostor))
     return scores, is_genuine
 
 
-def evaluate_source(model, gallery_loader, query_loader):
+def compute_metrics(scores, is_genuine):
     """
-    Source domain: query → gallery.
-    Returns (rank1_acc, eer).
-    Rank-1: each query matched to nearest gallery sample.
-    EER   : genuine/impostor pairs, query as probe.
-    """
-    g_feats, g_labels = extract_features(model, gallery_loader)
-    q_feats, q_labels = extract_features(model, query_loader)
+    Sweep 1000 thresholds over [-1, 1] and compute:
+      ACC       : (TP+TN)/(TP+TN+FP+FN) — best over all thresholds
+      EER       : threshold where FAR == FRR
+      TAR@FAR=0.1 : TAR when FAR <= 0.1
+      TAR@FAR=0.01: TAR when FAR <= 0.01
 
-    r1  = rank1_gallery_query(g_feats, g_labels, q_feats, q_labels)
-    scores, is_genuine = build_pairs_gallery_query(
-        g_feats, g_labels, q_feats, q_labels)
-    eer = compute_eer(scores, is_genuine)
-    return r1, eer
+    Paper formulas (Section 4.2):
+      ACC = (TP+TN)/(TP+TN+FP+FN)
+      FAR = FP/(FP+TN)
+      FRR = FN/(TP+FN)
+      TAR = TP/(TP+FN)
+      EER : FAR == FRR
+    """
+    gen = scores[ is_genuine]
+    imp = scores[~is_genuine]
+
+    thresholds = np.linspace(-1.0, 1.0, 1000)
+    far_arr, frr_arr, tar_arr, acc_arr = [], [], [], []
+
+    for thr in thresholds:
+        TP = int((gen >= thr).sum());  FN = int((gen  < thr).sum())
+        FP = int((imp >= thr).sum());  TN = int((imp  < thr).sum())
+        far_arr.append(FP / max(FP + TN, 1))
+        frr_arr.append(FN / max(TP + FN, 1))
+        tar_arr.append(TP / max(TP + FN, 1))
+        acc_arr.append((TP + TN) / max(TP + TN + FP + FN, 1))
+
+    far_arr = np.array(far_arr);  frr_arr = np.array(frr_arr)
+    tar_arr = np.array(tar_arr);  acc_arr = np.array(acc_arr)
+
+    # ACC: best threshold
+    acc = float(acc_arr.max())
+
+    # EER: crossing point of FAR and FRR curves
+    eer_idx = np.argmin(np.abs(far_arr - frr_arr))
+    eer     = float((far_arr[eer_idx] + frr_arr[eer_idx]) / 2.0)
+
+    # TAR @ FAR = 0.1
+    valid_01 = far_arr <= 0.1
+    tar_01   = float(tar_arr[valid_01].max()) if valid_01.any() else 0.0
+
+    # TAR @ FAR = 0.01
+    valid_001 = far_arr <= 0.01
+    tar_001   = float(tar_arr[valid_001].max()) if valid_001.any() else 0.0
+
+    return {
+        'acc'     : acc,
+        'eer'     : eer,
+        'tar_01'  : tar_01,
+        'tar_001' : tar_001,
+        'n_genuine' : int(is_genuine.sum()),
+        'n_impostor': int((~is_genuine).sum()),
+    }
 
 
-def evaluate_target(model, loader):
+def evaluate(model, loader, split_name=""):
     """
-    Target domain: all-vs-all (no separate gallery).
-    Returns (rank1_acc, eer).
-    Rank-1: each sample matched to nearest neighbour (self excluded).
-    EER   : all genuine/impostor pairs within set.
+    Full paper-faithful evaluation on one domain (all images in loader).
+    Returns metrics dict.
     """
-    feats, labels = extract_features(model, loader)
-    r1            = rank1_single_set(feats, labels)
-    scores, is_genuine = build_pairs_single_set(feats, labels)
-    eer           = compute_eer(scores, is_genuine)
-    return r1, eer
+    feats, labels      = extract_features(model, loader)
+    scores, is_genuine = build_pairs(feats, labels)
+    m                  = compute_metrics(scores, is_genuine)
+    log(f"  [{split_name}]  "
+        f"ACC={m['acc']*100:.2f}%  EER={m['eer']*100:.2f}%  "
+        f"TAR@FAR0.1={m['tar_01']*100:.2f}%  "
+        f"TAR@FAR0.01={m['tar_001']*100:.2f}%  "
+        f"(genuine={m['n_genuine']}, impostor={m['n_impostor']})")
+    return m
 
 
 # =============================================================================
@@ -589,44 +560,44 @@ def evaluate_target(model, loader):
 set_seed(SEED)
 
 log("=" * 72)
-log(f"TSCAN v5  |  {SOURCE_SPECTRUM} → {TARGET_SPECTRUM}  |  device={DEVICE}")
-log(f"Accuracy metric : Rank-1 (query → nearest gallery sample)")
-log(f"Source split    : {int((1-EVAL_SPLIT)*100)}% gallery / "
-    f"{int(EVAL_SPLIT*100)}% query  (stratified per identity)")
+log(f"TSCAN v6  |  {SOURCE_SPECTRUM} → {TARGET_SPECTRUM}  |  device={DEVICE}")
+log(f"Evaluation: paper protocol — all-vs-all pairs within each domain")
+log(f"Metrics   : ACC, EER, TAR@FAR=0.1, TAR@FAR=0.01  (Section 4.2)")
 log("=" * 72)
 
-# Source split
-all_src       = scan_spectrum(SOURCE_SPECTRUM)
-assert all_src, f"No source images for '{SOURCE_SPECTRUM}'"
-gallery_recs, query_recs = stratified_split(all_src, EVAL_SPLIT)
-LABEL_MAP     = build_label_map(all_src)
-NUM_CLASSES   = len(LABEL_MAP)
+# ── Source: ALL images used for training and evaluation ───────────────────────
+src_records = scan_spectrum(SOURCE_SPECTRUM)
+assert src_records, f"No source images for '{SOURCE_SPECTRUM}'"
+LABEL_MAP   = build_label_map(src_records)
+NUM_CLASSES = len(LABEL_MAP)
 
-log(f"Source [{SOURCE_SPECTRUM}] : {len(all_src)} total | "
-    f"gallery={len(gallery_recs)} | query={len(query_recs)} | "
-    f"identities={NUM_CLASSES}")
-log(f"Target [{TARGET_SPECTRUM}] : {len(scan_spectrum(TARGET_SPECTRUM))} images")
+tgt_records = scan_spectrum(TARGET_SPECTRUM)
+assert tgt_records, f"No target images for '{TARGET_SPECTRUM}'"
 
-# DataLoaders
-s1_gallery_loader = DataLoader(
-    RecordDataset(gallery_recs, weak_transform(), LABEL_MAP),
+log(f"Source [{SOURCE_SPECTRUM}]: {len(src_records)} images, "
+    f"{NUM_CLASSES} identities")
+log(f"Target [{TARGET_SPECTRUM}]: {len(tgt_records)} images")
+
+# ── DataLoaders ───────────────────────────────────────────────────────────────
+
+# Phase 1: source training loader (weak aug, all source images)
+s1_train_loader = DataLoader(
+    SpectrumDataset(SOURCE_SPECTRUM, weak_transform(), LABEL_MAP),
     batch_size=S1_BATCH_SIZE, shuffle=True,
     num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=True)
 
-gallery_eval_loader = DataLoader(
-    RecordDataset(gallery_recs, eval_transform(), LABEL_MAP),
-    batch_size=128, shuffle=False, num_workers=NUM_WORKERS)
-
-query_eval_loader = DataLoader(
-    RecordDataset(query_recs, eval_transform(), LABEL_MAP),
+# Evaluation loaders (deterministic, all images from each domain)
+src_eval_loader = DataLoader(
+    SpectrumDataset(SOURCE_SPECTRUM, eval_transform(), LABEL_MAP),
     batch_size=128, shuffle=False, num_workers=NUM_WORKERS)
 
 tgt_eval_loader = DataLoader(
-    RecordDataset(scan_spectrum(TARGET_SPECTRUM), eval_transform(), LABEL_MAP),
+    SpectrumDataset(TARGET_SPECTRUM, eval_transform(), LABEL_MAP),
     batch_size=128, shuffle=False, num_workers=NUM_WORKERS)
 
-s2_gallery_loader = DataLoader(
-    RecordDataset(gallery_recs, strong_transform(), LABEL_MAP),
+# Phase 2: source with strong aug, target unlabeled
+s2_src_loader = DataLoader(
+    SpectrumDataset(SOURCE_SPECTRUM, strong_transform(), LABEL_MAP),
     batch_size=S2_BATCH_SIZE, shuffle=True,
     num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=True)
 
@@ -635,7 +606,7 @@ s2_tgt_loader = DataLoader(
     batch_size=S2_BATCH_SIZE, shuffle=True,
     num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=True)
 
-# Models
+# ── Models ────────────────────────────────────────────────────────────────────
 teacher = PalmNet(feat_dim=FEATURE_DIM, pretrained=True).to(DEVICE)
 adaface = AdaFaceLoss(num_classes=NUM_CLASSES, feat_dim=FEATURE_DIM,
                       m0=ADAFACE_M0, m_min=ADAFACE_MMIN,
@@ -644,10 +615,14 @@ adaface = AdaFaceLoss(num_classes=NUM_CLASSES, feat_dim=FEATURE_DIM,
 frozen_p   = sum(p.numel() for p in teacher.encoder.frozen_layers.parameters())
 backbone_p = sum(p.numel() for p in teacher.backbone_parameters())
 head_p     = sum(p.numel() for p in teacher.head_parameters())
-log(f"\nFrozen : {frozen_p/1e6:.2f}M | "
-    f"Backbone (trainable): {backbone_p/1e6:.2f}M | "
-    f"Head: {head_p/1e6:.4f}M | "
-    f"AdaFace W: {sum(p.numel() for p in adaface.parameters())/1e6:.4f}M")
+ada_p      = sum(p.numel() for p in adaface.parameters())
+log(f"\nFrozen backbone : {frozen_p/1e6:.2f}M  (conv1, bn1, layer1, layer2)")
+log(f"Trainable layers: {backbone_p/1e6:.2f}M  (layer3, layer4)  "
+    f"LR={S1_LR_BACKBONE}")
+log(f"Trainable head  : {head_p/1e6:.4f}M  (linear+Tanh)     "
+    f"LR={S1_LR_HEAD}")
+log(f"AdaFace W       : {ada_p/1e6:.4f}M                       "
+    f"LR={S1_LR_HEAD}")
 
 
 # =============================================================================
@@ -656,12 +631,17 @@ log(f"\nFrozen : {frozen_p/1e6:.2f}M | "
 
 log("\n" + "=" * 72)
 log("PHASE 1 — Teacher Initialization")
-log("  Rank-1: each query matched to nearest gallery sample (cosine sim)")
-log("  EER   : genuine/impostor pairs, query as probe, gallery as reference\n")
-log(f"{'Epoch':>6}  {'Loss':>8}  "
-    f"{'Src R1':>8}  {'Src EER':>8}  "
-    f"{'Tgt R1':>8}  {'Tgt EER':>8}")
-log("-" * 56)
+log(f"  Training set : ALL source images [{SOURCE_SPECTRUM}]  "
+    f"({len(src_records)} images)")
+log(f"  Eval sets    : ALL source images (same domain, all-vs-all pairs)")
+log(f"                 ALL target images (cross-domain, all-vs-all pairs)")
+log(f"  Metrics      : ACC, EER, TAR@FAR=0.1  (paper Section 4.2)\n")
+
+hdr = (f"{'Epoch':>6}  {'Loss':>8}  "
+       f"{'Src ACC':>8}  {'Src EER':>8}  {'Src TAR@.1':>10}  "
+       f"{'Tgt ACC':>8}  {'Tgt EER':>8}  {'Tgt TAR@.1':>10}")
+log(hdr)
+log("-" * 80)
 
 s1_optimizer = optim.AdamW([
     {'params': teacher.backbone_parameters(), 'lr': S1_LR_BACKBONE},
@@ -671,15 +651,15 @@ s1_optimizer = optim.AdamW([
 s1_scheduler = make_warmup_cosine_scheduler(
     s1_optimizer, S1_WARMUP_EPOCHS, S1_EPOCHS)
 
-best_s1_eer    = 1.0
-best_s1_state  = None
+best_s1_eer     = 1.0
+best_s1_state   = None
 best_s1_adaface = None
 
 for epoch in range(1, S1_EPOCHS + 1):
     teacher.train();  adaface.train()
     loss_m = AverageMeter()
 
-    for imgs, labels in s1_gallery_loader:
+    for imgs, labels in s1_train_loader:
         imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
         feat, _  = teacher(imgs)
         loss     = adaface(feat, labels)
@@ -695,32 +675,34 @@ for epoch in range(1, S1_EPOCHS + 1):
     s1_scheduler.step()
 
     if epoch % EVAL_EVERY == 0 or epoch == S1_EPOCHS:
-        src_r1, src_eer = evaluate_source(teacher,
-                                           gallery_eval_loader,
-                                           query_eval_loader)
-        tgt_r1, tgt_eer = evaluate_target(teacher, tgt_eval_loader)
+        src_m = evaluate(teacher, src_eval_loader,
+                         split_name=f"Src epoch={epoch}")
+        tgt_m = evaluate(teacher, tgt_eval_loader,
+                         split_name=f"Tgt epoch={epoch}")
 
-        marker = " ★" if src_eer < best_s1_eer else ""
+        marker = "  ★" if src_m['eer'] < best_s1_eer else ""
         log(f"{epoch:>6}  {loss_m.avg:>8.4f}  "
-            f"{src_r1*100:>7.2f}%  {src_eer*100:>7.2f}%  "
-            f"{tgt_r1*100:>7.2f}%  {tgt_eer*100:>7.2f}%{marker}")
+            f"{src_m['acc']*100:>7.2f}%  {src_m['eer']*100:>7.2f}%  "
+            f"{src_m['tar_01']*100:>9.2f}%  "
+            f"{tgt_m['acc']*100:>7.2f}%  {tgt_m['eer']*100:>7.2f}%  "
+            f"{tgt_m['tar_01']*100:>9.2f}%{marker}")
 
-        if src_eer < best_s1_eer:
-            best_s1_eer     = src_eer
+        if src_m['eer'] < best_s1_eer:
+            best_s1_eer     = src_m['eer']
             best_s1_state   = copy.deepcopy(teacher.state_dict())
             best_s1_adaface = copy.deepcopy(adaface.state_dict())
     else:
         log(f"{epoch:>6}  {loss_m.avg:>8.4f}")
 
-log("-" * 56)
+log("-" * 80)
 log(f"Phase 1 done  |  Best Src EER = {best_s1_eer*100:.2f}%")
 
-# Record Phase 1 target baseline for Phase 2 comparison
+# Record Phase 1 target baseline for Phase 2 delta reporting
 teacher.load_state_dict(best_s1_state)
 adaface.load_state_dict(best_s1_adaface)
-p1_tgt_r1, p1_tgt_eer = evaluate_target(teacher, tgt_eval_loader)
-log(f"Phase 1 target baseline  →  Rank-1={p1_tgt_r1*100:.2f}%  "
-    f"EER={p1_tgt_eer*100:.2f}%")
+log("\nPhase 1 best checkpoint — full metrics:")
+p1_src_m = evaluate(teacher, src_eval_loader, split_name="P1 Source")
+p1_tgt_m = evaluate(teacher, tgt_eval_loader, split_name="P1 Target")
 
 
 # =============================================================================
@@ -729,20 +711,25 @@ log(f"Phase 1 target baseline  →  Rank-1={p1_tgt_r1*100:.2f}%  "
 
 log("\n" + "=" * 72)
 log("PHASE 2 — Teacher-Student Co-Learning (Domain Adaptation)")
-log("  Src Rank-1/EER : student performance on source query→gallery")
-log("                   (tracks: is student forgetting source knowledge?)")
-log("  Tgt Rank-1/EER : student performance on target all-vs-all")
-log("                   (tracks: is adaptation actually working?)")
-log(f"  Phase-1 target baseline: "
-    f"Rank-1={p1_tgt_r1*100:.2f}%  EER={p1_tgt_eer*100:.2f}%\n")
+log(f"  Source training : gallery = ALL source images (strong aug)")
+log(f"  Target training : ALL target images (unlabeled, weak+strong aug)")
+log(f"  Eval sets       : same as Phase 1 — all-vs-all pairs per domain")
+log(f"\n  Phase 1 baseline:")
+log(f"    Source — ACC={p1_src_m['acc']*100:.2f}%  "
+    f"EER={p1_src_m['eer']*100:.2f}%  "
+    f"TAR@0.1={p1_src_m['tar_01']*100:.2f}%")
+log(f"    Target — ACC={p1_tgt_m['acc']*100:.2f}%  "
+    f"EER={p1_tgt_m['eer']*100:.2f}%  "
+    f"TAR@0.1={p1_tgt_m['tar_01']*100:.2f}%\n")
 
-log(f"{'Epoch':>6}  {'L_total':>8}  {'L_sup':>7}  "
-    f"{'L_uns':>7}  {'L_dis':>7}  "
-    f"{'Src R1':>8}  {'Src EER':>8}  "
-    f"{'Tgt R1':>8}  {'Tgt EER':>8}")
-log("-" * 75)
+hdr2 = (f"{'Epoch':>6}  {'L_total':>8}  {'L_sup':>7}  "
+        f"{'L_uns':>7}  {'L_dis':>7}  "
+        f"{'Src ACC':>8}  {'Src EER':>8}  "
+        f"{'Tgt ACC':>8}  {'Tgt EER':>8}  {'Tgt TAR@.1':>10}")
+log(hdr2)
+log("-" * 90)
 
-# Initialise student from best Phase 1 teacher
+# Load best Phase 1 weights into teacher and student
 student = PalmNet(feat_dim=FEATURE_DIM, pretrained=True).to(DEVICE)
 student.load_state_dict(best_s1_state)
 
@@ -750,7 +737,7 @@ discriminator = DomainDiscriminator(
     feat_dim=FEATURE_DIM, hidden=128, alpha=1.0).to(DEVICE)
 
 for p in teacher.parameters():
-    p.requires_grad = False    # teacher: EMA only
+    p.requires_grad = False   # teacher updated by EMA only
 
 s2_optimizer = optim.AdamW([
     {'params': student.backbone_parameters(), 'lr': S2_LR_BACKBONE},
@@ -761,8 +748,8 @@ s2_optimizer = optim.AdamW([
 s2_scheduler = make_warmup_cosine_scheduler(
     s2_optimizer, S2_WARMUP_EPOCHS, S2_EPOCHS)
 
-best_s2_tgt_eer = p1_tgt_eer    # must beat Phase 1 baseline to count
-total_steps     = len(s2_gallery_loader) * S2_EPOCHS
+best_s2_tgt_eer = p1_tgt_m['eer']
+total_steps     = len(s2_src_loader) * S2_EPOCHS
 global_step     = 0
 
 for epoch in range(1, S2_EPOCHS + 1):
@@ -772,8 +759,8 @@ for epoch in range(1, S2_EPOCHS + 1):
     loss_t_m = AverageMeter();  loss_s_m = AverageMeter()
     loss_u_m = AverageMeter();  loss_d_m = AverageMeter()
 
-    max_steps = max(len(s2_gallery_loader), len(s2_tgt_loader))
-    src_iter  = itertools.cycle(s2_gallery_loader)
+    max_steps = max(len(s2_src_loader), len(s2_tgt_loader))
+    src_iter  = itertools.cycle(s2_src_loader)
     tgt_iter  = itertools.cycle(s2_tgt_loader)
 
     for _ in range(max_steps):
@@ -791,8 +778,8 @@ for epoch in range(1, S2_EPOCHS + 1):
         tgt_feat, _ = student(tgt_str)
 
         L_sup   = adaface(src_feat, src_lbl)
-        L_unsup = adaface(tgt_feat[mask], pl[mask]) if mask.any() \
-                  else torch.tensor(0.0, device=DEVICE)
+        L_unsup = (adaface(tgt_feat[mask], pl[mask]) if mask.any()
+                   else torch.tensor(0.0, device=DEVICE))
         L_dis   = domain_loss(discriminator, src_feat, tgt_feat)
         L_total = ALPHA * L_sup + BETA * L_unsup + GAMMA_LOSS * L_dis
 
@@ -816,34 +803,37 @@ for epoch in range(1, S2_EPOCHS + 1):
     s2_scheduler.step()
 
     if epoch % EVAL_EVERY == 0 or epoch == S2_EPOCHS:
-        src_r1, src_eer = evaluate_source(student,
-                                           gallery_eval_loader,
-                                           query_eval_loader)
-        tgt_r1, tgt_eer = evaluate_target(student, tgt_eval_loader)
+        src_m = evaluate(student, src_eval_loader,
+                         split_name=f"Src epoch={epoch}")
+        tgt_m = evaluate(student, tgt_eval_loader,
+                         split_name=f"Tgt epoch={epoch}")
 
-        # Show delta vs Phase 1 target baseline
-        delta_r1  = (tgt_r1  - p1_tgt_r1)  * 100
-        delta_eer = (p1_tgt_eer - tgt_eer) * 100   # positive = improvement
-        marker = (f"  [Tgt EER Δ{delta_eer:+.2f}%  R1 Δ{delta_r1:+.2f}%]"
-                  if epoch % EVAL_EVERY == 0 else "")
+        d_eer = (p1_tgt_m['eer'] - tgt_m['eer']) * 100  # + = improvement
+        marker = (f"  [ΔEER={d_eer:+.2f}%]"
+                  + ("  ★" if tgt_m['eer'] < best_s2_tgt_eer else ""))
 
         log(f"{epoch:>6}  {loss_t_m.avg:>8.4f}  {loss_s_m.avg:>7.4f}  "
             f"{loss_u_m.avg:>7.4f}  {loss_d_m.avg:>7.4f}  "
-            f"{src_r1*100:>7.2f}%  {src_eer*100:>7.2f}%  "
-            f"{tgt_r1*100:>7.2f}%  {tgt_eer*100:>7.2f}%{marker}")
+            f"{src_m['acc']*100:>7.2f}%  {src_m['eer']*100:>7.2f}%  "
+            f"{tgt_m['acc']*100:>7.2f}%  {tgt_m['eer']*100:>7.2f}%  "
+            f"{tgt_m['tar_01']*100:>9.2f}%{marker}")
 
-        if tgt_eer < best_s2_tgt_eer:
-            best_s2_tgt_eer = tgt_eer
-            log(f"         ★ best target EER so far  ({tgt_eer*100:.2f}%)")
+        if tgt_m['eer'] < best_s2_tgt_eer:
+            best_s2_tgt_eer = tgt_m['eer']
     else:
         log(f"{epoch:>6}  {loss_t_m.avg:>8.4f}  {loss_s_m.avg:>7.4f}  "
             f"{loss_u_m.avg:>7.4f}  {loss_d_m.avg:>7.4f}")
 
-log("-" * 75)
-log(f"\nFinal summary:")
-log(f"  Phase 1 source  →  Src EER={best_s1_eer*100:.2f}%")
-log(f"  Phase 1 target  →  Tgt R1={p1_tgt_r1*100:.2f}%  "
-    f"Tgt EER={p1_tgt_eer*100:.2f}%")
-log(f"  Phase 2 best    →  Tgt EER={best_s2_tgt_eer*100:.2f}%  "
-    f"(Δ {(p1_tgt_eer-best_s2_tgt_eer)*100:+.2f}%)")
-log("TSCAN v5 complete.")
+log("-" * 90)
+log(f"\nFinal results:")
+log(f"  Source — ACC={p1_src_m['acc']*100:.2f}%  "
+    f"EER={p1_src_m['eer']*100:.2f}%  "
+    f"TAR@FAR=0.1={p1_src_m['tar_01']*100:.2f}%")
+log(f"  Target before adaptation — "
+    f"ACC={p1_tgt_m['acc']*100:.2f}%  "
+    f"EER={p1_tgt_m['eer']*100:.2f}%  "
+    f"TAR@FAR=0.1={p1_tgt_m['tar_01']*100:.2f}%")
+log(f"  Target after  adaptation — "
+    f"Best EER={best_s2_tgt_eer*100:.2f}%  "
+    f"(ΔEER={( p1_tgt_m['eer']-best_s2_tgt_eer)*100:+.2f}%)")
+log("TSCAN v6 complete.")
