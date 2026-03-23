@@ -71,7 +71,7 @@ DATA_ROOT       = "/home/pai-ng/Jamal/CASIA-MS-ROI"
 
 ALL_SPECTRUMS   = ['460', '630', '700', '850', '940', 'White']
 SOURCE_SPECTRUM = '460'
-TARGET_SPECTRUM = '630'
+TARGET_SPECTRUM = '850'
 SEPARATE_HANDS  = True
 
 # ── Model ─────────────────────────────────────────────────────────────────────
