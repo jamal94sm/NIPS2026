@@ -74,8 +74,8 @@ S2_BATCH_SIZE   = 32
 S2_WARMUP_EPOCHS= 3
 
 # ── Co-learning ───────────────────────────────────────────────────────────────
-EMA_DECAY           = 0.999     # slightly higher than 0.99 — smoother teacher
-PSEUDO_LABEL_THRESH = 0.6       # was 0.8 — teacher at 3% acc never passes 0.8
+EMA_DECAY           = 0.99     # slightly higher than 0.99 — smoother teacher
+PSEUDO_LABEL_THRESH = 0.8       # was 0.8 — teacher at 3% acc never passes 0.8
 ALPHA               = 1.0       # L_sup weight
 BETA                = 0.8       # L_unsup weight
 GAMMA_LOSS          = 0.3       # L_dis weight
