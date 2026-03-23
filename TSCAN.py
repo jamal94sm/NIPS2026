@@ -1,22 +1,16 @@
 """
-TSCAN v4
+TSCAN v5
 
-Key change from v3:
-  Source domain split: 80% gallery (train), 20% query (eval) per identity.
-  Stratified: for each identity, last ceil(20%) images held out as query.
-  Every identity appears in both sets — required for EER pair building.
-
-Phase 1 printed metrics (every EVAL_EVERY epochs):
-  Loss      : AdaFace training loss on gallery
-  Eval ID   : identification acc  — query features matched against gallery
-  Eval EER  : verification EER    — genuine/impostor pairs from query set
-  Target ID : identification acc on target spectrum
-  Target EER: verification EER on target spectrum
-  Pseudo%   : % of target samples passing confidence threshold
-
-Removing train acc/EER — replaced by Eval acc/EER (query→gallery).
-Gap between Eval and Target metrics = domain shift magnitude.
-Gap between Train loss and Eval metrics = overfitting signal.
+Changes from v4:
+  1. Accuracy → Rank-1: for each query sample, find 1-nearest gallery sample
+     by cosine similarity. Rank-1 = fraction where top-1 match is correct identity.
+  2. Pseudo% column removed from all printed output.
+  3. Phase 2 adaptation fixes:
+     - GAMMA_LOSS 0.3 → 1.0  (stronger domain alignment pressure)
+     - EMA_DECAY  0.999 → 0.99 (teacher updates faster from student)
+     - PSEUDO_LABEL_THRESH 0.6 → 0.5 (accept more pseudo-labels early on)
+     - S2_LR_HEAD 5e-5 → 1e-4 (student head learns faster)
+     - Phase 2 now also reports whether target EER improved vs Phase 1 baseline
 """
 
 # =============================================================================
@@ -56,7 +50,7 @@ TARGET_SPECTRUM = '630'
 SEPARATE_HANDS  = True
 
 # ── Source split ──────────────────────────────────────────────────────────────
-EVAL_SPLIT      = 0.2   # fraction of each identity's images held out as query
+EVAL_SPLIT      = 0.2
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 FEATURE_DIM     = 256
@@ -76,18 +70,18 @@ S1_WARMUP_EPOCHS = 5
 
 # ── Stage 2 ───────────────────────────────────────────────────────────────────
 S2_EPOCHS        = 60
-S2_LR_HEAD       = 5e-5
+S2_LR_HEAD       = 1e-4      # was 5e-5 — student needs to learn faster
 S2_LR_BACKBONE   = 5e-6
 S2_WEIGHT_DECAY  = 5e-4
 S2_BATCH_SIZE    = 32
 S2_WARMUP_EPOCHS = 3
 
 # ── Co-learning ───────────────────────────────────────────────────────────────
-EMA_DECAY            = 0.999
-PSEUDO_LABEL_THRESH  = 0.6
+EMA_DECAY            = 0.99   # was 0.999 — faster teacher update from student
+PSEUDO_LABEL_THRESH  = 0.5    # was 0.6 — accept more pseudo-labels
 ALPHA                = 1.0
 BETA                 = 0.8
-GAMMA_LOSS           = 0.3
+GAMMA_LOSS           = 1.0    # was 0.3 — stronger domain alignment
 
 # ── Augmentation ──────────────────────────────────────────────────────────────
 RESIZE_SIZE     = 124
@@ -191,12 +185,10 @@ def parse_filename(filepath):
     if len(parts) < 4:
         return None, None
     identity = f"{parts[0]}_{parts[1]}" if SEPARATE_HANDS else parts[0]
-    spectrum = parts[2]
-    return identity, spectrum
+    return identity, parts[2]
 
 
 def scan_spectrum(spectrum):
-    """Return sorted list of (filepath, identity) for one spectrum."""
     files = sorted(glob.glob(os.path.join(DATA_ROOT, "*.jpg")))
     if not files:
         files = sorted(glob.glob(os.path.join(DATA_ROOT, "**", "*.jpg"),
@@ -210,33 +202,15 @@ def scan_spectrum(spectrum):
 
 
 def build_label_map(records):
-    identities = sorted(set(r[1] for r in records))
-    return {name: idx for idx, name in enumerate(identities)}
+    return {name: idx for idx, name in
+            enumerate(sorted(set(r[1] for r in records)))}
 
 
 def stratified_split(records, eval_fraction=0.2):
     """
-    Split records into (gallery, query) with stratification per identity.
-
-    For each identity:
-      - Sort images deterministically by filepath.
-      - Hold out the last ceil(eval_fraction * n) images as query.
-      - Keep the rest as gallery (train).
-
-    This guarantees:
-      - Every identity has at least 1 image in each split (provided ≥2 imgs/id).
-      - The split is deterministic (reproducible without a seed).
-      - No data leakage: query images never appear in gallery.
-
-    Args:
-        records       : list of (filepath, identity_str)
-        eval_fraction : fraction to hold out per identity (default 0.2)
-
-    Returns:
-        gallery : list of (filepath, identity_str)  — 80%, used for training
-        query   : list of (filepath, identity_str)  — 20%, used for evaluation
+    Per-identity split: last ceil(eval_fraction * n) images → query.
+    Deterministic (sorted filenames), no randomness.
     """
-    # Group by identity, sort files within each group
     by_identity = defaultdict(list)
     for fp, ident in records:
         by_identity[ident].append(fp)
@@ -244,60 +218,39 @@ def stratified_split(records, eval_fraction=0.2):
         by_identity[ident].sort()
 
     gallery, query = [], []
-    skipped = 0
     for ident, fps in sorted(by_identity.items()):
         n      = len(fps)
         n_eval = max(1, math.ceil(n * eval_fraction))
-
         if n < 2:
-            # Cannot split a single image — put in gallery only, skip query
             gallery.extend([(fp, ident) for fp in fps])
-            skipped += 1
             continue
-
-        # Last n_eval images → query; rest → gallery
         gallery.extend([(fp, ident) for fp in fps[:-n_eval]])
         query.extend  ([(fp, ident) for fp in fps[-n_eval:]])
-
-    if skipped:
-        log(f"  [split] {skipped} identities with <2 images skipped from query")
-
     return gallery, query
 
 
 class RecordDataset(Dataset):
-    """
-    Generic dataset from a pre-built list of (filepath, identity_str) records.
-    Accepts an explicit label_map so gallery and query share the same class indices.
-    """
     def __init__(self, records, transform, label_map):
         self.transform = transform
         self.label_map = label_map
-        # Keep only records whose identity is in label_map
         self.records   = [(fp, ident) for fp, ident in records
                           if ident in label_map]
-
-    @property
-    def num_classes(self):
-        return len(self.label_map)
 
     def __len__(self):
         return len(self.records)
 
     def __getitem__(self, idx):
         fp, ident = self.records[idx]
-        img = Image.open(fp).convert("RGB")
-        return self.transform(img), self.label_map[ident]
+        return (self.transform(Image.open(fp).convert("RGB")),
+                self.label_map[ident])
 
 
 class UnlabeledTargetDataset(Dataset):
-    """Target domain: returns (weak_aug, strong_aug) pair, no labels."""
     def __init__(self, spectrum):
         self.weak   = weak_transform()
         self.strong = strong_transform()
-        records     = scan_spectrum(spectrum)
-        assert records, f"No target images found for spectrum '{spectrum}'"
-        self.records = records
+        self.records = scan_spectrum(spectrum)
+        assert self.records, f"No target images: '{spectrum}'"
 
     def __len__(self):
         return len(self.records)
@@ -313,24 +266,20 @@ class UnlabeledTargetDataset(Dataset):
 
 class FeatureEncoder(nn.Module):
     """
-    ResNet18 partial unfreeze:
-      Frozen    : conv1, bn1, relu, maxpool, layer1, layer2
-      Trainable : layer3, layer4  (lower LR)
-      Trainable : linear(512→feat_dim), Tanh  (higher LR)
+    Frozen  : conv1, bn1, relu, maxpool, layer1, layer2
+    Trainable: layer3, layer4 (low LR) + linear(512→feat_dim) + Tanh (high LR)
     """
     def __init__(self, feat_dim=256, pretrained=True):
         super().__init__()
         weights  = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
         backbone = resnet18(weights=weights)
-
         self.frozen_layers    = nn.Sequential(*list(backbone.children())[:6])
         self.trainable_layers = nn.Sequential(*list(backbone.children())[6:9])
         self.flatten          = nn.Flatten()
         self.linear           = nn.Linear(512, feat_dim, bias=True)
         self.hash             = nn.Tanh()
-
-        for param in self.frozen_layers.parameters():
-            param.requires_grad = False
+        for p in self.frozen_layers.parameters():
+            p.requires_grad = False
 
     def forward(self, x):
         with torch.no_grad():
@@ -445,7 +394,7 @@ class DomainDiscriminator(nn.Module):
 # =============================================================================
 
 @torch.no_grad()
-def ema_update(teacher, student, decay=0.999):
+def ema_update(teacher, student, decay=0.99):
     for t_p, s_p in zip(teacher.parameters(), student.parameters()):
         t_p.data.mul_(decay).add_(s_p.data * (1.0 - decay))
 
@@ -470,13 +419,15 @@ def domain_loss(discriminator, src_feat, tgt_feat):
     src_lbl = torch.zeros(src_feat.size(0), 1, device=src_feat.device)
     tgt_lbl = torch.ones (tgt_feat.size(0), 1, device=tgt_feat.device)
     preds   = discriminator(torch.cat([src_feat, tgt_feat], dim=0))
-    return F.binary_cross_entropy(preds, torch.cat([src_lbl, tgt_lbl], dim=0))
+    return F.binary_cross_entropy(preds,
+                                   torch.cat([src_lbl, tgt_lbl], dim=0))
 
 
 def make_warmup_cosine_scheduler(optimizer, warmup_epochs, total_epochs):
     warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0,
                       total_iters=warmup_epochs)
-    cosine = CosineAnnealingLR(optimizer, T_max=total_epochs - warmup_epochs,
+    cosine = CosineAnnealingLR(optimizer,
+                                T_max=total_epochs - warmup_epochs,
                                 eta_min=1e-6)
     return SequentialLR(optimizer, schedulers=[warmup, cosine],
                         milestones=[warmup_epochs])
@@ -488,7 +439,7 @@ def make_warmup_cosine_scheduler(optimizer, warmup_epochs, total_epochs):
 
 @torch.no_grad()
 def extract_features(model, loader):
-    """Extract L2-normalised features and labels from a loader."""
+    """Extract L2-normalised features and integer labels from loader."""
     model.eval()
     feats, labs = [], []
     for imgs, labels in loader:
@@ -498,135 +449,90 @@ def extract_features(model, loader):
     return np.concatenate(feats), np.concatenate(labs)
 
 
-def compute_eer_and_acc(scores, is_genuine):
-    """Sweep 1000 thresholds, return (best_acc, eer)."""
+def rank1_gallery_query(gallery_feats, gallery_labels,
+                         query_feats,   query_labels):
+    """
+    Rank-1 identification accuracy: query → gallery.
+
+    For each query sample:
+      1. Compute cosine similarity against every gallery sample.
+      2. Find the gallery sample with highest similarity (rank-1 match).
+      3. Correct if rank-1 gallery label == query label.
+
+    Rank-1 Acc = # correct rank-1 matches / total query samples
+    """
+    # Full similarity matrix: (N_query, N_gallery)
+    sims        = query_feats @ gallery_feats.T       # cosine sim (already L2-normed)
+    top1_idx    = sims.argmax(axis=1)                 # index of best gallery match
+    top1_labels = gallery_labels[top1_idx]            # identity of best match
+    correct     = int((top1_labels == query_labels).sum())
+    total       = len(query_labels)
+    return correct / max(total, 1)
+
+
+def rank1_single_set(feats, labels):
+    """
+    Rank-1 accuracy within a single set (target domain, no separate gallery).
+    For each sample, exclude itself, find nearest neighbour, check identity.
+    """
+    # Full similarity matrix
+    sims = feats @ feats.T                             # (N, N)
+    np.fill_diagonal(sims, -2.0)                      # exclude self-match
+    top1_idx    = sims.argmax(axis=1)
+    top1_labels = labels[top1_idx]
+    correct     = int((top1_labels == labels).sum())
+    return correct / max(len(labels), 1)
+
+
+def compute_eer(scores, is_genuine):
+    """Sweep 1000 thresholds, return EER."""
     gen = scores[ is_genuine]
     imp = scores[~is_genuine]
-    far_arr, frr_arr, acc_arr = [], [], []
+    far_arr, frr_arr = [], []
     for thr in np.linspace(-1.0, 1.0, 1000):
         TP = int((gen >= thr).sum());  FN = int((gen  < thr).sum())
         FP = int((imp >= thr).sum());  TN = int((imp  < thr).sum())
         far_arr.append(FP / max(FP + TN, 1))
         frr_arr.append(FN / max(TP + FN, 1))
-        acc_arr.append((TP + TN) / max(TP + TN + FP + FN, 1))
     far_arr = np.array(far_arr);  frr_arr = np.array(frr_arr)
     eer_idx = np.argmin(np.abs(far_arr - frr_arr))
-    eer     = float((far_arr[eer_idx] + frr_arr[eer_idx]) / 2.0)
-    acc     = float(np.array(acc_arr).max())
-    return acc, eer
+    return float((far_arr[eer_idx] + frr_arr[eer_idx]) / 2.0)
 
 
-def build_pairs_gallery_query(gallery_feats, gallery_labels,
-                               query_feats,   query_labels):
+def build_pairs_gallery_query(g_feats, g_labels, q_feats, q_labels):
     """
-    Build genuine/impostor pairs using QUERY as probe and GALLERY as reference.
-
-    Genuine  : query[i] vs gallery[j] where query_labels[i] == gallery_labels[j]
-    Impostor : query[i] vs gallery[j] where query_labels[i] != gallery_labels[j]
-
-    This is the standard closed-set identification / open-set verification
-    protocol used in biometric benchmarks.
+    Genuine : (query_i, gallery_j) where labels match
+    Impostor: (query_i, gallery_j) where labels differ (random sample)
     """
     rng = np.random.RandomState(42)
+    g_by_id = defaultdict(list)
+    for idx, lbl in enumerate(g_labels):
+        g_by_id[lbl].append(idx)
+
     genuine, impostor = [], []
-
-    # Index gallery by identity for fast lookup
-    gallery_by_id = defaultdict(list)
-    for idx, lbl in enumerate(gallery_labels):
-        gallery_by_id[lbl].append(idx)
-
-    all_gallery_idx = np.arange(len(gallery_labels))
-
-    for q_idx, q_lbl in enumerate(query_labels):
-        q_feat = query_feats[q_idx]
-
-        # Genuine: match against all gallery samples of same identity
-        for g_idx in gallery_by_id.get(q_lbl, []):
-            sim = float(np.dot(q_feat, gallery_feats[g_idx]))
-            genuine.append(sim)
-
-        # Impostor: sample a few random gallery entries of different identity
-        n_imp = min(5, len(all_gallery_idx))
-        sampled = rng.choice(len(all_gallery_idx), size=n_imp * 3, replace=False)
-        count = 0
+    for q_idx, q_lbl in enumerate(q_labels):
+        q_feat = q_feats[q_idx]
+        for g_idx in g_by_id.get(q_lbl, []):
+            genuine.append(float(np.dot(q_feat, g_feats[g_idx])))
+        sampled = rng.choice(len(g_labels), size=min(15, len(g_labels)),
+                              replace=False)
         for g_idx in sampled:
-            if gallery_labels[g_idx] != q_lbl:
-                sim = float(np.dot(q_feat, gallery_feats[g_idx]))
-                impostor.append(sim)
-                count += 1
-                if count >= n_imp:
-                    break
+            if g_labels[g_idx] != q_lbl:
+                impostor.append(float(np.dot(q_feat, g_feats[g_idx])))
 
     scores     = np.array(genuine + impostor, dtype=np.float32)
     is_genuine = np.array([True] * len(genuine) + [False] * len(impostor))
     return scores, is_genuine
 
 
-def identification_acc_gallery_query(model, adaface,
-                                      gallery_loader, query_loader):
-    """
-    Closed-set identification accuracy:
-      For each query, find nearest gallery sample by cosine similarity.
-      Correct if the nearest gallery sample has the same identity label.
-    """
-    model.eval();  adaface.eval()
-
-    # Build gallery feature matrix
-    g_feats, g_labels = extract_features(model, gallery_loader)  # (N_g, D)
-
-    # Match each query against gallery
-    correct = total = 0
-    with torch.no_grad():
-        for imgs, labels in query_loader:
-            imgs   = imgs.to(DEVICE)
-            q_feat = F.normalize(model.get_features(imgs), dim=1).cpu().numpy()
-            # Cosine similarity: q_feat (B,D) @ g_feats.T (D,N_g) → (B, N_g)
-            sims   = q_feat @ g_feats.T
-            pred_idx    = sims.argmax(axis=1)          # nearest gallery index
-            pred_labels = g_labels[pred_idx]           # predicted identity
-            correct += int((pred_labels == labels.numpy()).sum())
-            total   += labels.size(0)
-
-    return correct / max(total, 1)
-
-
-def evaluate_gallery_query(model, adaface, gallery_loader, query_loader):
-    """
-    Full eval: identification accuracy + verification EER.
-    Gallery = probe reference, Query = probes.
-    Returns (id_acc, eer).
-    """
-    g_feats, g_labels = extract_features(model, gallery_loader)
-    q_feats, q_labels = extract_features(model, query_loader)
-
-    # Identification accuracy (query → nearest gallery)
-    sims        = q_feats @ g_feats.T               # (N_q, N_g)
-    pred_labels = g_labels[sims.argmax(axis=1)]
-    id_acc      = float((pred_labels == q_labels).mean())
-
-    # Verification EER (genuine/impostor pairs, query as probe)
-    scores, is_genuine = build_pairs_gallery_query(
-        g_feats, g_labels, q_feats, q_labels
-    )
-    _, eer = compute_eer_and_acc(scores, is_genuine)
-
-    return id_acc, eer
-
-
-def evaluate_single_set(model, loader):
-    """
-    Verification EER within a single set (all-vs-all pairs).
-    Used for target domain evaluation where there is no separate gallery/query.
-    Returns (id_acc_via_cosine_logits, eer).
-    """
-    feats, labels = extract_features(model, loader)
+def build_pairs_single_set(feats, labels):
+    """All genuine pairs + random impostor pairs within one set."""
     rng = np.random.RandomState(42)
-    genuine, impostor = [], []
-
     by_id = defaultdict(list)
     for idx, lbl in enumerate(labels):
         by_id[lbl].append(idx)
 
+    genuine, impostor = [], []
     for uid, idxs in by_id.items():
         for i in range(len(idxs)):
             for j in range(i + 1, len(idxs)):
@@ -642,21 +548,38 @@ def evaluate_single_set(model, loader):
 
     scores     = np.array(genuine + impostor, dtype=np.float32)
     is_genuine = np.array([True] * len(genuine) + [False] * len(impostor))
-    acc, eer   = compute_eer_and_acc(scores, is_genuine)
-    return acc, eer
+    return scores, is_genuine
 
 
-@torch.no_grad()
-def pseudo_acceptance_rate(teacher, adaface, loader, threshold):
-    """Fraction of target samples whose max confidence >= threshold."""
-    teacher.eval()
-    accept = total = 0
-    for imgs, _ in loader:
-        feat, _ = teacher(imgs.to(DEVICE))
-        max_p   = F.softmax(adaface.get_logits(feat), dim=1).max(dim=1).values
-        accept += (max_p >= threshold).sum().item()
-        total  += imgs.size(0)
-    return accept / max(total, 1)
+def evaluate_source(model, gallery_loader, query_loader):
+    """
+    Source domain: query → gallery.
+    Returns (rank1_acc, eer).
+    Rank-1: each query matched to nearest gallery sample.
+    EER   : genuine/impostor pairs, query as probe.
+    """
+    g_feats, g_labels = extract_features(model, gallery_loader)
+    q_feats, q_labels = extract_features(model, query_loader)
+
+    r1  = rank1_gallery_query(g_feats, g_labels, q_feats, q_labels)
+    scores, is_genuine = build_pairs_gallery_query(
+        g_feats, g_labels, q_feats, q_labels)
+    eer = compute_eer(scores, is_genuine)
+    return r1, eer
+
+
+def evaluate_target(model, loader):
+    """
+    Target domain: all-vs-all (no separate gallery).
+    Returns (rank1_acc, eer).
+    Rank-1: each sample matched to nearest neighbour (self excluded).
+    EER   : all genuine/impostor pairs within set.
+    """
+    feats, labels = extract_features(model, loader)
+    r1            = rank1_single_set(feats, labels)
+    scores, is_genuine = build_pairs_single_set(feats, labels)
+    eer           = compute_eer(scores, is_genuine)
+    return r1, eer
 
 
 # =============================================================================
@@ -665,64 +588,45 @@ def pseudo_acceptance_rate(teacher, adaface, loader, threshold):
 
 set_seed(SEED)
 
-log("=" * 75)
-log(f"TSCAN v4  |  {SOURCE_SPECTRUM} → {TARGET_SPECTRUM}  |  device={DEVICE}")
-log(f"Source split: {int((1-EVAL_SPLIT)*100)}% gallery (train) / "
-    f"{int(EVAL_SPLIT*100)}% query (eval)  — stratified per identity")
-log("=" * 75)
+log("=" * 72)
+log(f"TSCAN v5  |  {SOURCE_SPECTRUM} → {TARGET_SPECTRUM}  |  device={DEVICE}")
+log(f"Accuracy metric : Rank-1 (query → nearest gallery sample)")
+log(f"Source split    : {int((1-EVAL_SPLIT)*100)}% gallery / "
+    f"{int(EVAL_SPLIT*100)}% query  (stratified per identity)")
+log("=" * 72)
 
-# ── Source domain split ───────────────────────────────────────────────────────
-all_source_records = scan_spectrum(SOURCE_SPECTRUM)
-assert all_source_records, f"No source images found for spectrum '{SOURCE_SPECTRUM}'"
+# Source split
+all_src       = scan_spectrum(SOURCE_SPECTRUM)
+assert all_src, f"No source images for '{SOURCE_SPECTRUM}'"
+gallery_recs, query_recs = stratified_split(all_src, EVAL_SPLIT)
+LABEL_MAP     = build_label_map(all_src)
+NUM_CLASSES   = len(LABEL_MAP)
 
-gallery_records, query_records = stratified_split(all_source_records, EVAL_SPLIT)
+log(f"Source [{SOURCE_SPECTRUM}] : {len(all_src)} total | "
+    f"gallery={len(gallery_recs)} | query={len(query_recs)} | "
+    f"identities={NUM_CLASSES}")
+log(f"Target [{TARGET_SPECTRUM}] : {len(scan_spectrum(TARGET_SPECTRUM))} images")
 
-# Label map built from ALL source records so gallery and query share indices
-LABEL_MAP   = build_label_map(all_source_records)
-NUM_CLASSES = len(LABEL_MAP)
-
-log(f"Source [{SOURCE_SPECTRUM}]: {len(all_source_records)} total images, "
-    f"{NUM_CLASSES} identities")
-log(f"  Gallery (train) : {len(gallery_records)} images "
-    f"({len(gallery_records)/len(all_source_records)*100:.1f}%)")
-log(f"  Query   (eval)  : {len(query_records)} images "
-    f"({len(query_records)/len(all_source_records)*100:.1f}%)")
-
-# Verify every identity appears in both sets
-gallery_ids = set(r[1] for r in gallery_records)
-query_ids   = set(r[1] for r in query_records)
-missing     = query_ids - gallery_ids
-if missing:
-    log(f"  WARNING: {len(missing)} identities in query have no gallery samples")
-
-target_records = scan_spectrum(TARGET_SPECTRUM)
-log(f"Target  [{TARGET_SPECTRUM}]: {len(target_records)} images (unlabeled for adaptation)")
-
-# ── DataLoaders ───────────────────────────────────────────────────────────────
-
-# Phase 1 training: gallery with training augmentation
+# DataLoaders
 s1_gallery_loader = DataLoader(
-    RecordDataset(gallery_records, weak_transform(), LABEL_MAP),
+    RecordDataset(gallery_recs, weak_transform(), LABEL_MAP),
     batch_size=S1_BATCH_SIZE, shuffle=True,
     num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=True)
 
-# Evaluation: gallery and query with deterministic transform
 gallery_eval_loader = DataLoader(
-    RecordDataset(gallery_records, eval_transform(), LABEL_MAP),
+    RecordDataset(gallery_recs, eval_transform(), LABEL_MAP),
     batch_size=128, shuffle=False, num_workers=NUM_WORKERS)
 
 query_eval_loader = DataLoader(
-    RecordDataset(query_records, eval_transform(), LABEL_MAP),
+    RecordDataset(query_recs, eval_transform(), LABEL_MAP),
     batch_size=128, shuffle=False, num_workers=NUM_WORKERS)
 
-# Target domain evaluation (all target images, eval transform)
 tgt_eval_loader = DataLoader(
-    RecordDataset(target_records, eval_transform(), LABEL_MAP),
+    RecordDataset(scan_spectrum(TARGET_SPECTRUM), eval_transform(), LABEL_MAP),
     batch_size=128, shuffle=False, num_workers=NUM_WORKERS)
 
-# Phase 2 loaders
 s2_gallery_loader = DataLoader(
-    RecordDataset(gallery_records, strong_transform(), LABEL_MAP),
+    RecordDataset(gallery_recs, strong_transform(), LABEL_MAP),
     batch_size=S2_BATCH_SIZE, shuffle=True,
     num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=True)
 
@@ -731,49 +635,45 @@ s2_tgt_loader = DataLoader(
     batch_size=S2_BATCH_SIZE, shuffle=True,
     num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=True)
 
-# ── Models ───────────────────────────────────────────────────────────────────
+# Models
 teacher = PalmNet(feat_dim=FEATURE_DIM, pretrained=True).to(DEVICE)
 adaface = AdaFaceLoss(num_classes=NUM_CLASSES, feat_dim=FEATURE_DIM,
-                      m0=ADAFACE_M0, m_min=ADAFACE_MMIN, s=ADAFACE_S).to(DEVICE)
+                      m0=ADAFACE_M0, m_min=ADAFACE_MMIN,
+                      s=ADAFACE_S).to(DEVICE)
 
 frozen_p   = sum(p.numel() for p in teacher.encoder.frozen_layers.parameters())
 backbone_p = sum(p.numel() for p in teacher.backbone_parameters())
 head_p     = sum(p.numel() for p in teacher.head_parameters())
-adaface_p  = sum(p.numel() for p in adaface.parameters())
-log(f"\nFrozen     : {frozen_p/1e6:.2f}M  (conv1, bn1, layer1, layer2)")
-log(f"Backbone   : {backbone_p/1e6:.2f}M  trainable (layer3+layer4)  LR={S1_LR_BACKBONE}")
-log(f"Head       : {head_p/1e6:.4f}M  trainable (linear+Tanh)    LR={S1_LR_HEAD}")
-log(f"AdaFace W  : {adaface_p/1e6:.4f}M  trainable                  LR={S1_LR_HEAD}")
+log(f"\nFrozen : {frozen_p/1e6:.2f}M | "
+    f"Backbone (trainable): {backbone_p/1e6:.2f}M | "
+    f"Head: {head_p/1e6:.4f}M | "
+    f"AdaFace W: {sum(p.numel() for p in adaface.parameters())/1e6:.4f}M")
 
 
 # =============================================================================
 # PHASE 1 — TEACHER INITIALIZATION
 # =============================================================================
 
-log("\n" + "=" * 75)
+log("\n" + "=" * 72)
 log("PHASE 1 — Teacher Initialization")
-log(f"  Training on: gallery ({int((1-EVAL_SPLIT)*100)}% of source)")
-log(f"  Evaluation : query→gallery  (source held-out)")
-log(f"               all-vs-all     (target domain)\n")
-hdr = (f"{'Epoch':>6}  {'Loss':>8}  "
-       f"{'Eval ID':>8}  {'Eval EER':>9}  "
-       f"{'Tgt ID':>8}  {'Tgt EER':>8}  "
-       f"{'Pseudo%':>8}")
-log(hdr)
-log("-" * 75)
+log("  Rank-1: each query matched to nearest gallery sample (cosine sim)")
+log("  EER   : genuine/impostor pairs, query as probe, gallery as reference\n")
+log(f"{'Epoch':>6}  {'Loss':>8}  "
+    f"{'Src R1':>8}  {'Src EER':>8}  "
+    f"{'Tgt R1':>8}  {'Tgt EER':>8}")
+log("-" * 56)
 
 s1_optimizer = optim.AdamW([
     {'params': teacher.backbone_parameters(), 'lr': S1_LR_BACKBONE},
     {'params': teacher.head_parameters(),     'lr': S1_LR_HEAD},
     {'params': adaface.parameters(),          'lr': S1_LR_HEAD},
 ], weight_decay=S1_WEIGHT_DECAY)
-
 s1_scheduler = make_warmup_cosine_scheduler(
     s1_optimizer, S1_WARMUP_EPOCHS, S1_EPOCHS)
 
-best_s1_eval_eer = 1.0
-best_s1_state    = None
-best_s1_adaface  = None
+best_s1_eer    = 1.0
+best_s1_state  = None
+best_s1_adaface = None
 
 for epoch in range(1, S1_EPOCHS + 1):
     teacher.train();  adaface.train()
@@ -795,61 +695,62 @@ for epoch in range(1, S1_EPOCHS + 1):
     s1_scheduler.step()
 
     if epoch % EVAL_EVERY == 0 or epoch == S1_EPOCHS:
-        # Source: query probes matched against gallery
-        eval_id, eval_eer = evaluate_gallery_query(
-            teacher, adaface, gallery_eval_loader, query_eval_loader)
+        src_r1, src_eer = evaluate_source(teacher,
+                                           gallery_eval_loader,
+                                           query_eval_loader)
+        tgt_r1, tgt_eer = evaluate_target(teacher, tgt_eval_loader)
 
-        # Target: all-vs-all within target spectrum
-        tgt_id, tgt_eer = evaluate_single_set(teacher, tgt_eval_loader)
-
-        # Pseudo-label acceptance rate on target
-        pseudo_pct = pseudo_acceptance_rate(
-            teacher, adaface, tgt_eval_loader, PSEUDO_LABEL_THRESH) * 100
-
+        marker = " ★" if src_eer < best_s1_eer else ""
         log(f"{epoch:>6}  {loss_m.avg:>8.4f}  "
-            f"{eval_id*100:>7.2f}%  {eval_eer*100:>8.2f}%  "
-            f"{tgt_id*100:>7.2f}%  {tgt_eer*100:>7.2f}%  "
-            f"{pseudo_pct:>7.1f}%")
+            f"{src_r1*100:>7.2f}%  {src_eer*100:>7.2f}%  "
+            f"{tgt_r1*100:>7.2f}%  {tgt_eer*100:>7.2f}%{marker}")
 
-        # Save best by source eval EER (held-out, not target)
-        if eval_eer < best_s1_eval_eer:
-            best_s1_eval_eer = eval_eer
-            best_s1_state    = copy.deepcopy(teacher.state_dict())
-            best_s1_adaface  = copy.deepcopy(adaface.state_dict())
-            log(f"         ★ best Eval EER so far")
+        if src_eer < best_s1_eer:
+            best_s1_eer     = src_eer
+            best_s1_state   = copy.deepcopy(teacher.state_dict())
+            best_s1_adaface = copy.deepcopy(adaface.state_dict())
     else:
         log(f"{epoch:>6}  {loss_m.avg:>8.4f}")
 
-log("-" * 75)
-log(f"Phase 1 done  |  Best Src Eval EER = {best_s1_eval_eer*100:.2f}%")
+log("-" * 56)
+log(f"Phase 1 done  |  Best Src EER = {best_s1_eer*100:.2f}%")
+
+# Record Phase 1 target baseline for Phase 2 comparison
+teacher.load_state_dict(best_s1_state)
+adaface.load_state_dict(best_s1_adaface)
+p1_tgt_r1, p1_tgt_eer = evaluate_target(teacher, tgt_eval_loader)
+log(f"Phase 1 target baseline  →  Rank-1={p1_tgt_r1*100:.2f}%  "
+    f"EER={p1_tgt_eer*100:.2f}%")
 
 
 # =============================================================================
 # PHASE 2 — TEACHER-STUDENT CO-LEARNING
 # =============================================================================
 
-log("\n" + "=" * 75)
+log("\n" + "=" * 72)
 log("PHASE 2 — Teacher-Student Co-Learning (Domain Adaptation)")
-log(f"  Source gallery → student (labeled)   |   Target → teacher pseudo-labels\n")
-hdr2 = (f"{'Epoch':>6}  {'L_total':>8}  {'L_sup':>7}  "
-        f"{'L_uns':>7}  {'L_dis':>7}  {'Pseudo%':>8}  "
-        f"{'Eval ID':>8}  {'Eval EER':>9}  "
-        f"{'Tgt ID':>8}  {'Tgt EER':>8}")
-log(hdr2)
-log("-" * 85)
+log("  Src Rank-1/EER : student performance on source query→gallery")
+log("                   (tracks: is student forgetting source knowledge?)")
+log("  Tgt Rank-1/EER : student performance on target all-vs-all")
+log("                   (tracks: is adaptation actually working?)")
+log(f"  Phase-1 target baseline: "
+    f"Rank-1={p1_tgt_r1*100:.2f}%  EER={p1_tgt_eer*100:.2f}%\n")
 
-# Load best Phase 1 weights
-teacher.load_state_dict(best_s1_state)
-adaface.load_state_dict(best_s1_adaface)
+log(f"{'Epoch':>6}  {'L_total':>8}  {'L_sup':>7}  "
+    f"{'L_uns':>7}  {'L_dis':>7}  "
+    f"{'Src R1':>8}  {'Src EER':>8}  "
+    f"{'Tgt R1':>8}  {'Tgt EER':>8}")
+log("-" * 75)
 
+# Initialise student from best Phase 1 teacher
 student = PalmNet(feat_dim=FEATURE_DIM, pretrained=True).to(DEVICE)
-student.load_state_dict(best_s1_state)   # start identical to teacher
+student.load_state_dict(best_s1_state)
 
 discriminator = DomainDiscriminator(
     feat_dim=FEATURE_DIM, hidden=128, alpha=1.0).to(DEVICE)
 
-for p in teacher.parameters():          # teacher: EMA only, no gradient
-    p.requires_grad = False
+for p in teacher.parameters():
+    p.requires_grad = False    # teacher: EMA only
 
 s2_optimizer = optim.AdamW([
     {'params': student.backbone_parameters(), 'lr': S2_LR_BACKBONE},
@@ -857,12 +758,12 @@ s2_optimizer = optim.AdamW([
     {'params': adaface.parameters(),          'lr': S2_LR_HEAD},
     {'params': discriminator.parameters(),    'lr': S2_LR_HEAD},
 ], weight_decay=S2_WEIGHT_DECAY)
-
 s2_scheduler = make_warmup_cosine_scheduler(
     s2_optimizer, S2_WARMUP_EPOCHS, S2_EPOCHS)
 
-total_steps = len(s2_gallery_loader) * S2_EPOCHS
-global_step = 0
+best_s2_tgt_eer = p1_tgt_eer    # must beat Phase 1 baseline to count
+total_steps     = len(s2_gallery_loader) * S2_EPOCHS
+global_step     = 0
 
 for epoch in range(1, S2_EPOCHS + 1):
     student.train();  teacher.eval()
@@ -870,7 +771,6 @@ for epoch in range(1, S2_EPOCHS + 1):
 
     loss_t_m = AverageMeter();  loss_s_m = AverageMeter()
     loss_u_m = AverageMeter();  loss_d_m = AverageMeter()
-    pseudo_m = AverageMeter()
 
     max_steps = max(len(s2_gallery_loader), len(s2_tgt_loader))
     src_iter  = itertools.cycle(s2_gallery_loader)
@@ -911,27 +811,39 @@ for epoch in range(1, S2_EPOCHS + 1):
         loss_s_m.update(L_sup.item(),   bs)
         loss_u_m.update(L_unsup.item() if mask.any() else 0., bs)
         loss_d_m.update(L_dis.item(),   bs)
-        pseudo_m.update(mask.float().mean().item(), bs)
         global_step += 1
 
     s2_scheduler.step()
 
     if epoch % EVAL_EVERY == 0 or epoch == S2_EPOCHS:
-        # Source: query→gallery (same split as Phase 1)
-        eval_id, eval_eer = evaluate_gallery_query(
-            student, adaface, gallery_eval_loader, query_eval_loader)
-        # Target: all-vs-all
-        tgt_id, tgt_eer   = evaluate_single_set(student, tgt_eval_loader)
+        src_r1, src_eer = evaluate_source(student,
+                                           gallery_eval_loader,
+                                           query_eval_loader)
+        tgt_r1, tgt_eer = evaluate_target(student, tgt_eval_loader)
+
+        # Show delta vs Phase 1 target baseline
+        delta_r1  = (tgt_r1  - p1_tgt_r1)  * 100
+        delta_eer = (p1_tgt_eer - tgt_eer) * 100   # positive = improvement
+        marker = (f"  [Tgt EER Δ{delta_eer:+.2f}%  R1 Δ{delta_r1:+.2f}%]"
+                  if epoch % EVAL_EVERY == 0 else "")
 
         log(f"{epoch:>6}  {loss_t_m.avg:>8.4f}  {loss_s_m.avg:>7.4f}  "
             f"{loss_u_m.avg:>7.4f}  {loss_d_m.avg:>7.4f}  "
-            f"{pseudo_m.avg*100:>7.1f}%  "
-            f"{eval_id*100:>7.2f}%  {eval_eer*100:>8.2f}%  "
-            f"{tgt_id*100:>7.2f}%  {tgt_eer*100:>7.2f}%")
+            f"{src_r1*100:>7.2f}%  {src_eer*100:>7.2f}%  "
+            f"{tgt_r1*100:>7.2f}%  {tgt_eer*100:>7.2f}%{marker}")
+
+        if tgt_eer < best_s2_tgt_eer:
+            best_s2_tgt_eer = tgt_eer
+            log(f"         ★ best target EER so far  ({tgt_eer*100:.2f}%)")
     else:
         log(f"{epoch:>6}  {loss_t_m.avg:>8.4f}  {loss_s_m.avg:>7.4f}  "
-            f"{loss_u_m.avg:>7.4f}  {loss_d_m.avg:>7.4f}  "
-            f"{pseudo_m.avg*100:>7.1f}%")
+            f"{loss_u_m.avg:>7.4f}  {loss_d_m.avg:>7.4f}")
 
-log("-" * 85)
-log("TSCAN v4 complete.")
+log("-" * 75)
+log(f"\nFinal summary:")
+log(f"  Phase 1 source  →  Src EER={best_s1_eer*100:.2f}%")
+log(f"  Phase 1 target  →  Tgt R1={p1_tgt_r1*100:.2f}%  "
+    f"Tgt EER={p1_tgt_eer*100:.2f}%")
+log(f"  Phase 2 best    →  Tgt EER={best_s2_tgt_eer*100:.2f}%  "
+    f"(Δ {(p1_tgt_eer-best_s2_tgt_eer)*100:+.2f}%)")
+log("TSCAN v5 complete.")
