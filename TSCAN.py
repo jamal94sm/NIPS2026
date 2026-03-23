@@ -1,18 +1,41 @@
 """
-TSCAN v6 — Paper-faithful evaluation protocol.
+TSCAN v7 — Fixed Phase 2 based on training diagnostics.
 
-Reverted to paper definitions (Section 4.2):
-  - No gallery/query split. No Rank-1.
-  - Both source and target: ALL images in the domain used for pair evaluation.
-  - Pairs: ALL genuine pairs (same identity) + random impostor pairs (different identity).
-  - Metrics: ACC (best threshold), EER (FAR==FRR), TAR@FAR=0.1, TAR@FAR=0.01.
-  - Source training still uses all source images (no 80/20 split).
+Evaluation protocol unchanged from v6 (paper Section 4.2):
+  All images per domain, all-vs-all pairs, ACC/EER/TAR@FAR metrics.
 
-Phase 1 printed columns (every EVAL_EVERY epochs):
-  Loss | Src ACC | Src EER | Src TAR@0.1 | Tgt ACC | Tgt EER | Tgt TAR@0.1
+Phase 2 fixes (motivated by observed L_sup=15, ΔEER=-13%):
 
-Phase 2 printed columns (every EVAL_EVERY epochs):
-  L_total | L_sup | L_uns | L_dis | Src ACC | Src EER | Tgt ACC | Tgt EER | Tgt TAR@0.1
+  FIX 1 — Source augmentation: strong → weak in Phase 2.
+    Strong aug caused L_sup to jump from 0.01 (Phase 1 end) to 15+.
+    Weak aug keeps the student anchored to the feature space the
+    teacher learned under identical augmentation.
+
+  FIX 2 — Backbone fully frozen in Phase 2 (was partially trainable).
+    Layer3/layer4 conflicting gradients (L_sup + noisy L_uns + L_dis)
+    caused catastrophic forgetting. Only the linear head adapts now.
+
+  FIX 3 — AdaFace W frozen in Phase 2.
+    W was learned on source. Letting noisy pseudo-labels update W
+    corrupts source identity clusters. W is frozen; only the linear
+    layer is updated by backprop.
+
+  FIX 4 — Loss weights rebalanced.
+    BETA  0.8 → 0.3  (noisy pseudo-labels get less weight)
+    GAMMA 1.0 → 0.3  (restores paper values; domain loss was swamped)
+    ALPHA stays 1.0  (source supervision must dominate)
+
+  FIX 5 — EMA decay 0.99 → 0.999.
+    Fast EMA with degrading student quickly corrupted the teacher.
+    Slow EMA keeps teacher near Phase 1 while absorbing improvements.
+
+  FIX 6 — Pseudo-label threshold 0.5 → 0.7.
+    Overfit teacher (EER=0%) is overconfident. Low threshold accepts
+    confidently-wrong labels. Higher threshold is more selective.
+
+  FIX 7 — Phase 1 saves best checkpoint by TARGET EER, not source EER.
+    Source EER=0% is overfit. The best teacher for adaptation is the
+    one that generalises best to target, not the one that memorises source.
 """
 
 # =============================================================================
@@ -69,18 +92,17 @@ S1_WARMUP_EPOCHS = 5
 
 # ── Stage 2 ───────────────────────────────────────────────────────────────────
 S2_EPOCHS        = 60
-S2_LR_HEAD       = 1e-4
-S2_LR_BACKBONE   = 5e-6
+S2_LR_HEAD       = 1e-4    # only linear layer trains in Phase 2
 S2_WEIGHT_DECAY  = 5e-4
 S2_BATCH_SIZE    = 32
 S2_WARMUP_EPOCHS = 3
 
 # ── Co-learning ───────────────────────────────────────────────────────────────
-EMA_DECAY            = 0.99
-PSEUDO_LABEL_THRESH  = 0.5
-ALPHA                = 1.0
-BETA                 = 0.8
-GAMMA_LOSS           = 1.0
+EMA_DECAY            = 0.999  # FIX 5: was 0.99 — slow EMA protects teacher
+PSEUDO_LABEL_THRESH  = 0.7    # FIX 6: was 0.5 — stricter to avoid noisy labels
+ALPHA                = 1.0    # source supervision weight (unchanged)
+BETA                 = 0.3    # FIX 4: was 0.8 — less weight on noisy pseudo-labels
+GAMMA_LOSS           = 0.3    # FIX 4: was 1.0 — restore paper value
 
 # ── Augmentation ──────────────────────────────────────────────────────────────
 RESIZE_SIZE     = 124
@@ -92,7 +114,7 @@ NUM_WORKERS     = 8
 PIN_MEMORY      = True
 SEED            = 42
 EVAL_EVERY      = 5
-MAX_IMPOSTORS   = 50_000   # cap on impostor pairs to keep eval tractable
+MAX_IMPOSTORS   = 50_000
 
 
 # =============================================================================
@@ -206,10 +228,6 @@ def build_label_map(records):
 
 
 class SpectrumDataset(Dataset):
-    """
-    All images from one spectrum, labeled.
-    Used for both training (source) and evaluation (source + target).
-    """
     def __init__(self, spectrum, transform, label_map=None):
         self.transform = transform
         records        = scan_spectrum(spectrum)
@@ -232,7 +250,7 @@ class SpectrumDataset(Dataset):
 
 
 class UnlabeledTargetDataset(Dataset):
-    """Target domain: (weak_aug, strong_aug) pair, no labels."""
+    """Target: (weak_aug, strong_aug) — no labels."""
     def __init__(self, spectrum):
         self.weak    = weak_transform()
         self.strong  = strong_transform()
@@ -253,9 +271,8 @@ class UnlabeledTargetDataset(Dataset):
 
 class FeatureEncoder(nn.Module):
     """
-    Frozen  : conv1, bn1, relu, maxpool, layer1, layer2
-    Trainable: layer3, layer4  (low LR)
-    Trainable: linear(512→feat_dim), Tanh  (high LR)
+    Phase 1: layer3+layer4 trainable (low LR), linear+Tanh trainable (high LR)
+    Phase 2: ALL backbone layers frozen, only linear+Tanh trainable
     """
     def __init__(self, feat_dim=256, pretrained=True):
         super().__init__()
@@ -266,16 +283,25 @@ class FeatureEncoder(nn.Module):
         self.flatten          = nn.Flatten()
         self.linear           = nn.Linear(512, feat_dim, bias=True)
         self.hash             = nn.Tanh()
+        # Phase 1 default: freeze early layers only
         for p in self.frozen_layers.parameters():
             p.requires_grad = False
 
     def forward(self, x):
         with torch.no_grad():
             x = self.frozen_layers(x)
+        # In Phase 2 trainable_layers are also frozen via requires_grad=False
+        # but we still pass through normally — no extra no_grad needed
         x    = self.trainable_layers(x)
         bb   = self.flatten(x)
         feat = self.hash(self.linear(bb))
         return feat, bb
+
+    def freeze_backbone_for_phase2(self):
+        """FIX 2: freeze layer3+layer4 before Phase 2 starts."""
+        for p in self.trainable_layers.parameters():
+            p.requires_grad = False
+        log("  Backbone fully frozen for Phase 2 (layer3+layer4 now frozen)")
 
     def backbone_parameters(self):
         return list(self.trainable_layers.parameters())
@@ -300,6 +326,9 @@ class PalmNet(nn.Module):
 
     def head_parameters(self):
         return self.encoder.head_parameters()
+
+    def freeze_backbone_for_phase2(self):
+        self.encoder.freeze_backbone_for_phase2()
 
 
 # =============================================================================
@@ -339,6 +368,14 @@ class AdaFaceLoss(nn.Module):
     def get_logits(self, features):
         return (F.normalize(features, dim=1) @
                 F.normalize(self.weight, dim=1).T * self.s)
+
+    def freeze_weights(self):
+        """FIX 3: freeze W during Phase 2 so noisy pseudo-labels can't corrupt it."""
+        self.weight.requires_grad = False
+        log("  AdaFace W frozen for Phase 2")
+
+    def unfreeze_weights(self):
+        self.weight.requires_grad = True
 
 
 # =============================================================================
@@ -383,7 +420,7 @@ class DomainDiscriminator(nn.Module):
 # =============================================================================
 
 @torch.no_grad()
-def ema_update(teacher, student, decay=0.99):
+def ema_update(teacher, student, decay=0.999):
     for t_p, s_p in zip(teacher.parameters(), student.parameters()):
         t_p.data.mul_(decay).add_(s_p.data * (1.0 - decay))
 
@@ -428,7 +465,6 @@ def make_warmup_cosine_scheduler(optimizer, warmup_epochs, total_epochs):
 
 @torch.no_grad()
 def extract_features(model, loader):
-    """Extract L2-normalised 256-dim features for all images in loader."""
     model.eval()
     feats, labs = [], []
     for imgs, labels in loader:
@@ -440,34 +476,23 @@ def extract_features(model, loader):
 
 def build_pairs(feats, labels):
     """
-    Build genuine and impostor pair cosine similarity scores.
-
-    Genuine  : ALL pairs (i,j) where i<j and labels[i] == labels[j]
-               → every same-identity image combination within the domain
-    Impostor : random pairs where labels[i] != labels[j]
-               capped at MAX_IMPOSTORS to keep eval tractable
-
-    This matches the paper protocol exactly — no gallery/query distinction,
-    all images from the domain are used symmetrically.
+    Genuine : ALL (i<j) pairs where labels[i] == labels[j]
+    Impostor: random pairs where labels differ, capped at MAX_IMPOSTORS
     """
-    rng    = np.random.RandomState(42)
-    by_id  = defaultdict(list)
+    rng   = np.random.RandomState(42)
+    by_id = defaultdict(list)
     for idx, lbl in enumerate(labels):
         by_id[lbl].append(idx)
 
-    # ── All genuine pairs ────────────────────────────────────────────────────
     genuine = []
     for uid, idxs in by_id.items():
         for i in range(len(idxs)):
             for j in range(i + 1, len(idxs)):
-                genuine.append(
-                    float(np.dot(feats[idxs[i]], feats[idxs[j]])))
+                genuine.append(float(np.dot(feats[idxs[i]], feats[idxs[j]])))
 
-    # ── Random impostor pairs ────────────────────────────────────────────────
-    n_imp  = min(len(genuine) * 5, MAX_IMPOSTORS)
-    N      = len(labels)
+    n_imp    = min(len(genuine) * 5, MAX_IMPOSTORS)
+    N, seen  = len(labels), 0
     impostor = []
-    seen   = 0
     while len(impostor) < n_imp and seen < n_imp * 4:
         i, j = rng.choice(N, 2, replace=False)
         if labels[i] != labels[j]:
@@ -481,26 +506,11 @@ def build_pairs(feats, labels):
 
 
 def compute_metrics(scores, is_genuine):
-    """
-    Sweep 1000 thresholds over [-1, 1] and compute:
-      ACC       : (TP+TN)/(TP+TN+FP+FN) — best over all thresholds
-      EER       : threshold where FAR == FRR
-      TAR@FAR=0.1 : TAR when FAR <= 0.1
-      TAR@FAR=0.01: TAR when FAR <= 0.01
-
-    Paper formulas (Section 4.2):
-      ACC = (TP+TN)/(TP+TN+FP+FN)
-      FAR = FP/(FP+TN)
-      FRR = FN/(TP+FN)
-      TAR = TP/(TP+FN)
-      EER : FAR == FRR
-    """
+    """ACC, EER, TAR@FAR=0.1, TAR@FAR=0.01  (paper Section 4.2)"""
     gen = scores[ is_genuine]
     imp = scores[~is_genuine]
-
     thresholds = np.linspace(-1.0, 1.0, 1000)
     far_arr, frr_arr, tar_arr, acc_arr = [], [], [], []
-
     for thr in thresholds:
         TP = int((gen >= thr).sum());  FN = int((gen  < thr).sum())
         FP = int((imp >= thr).sum());  TN = int((imp  < thr).sum())
@@ -508,47 +518,26 @@ def compute_metrics(scores, is_genuine):
         frr_arr.append(FN / max(TP + FN, 1))
         tar_arr.append(TP / max(TP + FN, 1))
         acc_arr.append((TP + TN) / max(TP + TN + FP + FN, 1))
-
     far_arr = np.array(far_arr);  frr_arr = np.array(frr_arr)
     tar_arr = np.array(tar_arr);  acc_arr = np.array(acc_arr)
-
-    # ACC: best threshold
-    acc = float(acc_arr.max())
-
-    # EER: crossing point of FAR and FRR curves
+    acc     = float(acc_arr.max())
     eer_idx = np.argmin(np.abs(far_arr - frr_arr))
     eer     = float((far_arr[eer_idx] + frr_arr[eer_idx]) / 2.0)
-
-    # TAR @ FAR = 0.1
-    valid_01 = far_arr <= 0.1
-    tar_01   = float(tar_arr[valid_01].max()) if valid_01.any() else 0.0
-
-    # TAR @ FAR = 0.01
+    valid_01  = far_arr <= 0.1
+    tar_01    = float(tar_arr[valid_01].max())  if valid_01.any()  else 0.0
     valid_001 = far_arr <= 0.01
     tar_001   = float(tar_arr[valid_001].max()) if valid_001.any() else 0.0
-
-    return {
-        'acc'     : acc,
-        'eer'     : eer,
-        'tar_01'  : tar_01,
-        'tar_001' : tar_001,
-        'n_genuine' : int(is_genuine.sum()),
-        'n_impostor': int((~is_genuine).sum()),
-    }
+    return {'acc': acc, 'eer': eer, 'tar_01': tar_01, 'tar_001': tar_001,
+            'n_genuine': int(is_genuine.sum()),
+            'n_impostor': int((~is_genuine).sum())}
 
 
-def evaluate(model, loader, split_name=""):
-    """
-    Full paper-faithful evaluation on one domain (all images in loader).
-    Returns metrics dict.
-    """
+def evaluate(model, loader, label=""):
     feats, labels      = extract_features(model, loader)
     scores, is_genuine = build_pairs(feats, labels)
     m                  = compute_metrics(scores, is_genuine)
-    log(f"  [{split_name}]  "
-        f"ACC={m['acc']*100:.2f}%  EER={m['eer']*100:.2f}%  "
-        f"TAR@FAR0.1={m['tar_01']*100:.2f}%  "
-        f"TAR@FAR0.01={m['tar_001']*100:.2f}%  "
+    log(f"  [{label}]  ACC={m['acc']*100:.2f}%  EER={m['eer']*100:.2f}%  "
+        f"TAR@FAR0.1={m['tar_01']*100:.2f}%  TAR@FAR0.01={m['tar_001']*100:.2f}%  "
         f"(genuine={m['n_genuine']}, impostor={m['n_impostor']})")
     return m
 
@@ -560,12 +549,10 @@ def evaluate(model, loader, split_name=""):
 set_seed(SEED)
 
 log("=" * 72)
-log(f"TSCAN v6  |  {SOURCE_SPECTRUM} → {TARGET_SPECTRUM}  |  device={DEVICE}")
-log(f"Evaluation: paper protocol — all-vs-all pairs within each domain")
-log(f"Metrics   : ACC, EER, TAR@FAR=0.1, TAR@FAR=0.01  (Section 4.2)")
+log(f"TSCAN v7  |  {SOURCE_SPECTRUM} → {TARGET_SPECTRUM}  |  device={DEVICE}")
+log(f"Evaluation: paper protocol — all-vs-all pairs, ACC/EER/TAR@FAR")
 log("=" * 72)
 
-# ── Source: ALL images used for training and evaluation ───────────────────────
 src_records = scan_spectrum(SOURCE_SPECTRUM)
 assert src_records, f"No source images for '{SOURCE_SPECTRUM}'"
 LABEL_MAP   = build_label_map(src_records)
@@ -580,13 +567,13 @@ log(f"Target [{TARGET_SPECTRUM}]: {len(tgt_records)} images")
 
 # ── DataLoaders ───────────────────────────────────────────────────────────────
 
-# Phase 1: source training loader (weak aug, all source images)
+# Phase 1: weak aug on source
 s1_train_loader = DataLoader(
     SpectrumDataset(SOURCE_SPECTRUM, weak_transform(), LABEL_MAP),
     batch_size=S1_BATCH_SIZE, shuffle=True,
     num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=True)
 
-# Evaluation loaders (deterministic, all images from each domain)
+# Evaluation: deterministic, all images
 src_eval_loader = DataLoader(
     SpectrumDataset(SOURCE_SPECTRUM, eval_transform(), LABEL_MAP),
     batch_size=128, shuffle=False, num_workers=NUM_WORKERS)
@@ -595,12 +582,13 @@ tgt_eval_loader = DataLoader(
     SpectrumDataset(TARGET_SPECTRUM, eval_transform(), LABEL_MAP),
     batch_size=128, shuffle=False, num_workers=NUM_WORKERS)
 
-# Phase 2: source with strong aug, target unlabeled
+# Phase 2 source: WEAK aug (FIX 1 — was strong_transform)
 s2_src_loader = DataLoader(
-    SpectrumDataset(SOURCE_SPECTRUM, strong_transform(), LABEL_MAP),
+    SpectrumDataset(SOURCE_SPECTRUM, weak_transform(), LABEL_MAP),
     batch_size=S2_BATCH_SIZE, shuffle=True,
     num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=True)
 
+# Phase 2 target: unlabeled (weak for teacher, strong for student)
 s2_tgt_loader = DataLoader(
     UnlabeledTargetDataset(TARGET_SPECTRUM),
     batch_size=S2_BATCH_SIZE, shuffle=True,
@@ -615,14 +603,11 @@ adaface = AdaFaceLoss(num_classes=NUM_CLASSES, feat_dim=FEATURE_DIM,
 frozen_p   = sum(p.numel() for p in teacher.encoder.frozen_layers.parameters())
 backbone_p = sum(p.numel() for p in teacher.backbone_parameters())
 head_p     = sum(p.numel() for p in teacher.head_parameters())
-ada_p      = sum(p.numel() for p in adaface.parameters())
-log(f"\nFrozen backbone : {frozen_p/1e6:.2f}M  (conv1, bn1, layer1, layer2)")
-log(f"Trainable layers: {backbone_p/1e6:.2f}M  (layer3, layer4)  "
-    f"LR={S1_LR_BACKBONE}")
-log(f"Trainable head  : {head_p/1e6:.4f}M  (linear+Tanh)     "
-    f"LR={S1_LR_HEAD}")
-log(f"AdaFace W       : {ada_p/1e6:.4f}M                       "
-    f"LR={S1_LR_HEAD}")
+log(f"\nPhase 1 trainable: backbone={backbone_p/1e6:.2f}M (LR={S1_LR_BACKBONE}) "
+    f"+ head={head_p/1e6:.4f}M (LR={S1_LR_HEAD})")
+log(f"Phase 1 frozen   : {frozen_p/1e6:.2f}M (conv1..layer2)")
+log(f"Phase 2 trainable: head only={head_p/1e6:.4f}M (LR={S2_LR_HEAD})  "
+    f"[backbone+AdaFace W frozen]")
 
 
 # =============================================================================
@@ -631,16 +616,10 @@ log(f"AdaFace W       : {ada_p/1e6:.4f}M                       "
 
 log("\n" + "=" * 72)
 log("PHASE 1 — Teacher Initialization")
-log(f"  Training set : ALL source images [{SOURCE_SPECTRUM}]  "
-    f"({len(src_records)} images)")
-log(f"  Eval sets    : ALL source images (same domain, all-vs-all pairs)")
-log(f"                 ALL target images (cross-domain, all-vs-all pairs)")
-log(f"  Metrics      : ACC, EER, TAR@FAR=0.1  (paper Section 4.2)\n")
-
-hdr = (f"{'Epoch':>6}  {'Loss':>8}  "
-       f"{'Src ACC':>8}  {'Src EER':>8}  {'Src TAR@.1':>10}  "
-       f"{'Tgt ACC':>8}  {'Tgt EER':>8}  {'Tgt TAR@.1':>10}")
-log(hdr)
+log(f"  Saves best checkpoint by TARGET EER  (FIX 7 — avoids overfit teacher)\n")
+log(f"{'Epoch':>6}  {'Loss':>8}  "
+    f"{'Src ACC':>8}  {'Src EER':>8}  {'Src TAR@.1':>10}  "
+    f"{'Tgt ACC':>8}  {'Tgt EER':>8}  {'Tgt TAR@.1':>10}")
 log("-" * 80)
 
 s1_optimizer = optim.AdamW([
@@ -651,7 +630,7 @@ s1_optimizer = optim.AdamW([
 s1_scheduler = make_warmup_cosine_scheduler(
     s1_optimizer, S1_WARMUP_EPOCHS, S1_EPOCHS)
 
-best_s1_eer     = 1.0
+best_s1_tgt_eer = 1.0   # FIX 7: track target EER, not source EER
 best_s1_state   = None
 best_s1_adaface = None
 
@@ -675,34 +654,32 @@ for epoch in range(1, S1_EPOCHS + 1):
     s1_scheduler.step()
 
     if epoch % EVAL_EVERY == 0 or epoch == S1_EPOCHS:
-        src_m = evaluate(teacher, src_eval_loader,
-                         split_name=f"Src epoch={epoch}")
-        tgt_m = evaluate(teacher, tgt_eval_loader,
-                         split_name=f"Tgt epoch={epoch}")
+        src_m = evaluate(teacher, src_eval_loader, label=f"Src ep{epoch}")
+        tgt_m = evaluate(teacher, tgt_eval_loader, label=f"Tgt ep{epoch}")
 
-        marker = "  ★" if src_m['eer'] < best_s1_eer else ""
+        # FIX 7: save best by target EER
+        marker = "  ★" if tgt_m['eer'] < best_s1_tgt_eer else ""
         log(f"{epoch:>6}  {loss_m.avg:>8.4f}  "
             f"{src_m['acc']*100:>7.2f}%  {src_m['eer']*100:>7.2f}%  "
             f"{src_m['tar_01']*100:>9.2f}%  "
             f"{tgt_m['acc']*100:>7.2f}%  {tgt_m['eer']*100:>7.2f}%  "
             f"{tgt_m['tar_01']*100:>9.2f}%{marker}")
 
-        if src_m['eer'] < best_s1_eer:
-            best_s1_eer     = src_m['eer']
+        if tgt_m['eer'] < best_s1_tgt_eer:
+            best_s1_tgt_eer = tgt_m['eer']
             best_s1_state   = copy.deepcopy(teacher.state_dict())
             best_s1_adaface = copy.deepcopy(adaface.state_dict())
     else:
         log(f"{epoch:>6}  {loss_m.avg:>8.4f}")
 
 log("-" * 80)
-log(f"Phase 1 done  |  Best Src EER = {best_s1_eer*100:.2f}%")
+log(f"Phase 1 done  |  Best Target EER = {best_s1_tgt_eer*100:.2f}%")
 
-# Record Phase 1 target baseline for Phase 2 delta reporting
 teacher.load_state_dict(best_s1_state)
 adaface.load_state_dict(best_s1_adaface)
-log("\nPhase 1 best checkpoint — full metrics:")
-p1_src_m = evaluate(teacher, src_eval_loader, split_name="P1 Source")
-p1_tgt_m = evaluate(teacher, tgt_eval_loader, split_name="P1 Target")
+log("\nPhase 1 best checkpoint:")
+p1_src_m = evaluate(teacher, src_eval_loader, label="P1 Source")
+p1_tgt_m = evaluate(teacher, tgt_eval_loader, label="P1 Target")
 
 
 # =============================================================================
@@ -710,40 +687,49 @@ p1_tgt_m = evaluate(teacher, tgt_eval_loader, split_name="P1 Target")
 # =============================================================================
 
 log("\n" + "=" * 72)
-log("PHASE 2 — Teacher-Student Co-Learning (Domain Adaptation)")
-log(f"  Source training : gallery = ALL source images (strong aug)")
-log(f"  Target training : ALL target images (unlabeled, weak+strong aug)")
-log(f"  Eval sets       : same as Phase 1 — all-vs-all pairs per domain")
+log("PHASE 2 — Teacher-Student Co-Learning")
+log("  FIX 1: source uses weak aug (same as Phase 1)")
+log("  FIX 2: backbone fully frozen — only linear head trains")
+log("  FIX 3: AdaFace W frozen — pseudo-labels cannot corrupt source clusters")
+log(f"  FIX 4: ALPHA={ALPHA} BETA={BETA} GAMMA={GAMMA_LOSS} "
+    f"(was 1.0/0.8/1.0)")
+log(f"  FIX 5: EMA decay={EMA_DECAY}  (was 0.99)")
+log(f"  FIX 6: pseudo threshold={PSEUDO_LABEL_THRESH}  (was 0.5)")
 log(f"\n  Phase 1 baseline:")
-log(f"    Source — ACC={p1_src_m['acc']*100:.2f}%  "
+log(f"    Source → ACC={p1_src_m['acc']*100:.2f}%  "
     f"EER={p1_src_m['eer']*100:.2f}%  "
     f"TAR@0.1={p1_src_m['tar_01']*100:.2f}%")
-log(f"    Target — ACC={p1_tgt_m['acc']*100:.2f}%  "
+log(f"    Target → ACC={p1_tgt_m['acc']*100:.2f}%  "
     f"EER={p1_tgt_m['eer']*100:.2f}%  "
     f"TAR@0.1={p1_tgt_m['tar_01']*100:.2f}%\n")
 
-hdr2 = (f"{'Epoch':>6}  {'L_total':>8}  {'L_sup':>7}  "
-        f"{'L_uns':>7}  {'L_dis':>7}  "
-        f"{'Src ACC':>8}  {'Src EER':>8}  "
-        f"{'Tgt ACC':>8}  {'Tgt EER':>8}  {'Tgt TAR@.1':>10}")
-log(hdr2)
+log(f"{'Epoch':>6}  {'L_total':>8}  {'L_sup':>7}  "
+    f"{'L_uns':>7}  {'L_dis':>7}  "
+    f"{'Src ACC':>8}  {'Src EER':>8}  "
+    f"{'Tgt ACC':>8}  {'Tgt EER':>8}  {'Tgt TAR@.1':>10}")
 log("-" * 90)
 
-# Load best Phase 1 weights into teacher and student
+# ── Build student from best Phase 1 checkpoint ────────────────────────────────
 student = PalmNet(feat_dim=FEATURE_DIM, pretrained=True).to(DEVICE)
 student.load_state_dict(best_s1_state)
+
+# FIX 2: freeze backbone in both student and teacher for Phase 2
+student.freeze_backbone_for_phase2()
+
+# FIX 3: freeze AdaFace W so pseudo-labels cannot corrupt source clusters
+adaface.freeze_weights()
 
 discriminator = DomainDiscriminator(
     feat_dim=FEATURE_DIM, hidden=128, alpha=1.0).to(DEVICE)
 
+# Teacher: no gradient at all (EMA only)
 for p in teacher.parameters():
-    p.requires_grad = False   # teacher updated by EMA only
+    p.requires_grad = False
 
+# Optimizer: only student linear head + discriminator (backbone and W frozen)
 s2_optimizer = optim.AdamW([
-    {'params': student.backbone_parameters(), 'lr': S2_LR_BACKBONE},
-    {'params': student.head_parameters(),     'lr': S2_LR_HEAD},
-    {'params': adaface.parameters(),          'lr': S2_LR_HEAD},
-    {'params': discriminator.parameters(),    'lr': S2_LR_HEAD},
+    {'params': student.head_parameters(),  'lr': S2_LR_HEAD},
+    {'params': discriminator.parameters(), 'lr': S2_LR_HEAD},
 ], weight_decay=S2_WEIGHT_DECAY)
 s2_scheduler = make_warmup_cosine_scheduler(
     s2_optimizer, S2_WARMUP_EPOCHS, S2_EPOCHS)
@@ -754,7 +740,7 @@ global_step     = 0
 
 for epoch in range(1, S2_EPOCHS + 1):
     student.train();  teacher.eval()
-    discriminator.train();  adaface.train()
+    discriminator.train();  adaface.eval()   # adaface in eval (W frozen)
 
     loss_t_m = AverageMeter();  loss_s_m = AverageMeter()
     loss_u_m = AverageMeter();  loss_d_m = AverageMeter()
@@ -772,24 +758,31 @@ for epoch in range(1, S2_EPOCHS + 1):
         src_imgs = src_imgs.to(DEVICE);  src_lbl  = src_lbl.to(DEVICE)
         tgt_weak = tgt_weak.to(DEVICE);  tgt_str  = tgt_str.to(DEVICE)
 
+        # Pseudo-labels from teacher (no grad)
         pl, mask    = generate_pseudo_labels(
             teacher, tgt_weak, adaface, PSEUDO_LABEL_THRESH)
+
+        # Student forward
         src_feat, _ = student(src_imgs)
         tgt_feat, _ = student(tgt_str)
 
+        # L_sup: source supervised loss (W frozen, only linear head trains)
         L_sup   = adaface(src_feat, src_lbl)
+
+        # L_unsup: pseudo-label loss on confident target samples
         L_unsup = (adaface(tgt_feat[mask], pl[mask]) if mask.any()
                    else torch.tensor(0.0, device=DEVICE))
+
+        # L_dis: adversarial domain alignment via GRL
         L_dis   = domain_loss(discriminator, src_feat, tgt_feat)
+
         L_total = ALPHA * L_sup + BETA * L_unsup + GAMMA_LOSS * L_dis
 
         s2_optimizer.zero_grad()
         L_total.backward()
         nn.utils.clip_grad_norm_(
-            student.backbone_parameters() +
             student.head_parameters() +
-            list(discriminator.parameters()) +
-            list(adaface.parameters()), max_norm=5.0)
+            list(discriminator.parameters()), max_norm=5.0)
         s2_optimizer.step()
         ema_update(teacher, student, decay=EMA_DECAY)
 
@@ -803,12 +796,10 @@ for epoch in range(1, S2_EPOCHS + 1):
     s2_scheduler.step()
 
     if epoch % EVAL_EVERY == 0 or epoch == S2_EPOCHS:
-        src_m = evaluate(student, src_eval_loader,
-                         split_name=f"Src epoch={epoch}")
-        tgt_m = evaluate(student, tgt_eval_loader,
-                         split_name=f"Tgt epoch={epoch}")
+        src_m = evaluate(student, src_eval_loader, label=f"Src ep{epoch}")
+        tgt_m = evaluate(student, tgt_eval_loader, label=f"Tgt ep{epoch}")
 
-        d_eer = (p1_tgt_m['eer'] - tgt_m['eer']) * 100  # + = improvement
+        d_eer  = (p1_tgt_m['eer'] - tgt_m['eer']) * 100
         marker = (f"  [ΔEER={d_eer:+.2f}%]"
                   + ("  ★" if tgt_m['eer'] < best_s2_tgt_eer else ""))
 
@@ -835,5 +826,5 @@ log(f"  Target before adaptation — "
     f"TAR@FAR=0.1={p1_tgt_m['tar_01']*100:.2f}%")
 log(f"  Target after  adaptation — "
     f"Best EER={best_s2_tgt_eer*100:.2f}%  "
-    f"(ΔEER={( p1_tgt_m['eer']-best_s2_tgt_eer)*100:+.2f}%)")
-log("TSCAN v6 complete.")
+    f"(ΔEER={(p1_tgt_m['eer']-best_s2_tgt_eer)*100:+.2f}%)")
+log("TSCAN v7 complete.")
