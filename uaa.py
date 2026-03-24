@@ -47,7 +47,7 @@ CONFIG = {
     'gen_pretrain_epochs': 100,
     'gen_lr'             : 1e-3,
     'gen_save_path'      : 'checkpoints/generation_network_pretrained.pt',
-    'gan_finetune_epochs': 10,
+    'gan_finetune_epochs': 100,
 
     # ── PGD ───────────────────────────────────────────────────────────────
     # FIX A: separate K per augmentation type — paper §4.3: K=1 geo, K=2 tex
