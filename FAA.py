@@ -278,7 +278,7 @@ def amp_phase_to_image(amplitude, phase):
 
 def log_amp_to_amp(log_amp):
     """Inverse of log1p: recover amplitude from log-amplitude."""
-    return torch.expm1(log_amp.clamp(min=0.0))
+    return torch.expm1(log_amp.clamp(min=0.0, max=10.0))  # clamp max: expm1(10)≈22026, prevents inf→NaN in IFFT
 
 
 # ============================================================================
@@ -332,7 +332,7 @@ class ConvVAE(nn.Module):
     def encode(self, log_amp):
         h      = self.encoder(log_amp).flatten(1)
         mu     = self.fc_mu(h)
-        logvar = self.fc_logvar(h)
+        logvar = self.fc_logvar(h).clamp(-10.0, 10.0)  # prevent exp() explosion → NaN
         return mu, logvar
 
     def reparameterise(self, mu, logvar):
@@ -671,7 +671,11 @@ class Evaluator:
 
         all_s = np.concatenate([gen_s, imp_s])
         all_l = np.concatenate([np.ones(len(gen_s)), np.zeros(len(imp_s))])
-        fpr, tpr, _ = roc_curve(all_l, all_s)
+        valid = np.isfinite(all_s)  # guard: NaN scores crash roc_curve
+        if valid.sum() < 2:
+            results['EER'] = float('nan')
+            return results, gen_s, imp_s
+        fpr, tpr, _ = roc_curve(all_l[valid], all_s[valid])
         diff = np.abs(fpr - (1 - tpr))
         eer_idx = np.argmin(diff)
         results['EER'] = float((fpr[eer_idx] + (1 - tpr[eer_idx])) / 2)
