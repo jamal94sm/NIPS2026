@@ -67,7 +67,6 @@ K           = 4     # support images per class               (paper: 4)
 Q_PER_CLASS = 4     # query images per class  (not specified; match K)
 
 EPISODES_PER_EPOCH = 200
-VAL_EPISODES       = 100          # validation episodes (informational only)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 EMBED_DIM  = 128    # embedding dimensionality                (paper: 128)
@@ -80,7 +79,7 @@ GAMMA  = 0.5        # similarity margin for weighting        (paper: 0.5 optimal
 MARGIN = 0.05       # hard-mining margin m                   (paper: 0.05 optimal)
 
 # ── Training ──────────────────────────────────────────────────────────────────
-NUM_EPOCHS   = 100
+NUM_EPOCHS   = 60
 LR           = 2e-4             # Adam base lr                (paper: 0.0002)
 WEIGHT_DECAY = 1e-4
 LR_STEP      = 20               # StepLR: decay every N epochs
@@ -275,30 +274,43 @@ class EpisodeSampler:
 
 class W2MLModel(nn.Module):
     """
-    ResNet-18 with partial freezing:
-      layers 0-6  (conv1 … layer3) : frozen  — stable low-level features
-      layer4 + avgpool              : trainable at LR/10 — adapts to palmprint textures
-      embed head (Dropout + Linear) : trainable at full LR
+    ResNet-18 with fine-grained partial freezing:
 
-    ResNet-18 children layout (index in nn.Sequential after removing fc):
-      0: conv1  1: bn1  2: relu  3: maxpool
-      4: layer1  5: layer2  6: layer3  7: layer4  8: avgpool
+      Frozen  (conv1 … layer3 + layer4.block0) : generic low/mid-level features
+      Trainable at LR/10  (layer4.block1)      : last ~4.7M params, adapts to palmprints
+      Trainable at LR     (embed head)          : ~65K params, learns the metric space
+
+    Why only layer4 block1?
+      layer4 has 2 BasicBlocks totalling ~8.4M params — far too many for 108 identities.
+      Block1 alone (~4.7M) is the deepest part and most domain-specific; block0 acts as
+      a bridge from 256→512 channels and is safer to leave frozen.
+
+    ResNet-18 named modules used:
+      resnet.layer4[0]  — first BasicBlock  (256→512, has downsample conv)  : FROZEN
+      resnet.layer4[1]  — second BasicBlock (512→512, no downsample)        : trainable
     """
 
     def __init__(self):
         super().__init__()
         weights = models.ResNet18_Weights.IMAGENET1K_V1 if PRETRAINED else None
         resnet  = models.resnet18(weights=weights)
-        children = list(resnet.children())[:-1]         # drop original fc
-        self.backbone = nn.Sequential(*children)        # indices 0-8
 
-        # Freeze early layers (conv1 … layer3 = indices 0-6)
-        for idx in range(7):
-            for param in self.backbone[idx].parameters():
+        # Keep named submodules so we can address layer4 blocks directly
+        self.stem    = nn.Sequential(resnet.conv1, resnet.bn1,
+                                     resnet.relu, resnet.maxpool)
+        self.layer1  = resnet.layer1
+        self.layer2  = resnet.layer2
+        self.layer3  = resnet.layer3
+        self.layer4  = resnet.layer4   # 2 BasicBlocks
+        self.avgpool = resnet.avgpool
+
+        # Freeze: stem, layer1-3, and layer4 block0
+        for module in [self.stem, self.layer1, self.layer2,
+                       self.layer3, self.layer4[0]]:
+            for param in module.parameters():
                 param.requires_grad = False
 
-        # layer4 (index 7) and avgpool (index 8) remain trainable
-        # — they learn palmprint-specific high-level texture features
+        # layer4[1] and avgpool remain trainable (avgpool has no params)
 
         self.embed = nn.Sequential(
             nn.Flatten(),
@@ -307,19 +319,23 @@ class W2MLModel(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.normalize(self.embed(self.backbone(x)), p=2, dim=1)
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.avgpool(x)
+        return F.normalize(self.embed(x), p=2, dim=1)
 
     def param_groups(self, lr: float) -> list:
         """
         Differential learning rates:
-          layer4 + avgpool : lr / 10  (fine-tune carefully)
-          embed head       : lr       (train freely)
+          layer4[1] : lr / 10  — fine-tune the deepest block carefully
+          embed head : lr      — train the projection head freely
         """
-        fine_tune = list(self.backbone[7].parameters()) + \
-                    list(self.backbone[8].parameters())
         return [
-            {'params': fine_tune,           'lr': lr / 10},
-            {'params': self.embed.parameters(), 'lr': lr},
+            {'params': self.layer4[1].parameters(), 'lr': lr / 10},
+            {'params': self.embed.parameters(),      'lr': lr},
         ]
 
     def trainable_parameters(self):
