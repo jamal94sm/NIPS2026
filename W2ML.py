@@ -195,8 +195,12 @@ def get_transforms(train: bool = True) -> T.Compose:
     if train:
         return T.Compose([
             T.Resize((IMG_SIZE, IMG_SIZE)),
-            T.RandomHorizontalFlip(p=0.3),
-            T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomVerticalFlip(p=0.2),
+            T.RandomRotation(degrees=15),
+            T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
+            T.RandomGrayscale(p=0.1),
+            T.RandomErasing(p=0.2, scale=(0.02, 0.15)),   # simulate occlusion
             T.ToTensor(),
             T.Normalize(mean, std),
         ])
@@ -271,8 +275,11 @@ class EpisodeSampler:
 
 class W2MLModel(nn.Module):
     """
-    ResNet-18 backbone → Linear(512, 128) → L2-normalise.
-    L2-norm ensures: cosine_distance(a, b) = 1 − dot(a, b).
+    ResNet-18 backbone (frozen) → Dropout → Linear(512, 128) → L2-normalise.
+
+    Only the embedding head is trained.  The frozen ImageNet backbone provides
+    stable low-level features; the small trainable head learns the metric space.
+    Dropout regularises the head and reduces overfitting to train identities.
     """
 
     def __init__(self):
@@ -280,13 +287,25 @@ class W2MLModel(nn.Module):
         weights   = models.ResNet18_Weights.IMAGENET1K_V1 if PRETRAINED else None
         resnet    = models.resnet18(weights=weights)
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])  # (B,512,1,1)
-        self.embed    = nn.Sequential(
+
+        # Freeze all backbone parameters
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        self.embed = nn.Sequential(
             nn.Flatten(),
+            nn.Dropout(p=0.3),                          # regularise the head
             nn.Linear(512, EMBED_DIM, bias=False),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.normalize(self.embed(self.backbone(x)), p=2, dim=1)
+        with torch.no_grad():                           # no grad through backbone
+            feat = self.backbone(x)
+        return F.normalize(self.embed(feat), p=2, dim=1)
+
+    def trainable_parameters(self):
+        """Return only the embed head parameters for the optimiser."""
+        return self.embed.parameters()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -552,7 +571,11 @@ def main() -> None:
 
     # ── Model ────────────────────────────────────────────────────────────
     model     = W2MLModel().to(device)
-    optimizer = Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    n_total     = sum(p.numel() for p in model.parameters())
+    n_trainable = sum(p.numel() for p in model.trainable_parameters())
+    print(f"Params:    {n_trainable:,} trainable / {n_total:,} total "
+          f"(backbone frozen)\n")
+    optimizer = Adam(model.trainable_parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = StepLR(optimizer, step_size=LR_STEP, gamma=LR_GAMMA)
     os.makedirs(SAVE_DIR, exist_ok=True)
 
