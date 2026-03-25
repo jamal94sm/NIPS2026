@@ -81,7 +81,7 @@ MARGIN = 0.05       # hard-mining margin m                   (paper: 0.05 optima
 
 # ── Training ──────────────────────────────────────────────────────────────────
 NUM_EPOCHS   = 60
-LR           = 2e-4             # Adam base lr                (paper: 0.0002)
+LR           = 1e-4             # reduced: head-only training needs smaller LR
 WEIGHT_DECAY = 1e-4
 LR_STEP      = 20               # StepLR: decay every N epochs
 LR_GAMMA     = 0.5
@@ -275,20 +275,19 @@ class EpisodeSampler:
 
 class W2MLModel(nn.Module):
     """
-    ResNet-18 with fine-grained partial freezing:
+    ResNet-18 backbone fully frozen + trainable BN→Dropout→Linear head.
 
-      Frozen  (conv1 … layer3 + layer4.block0) : generic low/mid-level features
-      Trainable at LR/10  (layer4.block1)      : last ~4.7M params, adapts to palmprints
-      Trainable at LR     (embed head)          : ~65K params, learns the metric space
+    With only 108 train identities (~3 K images), any backbone fine-tuning
+    causes severe overfitting (train EER→3%, test EER stuck at 21%).
+    Solution: freeze the entire backbone and make the 65K embed head more
+    expressive by adding BatchNorm1d before the projection.
 
-    Why only layer4 block1?
-      layer4 has 2 BasicBlocks totalling ~8.4M params — far too many for 108 identities.
-      Block1 alone (~4.7M) is the deepest part and most domain-specific; block0 acts as
-      a bridge from 256→512 channels and is safer to leave frozen.
+      Frozen   : entire ResNet-18 backbone (ImageNet weights preserved)
+      Trainable: BN(512) → Dropout(0.3) → Linear(512→128)   [~66K params]
 
-    ResNet-18 named modules used:
-      resnet.layer4[0]  — first BasicBlock  (256→512, has downsample conv)  : FROZEN
-      resnet.layer4[1]  — second BasicBlock (512→512, no downsample)        : trainable
+    BatchNorm re-centres and re-scales the 512-d backbone features per
+    mini-batch, giving the head adaptive normalisation without adding
+    overfittable convolutional weights.
     """
 
     def __init__(self):
@@ -296,48 +295,41 @@ class W2MLModel(nn.Module):
         weights = models.ResNet18_Weights.IMAGENET1K_V1 if PRETRAINED else None
         resnet  = models.resnet18(weights=weights)
 
-        # Keep named submodules so we can address layer4 blocks directly
         self.stem    = nn.Sequential(resnet.conv1, resnet.bn1,
                                      resnet.relu, resnet.maxpool)
         self.layer1  = resnet.layer1
         self.layer2  = resnet.layer2
         self.layer3  = resnet.layer3
-        self.layer4  = resnet.layer4   # 2 BasicBlocks
+        self.layer4  = resnet.layer4
         self.avgpool = resnet.avgpool
 
-        # Freeze: stem, layer1-3, and layer4 block0
+        # Freeze entire backbone
         for module in [self.stem, self.layer1, self.layer2,
-                       self.layer3, self.layer4[0]]:
+                       self.layer3, self.layer4]:
             for param in module.parameters():
                 param.requires_grad = False
 
-        # layer4[1] and avgpool remain trainable (avgpool has no params)
-
+        # Trainable head: BN adapts feature scale, Dropout regularises
         self.embed = nn.Sequential(
             nn.Flatten(),
+            nn.BatchNorm1d(512),        # re-normalise backbone features
             nn.Dropout(p=0.3),
             nn.Linear(512, EMBED_DIM, bias=False),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-        x = self.avgpool(x)
+        with torch.no_grad():
+            x = self.stem(x)
+            x = self.layer1(x)
+            x = self.layer2(x)
+            x = self.layer3(x)
+            x = self.layer4(x)
+            x = self.avgpool(x)
         return F.normalize(self.embed(x), p=2, dim=1)
 
     def param_groups(self, lr: float) -> list:
-        """
-        Differential learning rates:
-          layer4[1] : lr / 10  — fine-tune the deepest block carefully
-          embed head : lr      — train the projection head freely
-        """
-        return [
-            {'params': self.layer4[1].parameters(), 'lr': lr / 10},
-            {'params': self.embed.parameters(),      'lr': lr},
-        ]
+        """Single group — only the embed head is trained."""
+        return [{'params': self.embed.parameters(), 'lr': lr}]
 
     def trainable_parameters(self):
         """All parameters that require grad (for counting)."""
@@ -610,7 +602,7 @@ def main() -> None:
     n_total     = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.trainable_parameters())
     print(f"Params:    {n_trainable:,} trainable / {n_total:,} total "
-          f"(conv1-layer3 frozen, layer4+head trainable)\n")
+          f"(backbone fully frozen, head only)\n")
     # Differential LR: layer4 at LR/10, embed head at full LR
     optimizer = Adam(model.param_groups(LR), weight_decay=WEIGHT_DECAY)
     scheduler = StepLR(optimizer, step_size=LR_STEP, gamma=LR_GAMMA)
