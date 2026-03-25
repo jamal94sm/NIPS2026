@@ -66,7 +66,8 @@ N           = 32    # number of classes per episode          (paper: 32)
 K           = 4     # support images per class               (paper: 4)
 Q_PER_CLASS = 4     # query images per class  (not specified; match K)
 
-EPISODES_PER_EPOCH = 200
+EPISODES_PER_EPOCH = 500
+VAL_EPISODES       = 200          # validation episodes (informational only)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 EMBED_DIM  = 128    # embedding dimensionality                (paper: 128)
