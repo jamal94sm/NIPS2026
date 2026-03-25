@@ -304,8 +304,7 @@ class W2MLModel(nn.Module):
         self.avgpool = resnet.avgpool
 
         # Freeze entire backbone
-        for module in [self.stem, self.layer1, self.layer2,
-                       self.layer3, self.layer4]:
+        for module in [self.stem, self.layer1, self.layer2]:
             for param in module.parameters():
                 param.requires_grad = False
 
@@ -313,7 +312,7 @@ class W2MLModel(nn.Module):
         self.embed = nn.Sequential(
             nn.Flatten(),
             nn.BatchNorm1d(512),        # re-normalise backbone features
-            nn.Dropout(p=0.3),
+            nn.Dropout(p=0.5),
             nn.Linear(512, EMBED_DIM, bias=False),
         )
 
