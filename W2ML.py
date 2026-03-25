@@ -200,9 +200,9 @@ def get_transforms(train: bool = True) -> T.Compose:
             T.RandomRotation(degrees=15),
             T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
             T.RandomGrayscale(p=0.1),
-            T.RandomErasing(p=0.2, scale=(0.02, 0.15)),   # simulate occlusion
             T.ToTensor(),
             T.Normalize(mean, std),
+            T.RandomErasing(p=0.2, scale=(0.02, 0.15)),   # must be after ToTensor
         ])
     return T.Compose([
         T.Resize((IMG_SIZE, IMG_SIZE)),
