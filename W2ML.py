@@ -42,7 +42,7 @@ from tqdm import tqdm
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-DATA_ROOT = "data/CASIA-MS"       # folder containing all ROI .jpg files
+DATA_ROOT = "/home/pai-ng/Jamal/CASIA-MS-ROI"       # folder containing all ROI .jpg files
 SAVE_DIR  = "checkpoints"         # where best.pth / latest.pth are written
 RESUME    = None                  # path to a .pth checkpoint to resume from
                                   # e.g. "checkpoints/best.pth"
