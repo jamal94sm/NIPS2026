@@ -317,8 +317,8 @@ def mine_hard_pairs(
     Eq. 5 — negative selected iff  d_neg > min(d_pos) - m
     Returns boolean masks (hard_pos_mask, hard_neg_mask).
     """
-    hard_pos_mask = pos_dists < neg_dists.max()  + MARGIN   # Eq. 4
-    hard_neg_mask = neg_dists > pos_dists.min()  - MARGIN   # Eq. 5
+    hard_pos_mask = pos_dists < neg_dists.max() + MARGIN    # Eq. 4
+    hard_neg_mask = neg_dists > pos_dists.min() - MARGIN    # Eq. 5
     return hard_pos_mask, hard_neg_mask
 
 
@@ -331,10 +331,17 @@ def w2ml_loss(
     """
     Eq. 8 — Episode loss averaged over all l query samples.
 
-    Positive term: (1/α) · log(1 + Σ_P exp(−α(d_p − γ)))
-    Negative term: (1/β) · log(1 + Σ_N exp(+β(d_n − γ)))
+    Loss is expressed in DISTANCE space (d = 1 − cosine_similarity).
+    Substituting S = 1 − d into the original similarity-space MS Loss gives:
 
-    Gradient of Eq. 8 w.r.t. d(x_q, x_s) equals the weights in Eq. 6 / 7.
+      Positive term: (1/α) · log(1 + Σ_P exp(+α(d_p − γ)))
+                     penalises large positive distances  ✓
+
+      Negative term: (1/β) · log(1 + Σ_N exp(−β(d_n − γ)))
+                     penalises small negative distances  ✓
+
+    FIX vs. original code: both exponent signs were inverted, causing the model
+    to push same-class embeddings apart and pull different-class ones together.
     """
     MAX_EXP = 80.0   # clamp to prevent inf with β=40
     dist_mat = 1.0 - torch.mm(query_embs, meta_embs.t())   # (Q, N)
@@ -361,12 +368,13 @@ def w2ml_loss(
         hp = pos_dists[hp_mask]
         hn = neg_dists[hn_mask]
 
-        # Eq. 8 positive term  (Eq. 6 weights are its implicit gradients)
-        pos_exp  = torch.clamp(-ALPHA * (hp - GAMMA), max=MAX_EXP)
+        # FIX: distance-space signs (were both inverted in original code)
+        # Eq. 8 positive term — penalise large positive distances
+        pos_exp  = torch.clamp(+ALPHA * (hp - GAMMA), max=MAX_EXP)   # was: -ALPHA
         pos_term = (1.0 / ALPHA) * torch.log1p(torch.exp(pos_exp).sum())
 
-        # Eq. 8 negative term  (Eq. 7 weights are its implicit gradients)
-        neg_exp  = torch.clamp( BETA  * (hn - GAMMA), max=MAX_EXP)
+        # Eq. 8 negative term — penalise small negative distances
+        neg_exp  = torch.clamp(-BETA  * (hn - GAMMA), max=MAX_EXP)   # was: +BETA
         neg_term = (1.0 / BETA)  * torch.log1p(torch.exp(neg_exp).sum())
 
         per_query_losses.append(pos_term + neg_term)
@@ -530,12 +538,17 @@ def main() -> None:
         raise ValueError(f"Unknown EVAL_PROTOCOL: {EVAL_PROTOCOL}")
 
     train_dataset = CASIAMSDataset(DATA_ROOT, train_ids, tr_spec,
-                                   get_transforms(train=True))
+                                   get_transforms(train=False))  # no augment for eval
     test_dataset  = CASIAMSDataset(DATA_ROOT, test_ids,  te_spec,
                                    get_transforms(train=False))
+
+    # Separate augmented dataset used only during training episodes
+    train_dataset_aug = CASIAMSDataset(DATA_ROOT, train_ids, tr_spec,
+                                       get_transforms(train=True))
+
     print(f"Samples:   {len(train_dataset)} train / {len(test_dataset)} test\n")
 
-    train_sampler = EpisodeSampler(train_dataset)
+    train_sampler = EpisodeSampler(train_dataset_aug)
 
     # ── Model ────────────────────────────────────────────────────────────
     model     = W2MLModel().to(device)
@@ -582,12 +595,22 @@ def main() -> None:
               f"avg_loss={epoch_loss/EPISODES_PER_EPOCH:.4f}  "
               f"time={elapsed:.0f}s")
 
-        # ── Epoch-end evaluation ─────────────────────────────────────────
-        metrics = evaluate(model, test_dataset, device, tag=EVAL_PROTOCOL)
-        acc, eer = metrics['accuracy'], metrics['eer']
+        # ── Epoch-end evaluation — train and test ────────────────────────
+        print("  Evaluating train set ...")
+        tr_metrics = evaluate(model, train_dataset, device, tag='train')
 
-        if eer < best_eer or (eer == best_eer and acc > best_acc):
-            best_eer, best_acc = eer, acc
+        print("  Evaluating test set ...")
+        te_metrics = evaluate(model, test_dataset,  device, tag=EVAL_PROTOCOL)
+
+        tr_acc, tr_eer = tr_metrics['accuracy'], tr_metrics['eer']
+        te_acc, te_eer = te_metrics['accuracy'], te_metrics['eer']
+
+        print(f"  Summary  │  Train: Acc={tr_acc*100:.2f}%  EER={tr_eer*100:.2f}%"
+              f"  │  Test:  Acc={te_acc*100:.2f}%  EER={te_eer*100:.2f}%")
+
+        # Save best checkpoint based on test EER (lower is better)
+        if te_eer < best_eer or (te_eer == best_eer and te_acc > best_acc):
+            best_eer, best_acc = te_eer, te_acc
             torch.save({
                 'epoch':     epoch + 1,
                 'model':     model.state_dict(),
@@ -596,7 +619,7 @@ def main() -> None:
                 'best_acc':  best_acc,
             }, os.path.join(SAVE_DIR, 'best.pth'))
             print(f"  ✓ Best checkpoint saved  "
-                  f"(EER={best_eer*100:.2f}%  Acc={best_acc*100:.2f}%)")
+                  f"(Test EER={best_eer*100:.2f}%  Test Acc={best_acc*100:.2f}%)")
 
         torch.save({
             'epoch':    epoch + 1,
@@ -618,7 +641,7 @@ def main() -> None:
                 print(f"  [{spec}] no samples — skip"); continue
             evaluate(model, ds, device, tag=f'spectrum={spec}')
 
-    print(f"\nDone.  Best EER={best_eer*100:.2f}%  Acc={best_acc*100:.2f}%")
+    print(f"\nDone.  Best Test EER={best_eer*100:.2f}%  Best Test Acc={best_acc*100:.2f}%")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
