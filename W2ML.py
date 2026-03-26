@@ -19,6 +19,7 @@ import os
 import random
 import time
 from collections import defaultdict
+from functools import partial
 from typing import Dict, List, Optional, Tuple
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -48,18 +49,20 @@ RESUME    = None                  # path to a .pth checkpoint to resume from
                                   # e.g. "checkpoints/best.pth"
 
 # ── Evaluation protocol ───────────────────────────────────────────────────────
-# 'cross_subject'  : train on first 50 % of subjects, test on last 50 %
+# 'cross_subject'  : train on TRAIN_RATIO of subjects, test on remainder
 #                   (all 6 spectra used for both splits)
 # 'cross_spectrum' : train on TRAIN_SPECTRA, test on TEST_SPECTRA
-#                   (still with a 50/50 subject split)
+#                   (still with TRAIN_RATIO subject split)
 EVAL_PROTOCOL  = 'cross_subject'
+TRAIN_RATIO    = 0.5              # fraction of subjects used for training
+                                  # e.g. 0.5 → 50/50, 0.7 → 70/30
 
 ALL_SPECTRA    = ['460', '630', '700', '850', '940', 'White']
 TRAIN_SPECTRA  = ['460', '630', '700']   # used only for cross_spectrum
 TEST_SPECTRA   = ['850', '940', 'White'] # used only for cross_spectrum
 
 # ── Image ─────────────────────────────────────────────────────────────────────
-IMG_SIZE = 224                    # paper uses 224 × 224 ROIs
+IMG_SIZE = 128                    # custom CNN trained from scratch; 128×128
 
 # ── Episode sampling  (Table 1) ───────────────────────────────────────────────
 N           = 32    # number of classes per episode          (paper: 32)
@@ -67,11 +70,9 @@ K           = 4     # support images per class               (paper: 4)
 Q_PER_CLASS = 4     # query images per class  (not specified; match K)
 
 EPISODES_PER_EPOCH = 500
-VAL_EPISODES       = 200          # validation episodes (informational only)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-EMBED_DIM  = 128    # embedding dimensionality                (paper: 128)
-PRETRAINED = True   # ImageNet init
+EMBED_DIM  = 128    # embedding dimensionality — matches FC3 output (paper: 128)
 
 # ── Loss hyper-parameters  (Section 3.3, optimal from Tables 5 & 6) ──────────
 ALPHA  = 2.0        # positive weighting scale               (paper: 2,  fixed)
@@ -81,7 +82,7 @@ MARGIN = 0.05       # hard-mining margin m                   (paper: 0.05 optima
 
 # ── Training ──────────────────────────────────────────────────────────────────
 NUM_EPOCHS   = 60
-LR           = 1e-4             # reduced: head-only training needs smaller LR
+LR           = 2e-4             # Adam base lr                (paper: 0.0002)
 WEIGHT_DECAY = 1e-4
 LR_STEP      = 20               # StepLR: decay every N epochs
 LR_GAMMA     = 0.5
@@ -119,16 +120,20 @@ def get_all_subjects(root: str) -> List[str]:
     return sorted(subjects)
 
 
-def split_subjects_50_50(root: str) -> Tuple[List[str], List[str]]:
+def split_subjects(root: str, train_ratio: float = TRAIN_RATIO
+                   ) -> Tuple[List[str], List[str]]:
     """
-    Open-set 50/50 subject split (Section 4.2):
-    first half → train, second half → test, zero category overlap.
+    Open-set subject split with configurable ratio (Section 4.2).
+    first (train_ratio * 100)% of subjects → train,
+    remaining subjects → test.  Zero category overlap guaranteed.
     Returns (train_identities, test_identities)  where identity = 'sub_side'.
     """
-    subjects = get_all_subjects(root)
-    mid      = len(subjects) // 2
-    train_subs = set(subjects[:mid])
-    test_subs  = set(subjects[mid:])
+    if not 0.0 < train_ratio < 1.0:
+        raise ValueError(f"TRAIN_RATIO must be in (0, 1), got {train_ratio}")
+    subjects   = get_all_subjects(root)
+    n_train    = max(1, int(len(subjects) * train_ratio))
+    train_subs = set(subjects[:n_train])
+    test_subs  = set(subjects[n_train:])
 
     all_ids = sorted({
         f"{p[0]}_{p[1]}"
@@ -270,70 +275,87 @@ class EpisodeSampler:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SECTION 3 — MODEL  (Section 4.2)
+#  SECTION 3 — MODEL  (custom CNN, trained from scratch)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class W2MLModel(nn.Module):
     """
-    ResNet-18 backbone fully frozen + trainable BN→Dropout→Linear head.
+    Custom CNN trained from scratch (no pretrained weights).
 
-    With only 108 train identities (~3 K images), any backbone fine-tuning
-    causes severe overfitting (train EER→3%, test EER stuck at 21%).
-    Solution: freeze the entire backbone and make the 65K embed head more
-    expressive by adding BatchNorm1d before the projection.
+    Architecture (from paper Figure):
+      Conv1 : 3×3, 16 filters, stride 4, Leaky ReLU(0.1)
+      MaxPool: 2×2, stride 1
+      Conv2 : 5×5, 32 filters, stride 2, Leaky ReLU(0.1)
+      MaxPool: 2×2, stride 1
+      Conv3 : 3×3, 64 filters, stride 1, Leaky ReLU(0.1)
+      Conv4 : 3×3, 128 filters, stride 1, Leaky ReLU(0.1)
+      MaxPool: 2×2, stride 1
+      FC1   : 1024, Leaky ReLU(0.1)
+      FC2   : 512,  Leaky ReLU(0.1)
+      FC3   : 128,  no activation  ← embedding output
+      L2-normalise → EMBED_DIM-d unit hypersphere
 
-      Frozen   : entire ResNet-18 backbone (ImageNet weights preserved)
-      Trainable: BN(512) → Dropout(0.3) → Linear(512→128)   [~66K params]
-
-    BatchNorm re-centres and re-scales the 512-d backbone features per
-    mini-batch, giving the head adaptive normalisation without adding
-    overfittable convolutional weights.
+    Input: IMG_SIZE × IMG_SIZE (128×128 recommended for this architecture)
     """
 
     def __init__(self):
         super().__init__()
-        weights = models.ResNet18_Weights.IMAGENET1K_V1 if PRETRAINED else None
-        resnet  = models.resnet18(weights=weights)
+        lrelu = partial(nn.LeakyReLU, negative_slope=0.1, inplace=True)
 
-        self.stem    = nn.Sequential(resnet.conv1, resnet.bn1,
-                                     resnet.relu, resnet.maxpool)
-        self.layer1  = resnet.layer1
-        self.layer2  = resnet.layer2
-        self.layer3  = resnet.layer3
-        self.layer4  = resnet.layer4
-        self.avgpool = resnet.avgpool
+        self.features = nn.Sequential(
+            # Conv block 1
+            nn.Conv2d(3, 16, kernel_size=3, stride=4, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            lrelu(),
+            nn.MaxPool2d(kernel_size=2, stride=1),
 
-        # Freeze entire backbone
-        for module in [self.stem, self.layer1, self.layer2]:
-            for param in module.parameters():
-                param.requires_grad = False
+            # Conv block 2
+            nn.Conv2d(16, 32, kernel_size=5, stride=2, padding=2, bias=False),
+            nn.BatchNorm2d(32),
+            lrelu(),
+            nn.MaxPool2d(kernel_size=2, stride=1),
 
-        # Trainable head: BN adapts feature scale, Dropout regularises
-        self.embed = nn.Sequential(
+            # Conv block 3
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            lrelu(),
+
+            # Conv block 4
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            lrelu(),
+            nn.MaxPool2d(kernel_size=2, stride=1),
+        )
+
+        # Compute flattened feature size dynamically
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, IMG_SIZE, IMG_SIZE)
+            feat_size = self.features(dummy).view(1, -1).shape[1]
+
+        self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.BatchNorm1d(512),        # re-normalise backbone features
-            nn.Dropout(p=0.5),
-            nn.Linear(512, EMBED_DIM, bias=False),
+            nn.Linear(feat_size, 1024, bias=False),
+            nn.BatchNorm1d(1024),
+            lrelu(),
+            nn.Dropout(p=0.3),
+
+            nn.Linear(1024, 512, bias=False),
+            nn.BatchNorm1d(512),
+            lrelu(),
+            nn.Dropout(p=0.3),
+
+            nn.Linear(512, EMBED_DIM, bias=False),   # FC3 — no activation
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            x = self.stem(x)
-            x = self.layer1(x)
-            x = self.layer2(x)
-            x = self.layer3(x)
-            x = self.layer4(x)
-            x = self.avgpool(x)
-        return F.normalize(self.embed(x), p=2, dim=1)
+        return F.normalize(self.classifier(self.features(x)), p=2, dim=1)
 
     def param_groups(self, lr: float) -> list:
-        """Single group — only the embed head is trained."""
-        return [{'params': self.embed.parameters(), 'lr': lr}]
+        """Single group — all parameters trained from scratch at the same LR."""
+        return [{'params': self.parameters(), 'lr': lr}]
 
     def trainable_parameters(self):
-        """All parameters that require grad (for counting)."""
-        return [p for p in self.parameters() if p.requires_grad]
-
+        return list(self.parameters())
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 4 — W2ML LOSS  (Equations 2–8)
@@ -568,9 +590,10 @@ def main() -> None:
     print(f"  Protocol : {EVAL_PROTOCOL}\n")
 
     # ── Build datasets ───────────────────────────────────────────────────
-    train_ids, test_ids = split_subjects_50_50(DATA_ROOT)
+    train_ids, test_ids = split_subjects(DATA_ROOT, TRAIN_RATIO)
     print(f"Subjects:  {len(train_ids)} train identities / "
-          f"{len(test_ids)} test identities")
+          f"{len(test_ids)} test identities  "
+          f"(ratio={TRAIN_RATIO:.0%}/{1-TRAIN_RATIO:.0%})")
 
     if EVAL_PROTOCOL == 'cross_subject':
         tr_spec  = ALL_SPECTRA
@@ -601,7 +624,7 @@ def main() -> None:
     n_total     = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.trainable_parameters())
     print(f"Params:    {n_trainable:,} trainable / {n_total:,} total "
-          f"(backbone fully frozen, head only)\n")
+          f"(custom CNN, trained from scratch)\n")
     # Differential LR: layer4 at LR/10, embed head at full LR
     optimizer = Adam(model.param_groups(LR), weight_decay=WEIGHT_DECAY)
     scheduler = StepLR(optimizer, step_size=LR_STEP, gamma=LR_GAMMA)
