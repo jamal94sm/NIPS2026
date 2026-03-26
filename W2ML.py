@@ -68,7 +68,19 @@ Q_PER_CLASS = 5     # query images per class (fixed); the rest become support (K
 EPISODES_PER_EPOCH = 200
 
 # ── Model ─────────────────────────────────────────────────────────────────────
+# Choose backbone:
+#   'custom'   — lightweight CNN trained from scratch (original paper default)
+#   'resnet18' — ResNet-18 pretrained on ImageNet, layer1-3 frozen,
+#                layer4 + embedding head fine-tuned (paper Section 4.2)
+BACKBONE   = 'resnet18'
 EMBED_DIM  = 128
+
+# Differential learning rates (only used when BACKBONE = 'resnet18')
+#   LR_LAYER4 : fine-tune rate for the unfrozen ResNet layer4
+#   LR_HEAD   : full learning rate for the new 128-d embedding head
+# The frozen layers (layer1-3) receive no gradient at all.
+LR_LAYER4  = 2e-5   # 10× lower than head — gentle fine-tuning of layer4
+LR_HEAD    = 2e-4   # matches the paper's Adam base lr (same as LR above)
 
 # ── Loss hyper-parameters (Section 3.3) ──────────────────────────────────────
 ALPHA  = 2.0
@@ -483,6 +495,111 @@ class W2MLModel(nn.Module):
         return list(self.parameters())
 
 
+class ResNet18Model(nn.Module):
+    """
+    ResNet-18 backbone as used in the paper (Section 4.2).
+
+    Freezing strategy
+    ─────────────────
+    Frozen  (requires_grad=False) : conv1, bn1, maxpool, layer1, layer2, layer3
+    Unfrozen (fine-tuned)         : layer4  ← rich semantic features, adapt to palmprint
+    Unfrozen (trained from init)  : embedding head (Linear 512→EMBED_DIM, no bias)
+
+    The original ResNet-18 avgpool + fc are replaced by:
+        AdaptiveAvgPool2d(1) → Flatten → Linear(512, EMBED_DIM, bias=False)
+    followed by L2 normalisation onto the unit hypersphere.
+
+    Param groups (for differential LR in Adam)
+    ──────────────────────────────────────────
+      group 0 — layer4          : LR_LAYER4  (gentle fine-tune)
+      group 1 — embedding head  : LR_HEAD    (full rate, new weights)
+
+    IMG_SIZE note
+    ─────────────
+    The paper uses 224×224 ROIs.  This model works at any size ≥ 32 px because
+    of the AdaptiveAvgPool2d, but 224 is recommended for best transfer quality.
+    Set IMG_SIZE = 224 in the PARAMETERS block when using this backbone.
+    """
+
+    # Modules that stay frozen — listed by attribute name on the ResNet object
+    _FROZEN_MODULES = ('conv1', 'bn1', 'relu', 'maxpool',
+                       'layer1', 'layer2', 'layer3')
+
+    def __init__(self):
+        super().__init__()
+        import torchvision.models as models
+
+        base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+
+        # ── Freeze layers 1–3 ────────────────────────────────────────────
+        for name in self._FROZEN_MODULES:
+            module = getattr(base, name)
+            for param in module.parameters():
+                param.requires_grad = False
+
+        # ── Keep layer4 (unfrozen by default) ────────────────────────────
+        self.frozen_body = nn.Sequential(
+            base.conv1, base.bn1, base.relu, base.maxpool,
+            base.layer1, base.layer2, base.layer3,
+        )
+        self.layer4 = base.layer4          # unfrozen — fine-tuned at LR_LAYER4
+
+        # ── New embedding head (replaces avgpool + fc) ────────────────────
+        # ResNet-18 layer4 output: (B, 512, H/32, W/32)
+        self.pool     = nn.AdaptiveAvgPool2d(1)
+        self.head     = nn.Linear(512, EMBED_DIM, bias=False)  # trained at LR_HEAD
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.frozen_body(x)   # frozen — no grad flows here
+        x = self.layer4(x)        # fine-tuned
+        x = self.pool(x).flatten(1)
+        x = self.head(x)
+        return F.normalize(x, p=2, dim=1)
+
+    def param_groups(self, lr: float) -> list:
+        """
+        Two groups with differential learning rates.
+        `lr` argument is accepted for API compatibility but ignored here —
+        LR_LAYER4 and LR_HEAD from the global config are used directly.
+        """
+        return [
+            {'params': self.layer4.parameters(),
+             'lr': LR_LAYER4,
+             'name': 'layer4'},
+            {'params': self.head.parameters(),
+             'lr': LR_HEAD,
+             'name': 'head'},
+        ]
+
+    def trainable_parameters(self):
+        return [p for p in self.parameters() if p.requires_grad]
+
+    @staticmethod
+    def frozen_module_names() -> Tuple[str, ...]:
+        return ResNet18Model._FROZEN_MODULES
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_model(backbone: str = BACKBONE) -> nn.Module:
+    """
+    Factory that returns the selected model.
+
+    backbone='custom'   → W2MLModel  (from-scratch CNN, any IMG_SIZE)
+    backbone='resnet18' → ResNet18Model  (ImageNet pretrained, IMG_SIZE=224 recommended)
+    """
+    backbone = backbone.lower().strip()
+    if backbone == 'custom':
+        return W2MLModel()
+    elif backbone == 'resnet18':
+        return ResNet18Model()
+    else:
+        raise ValueError(
+            f"Unknown backbone '{backbone}'. "
+            f"Choose 'custom' or 'resnet18'."
+        )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 4 — W2ML LOSS  (Equations 2–8)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -686,8 +803,9 @@ def main() -> None:
     np.random.seed(SEED)
     device = torch.device(DEVICE if torch.cuda.is_available() else 'cpu')
     print(f"\nW2ML Palmprint Recognition")
-    print(f"  Device   : {device}")
-    print(f"  Protocol : {EVAL_PROTOCOL}")
+    print(f"  Device    : {device}")
+    print(f"  Backbone  : {BACKBONE}")
+    print(f"  Protocol  : {EVAL_PROTOCOL}")
     print(f"  Q_PER_CLASS (fixed) : {Q_PER_CLASS}")
     print(f"  K will be computed dynamically from training data\n")
 
@@ -737,11 +855,20 @@ def main() -> None:
     train_sampler = EpisodeSampler(train_dataset_aug, k=K)
 
     # ── Model ────────────────────────────────────────────────────────────
-    model = W2MLModel().to(device)
+    model = build_model(BACKBONE).to(device)
+
     n_total     = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.trainable_parameters())
-    print(f"Params:    {n_trainable:,} trainable / {n_total:,} total "
-          f"(custom CNN, trained from scratch)\n")
+    n_frozen    = n_total - n_trainable
+
+    print(f"Backbone   : {BACKBONE}")
+    if BACKBONE == 'resnet18':
+        print(f"  Frozen modules  : {ResNet18Model.frozen_module_names()}")
+        print(f"  Unfrozen modules: layer4  (lr={LR_LAYER4:.1e}), "
+              f"head  (lr={LR_HEAD:.1e})")
+    print(f"Params     : {n_trainable:,} trainable  /  "
+          f"{n_frozen:,} frozen  /  {n_total:,} total\n")
+
     optimizer = Adam(model.param_groups(LR), weight_decay=WEIGHT_DECAY)
     scheduler = StepLR(optimizer, step_size=LR_STEP, gamma=LR_GAMMA)
     os.makedirs(SAVE_DIR, exist_ok=True)
@@ -806,6 +933,7 @@ def main() -> None:
                 'best_eer':  best_eer,
                 'best_acc':  best_acc,
                 'K':         K,
+                'backbone':  BACKBONE,
             }, os.path.join(SAVE_DIR, 'best.pth'))
             print(f"  ✓ Best checkpoint saved  "
                   f"(Test EER={best_eer*100:.2f}%  Test Acc={best_acc*100:.2f}%)")
@@ -816,6 +944,7 @@ def main() -> None:
             'best_eer': best_eer,
             'best_acc': best_acc,
             'K':        K,
+            'backbone': BACKBONE,
         }, os.path.join(SAVE_DIR, 'latest.pth'))
         print()
 
