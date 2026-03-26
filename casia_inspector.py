@@ -21,6 +21,7 @@ DATA_ROOT = "/home/pai-ng/Jamal/CASIA-MS-ROI"
 
 import os
 import re
+import time
 from collections import defaultdict
 
 import pandas as pd
@@ -99,6 +100,7 @@ per_identity = (df.groupby('identity')
                   .rename('n_images')
                   .sort_values(ascending=False))
 
+time.sleep(10)
 print(f"{'─'*60}")
 print(f"  Images per identity  (total {len(per_identity)} identities)")
 print(f"  Each identity = subjectID_L  or  subjectID_R")
@@ -127,6 +129,7 @@ per_spectrum = (df.groupby('spectrum')
                   .rename('n_images')
                   .sort_index())
 
+time.sleep(10)
 print(f"{'─'*60}")
 print(f"  Images per spectrum")
 print(f"{'─'*60}")
@@ -154,6 +157,7 @@ cross = cross.sort_index()
 # Expected images per cell = number of unique iterations
 expected = df['iteration'].nunique()
 
+time.sleep(10)
 print(f"{'═'*60}")
 print(f"  Identity × Spectrum Sample Count Table")
 print(f"  Rows    = identity (subjectID_L / subjectID_R)")
@@ -243,6 +247,7 @@ print("  Plot saved to casia_ms_stats.png")
 #  6. Summary for episode sampler
 # ═══════════════════════════════════════════════════════════════════════════════
 
+time.sleep(10)
 print(f"{'═'*60}")
 print(f"  Episode Sampler Summary  (Q_PER_CLASS = 5)")
 print(f"{'═'*60}")
