@@ -33,7 +33,6 @@ from PIL import Image
 from torch.optim import Adam
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import DataLoader, Dataset
-from torchvision import models
 import torchvision.transforms as T
 from tqdm import tqdm
 
@@ -54,7 +53,7 @@ RESUME    = None                  # path to a .pth checkpoint to resume from
 # 'cross_spectrum' : train on TRAIN_SPECTRA, test on TEST_SPECTRA
 #                   (still with TRAIN_RATIO subject split)
 EVAL_PROTOCOL  = 'cross_subject'
-TRAIN_RATIO    = 0.8              # fraction of subjects used for training
+TRAIN_RATIO    = 0.5              # fraction of subjects used for training
                                   # e.g. 0.5 → 50/50, 0.7 → 70/30
 
 ALL_SPECTRA    = ['460', '630', '700', '850', '940', 'White']
@@ -69,7 +68,7 @@ N           = 32    # number of classes per episode          (paper: 32)
 K           = 4     # support images per class               (paper: 4)
 Q_PER_CLASS = 4     # query images per class  (not specified; match K)
 
-EPISODES_PER_EPOCH = 200
+EPISODES_PER_EPOCH = 500
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 EMBED_DIM  = 128    # embedding dimensionality — matches FC3 output (paper: 128)
@@ -82,11 +81,11 @@ MARGIN = 0.05       # hard-mining margin m                   (paper: 0.05 optima
 
 # ── Training ──────────────────────────────────────────────────────────────────
 NUM_EPOCHS   = 60
-LR           = 1e-3             # Adam base lr                (paper: 0.0002)
+LR           = 2e-4             # Adam base lr                (paper: 0.0002)
 WEIGHT_DECAY = 1e-4
 LR_STEP      = 20               # StepLR: decay every N epochs
 LR_GAMMA     = 0.5
-GRAD_CLIP    = 2.0
+GRAD_CLIP    = 5.0
 
 DEVICE      = 'cuda'            # 'cuda' or 'cpu'
 NUM_WORKERS = 4
@@ -334,7 +333,7 @@ class W2MLModel(nn.Module):
 
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(feat_size, 1024, bias=False),
+            nn.Linear(feat_size, 1024, bias=False),  # feat_size=25088 for 128×128 input
             nn.BatchNorm1d(1024),
             lrelu(),
             nn.Dropout(p=0.3),
@@ -564,20 +563,17 @@ def run_episode(
     model:   nn.Module,
     sampler: EpisodeSampler,
     device:  torch.device,
-    train:   bool = True,
 ) -> torch.Tensor:
-    """One episode: sample → forward → W2ML loss."""
+    """One episode (training only): sample → forward → W2ML loss."""
     s_imgs, s_labels, q_imgs, q_labels = sampler.sample_episode()
     s_imgs, s_labels = s_imgs.to(device), s_labels.to(device)
     q_imgs, q_labels = q_imgs.to(device), q_labels.to(device)
 
-    ctx = torch.enable_grad() if train else torch.no_grad()
-    with ctx:
-        s_embs = model(s_imgs)                                    # (N*K, D)
-        q_embs = model(q_imgs)                                    # (N*Q, D)
-        meta_embs, meta_labels = build_meta_support_sets(s_embs, s_labels)
-        loss = w2ml_loss(q_embs, q_labels, meta_embs, meta_labels)
-    return loss
+    # model is already in train mode — forward with grad enabled
+    s_embs = model(s_imgs)                                    # (N*K, D)
+    q_embs = model(q_imgs)                                    # (N*Q, D)
+    meta_embs, meta_labels = build_meta_support_sets(s_embs, s_labels)
+    return w2ml_loss(q_embs, q_labels, meta_embs, meta_labels)
 
 
 def main() -> None:
@@ -625,7 +621,6 @@ def main() -> None:
     n_trainable = sum(p.numel() for p in model.trainable_parameters())
     print(f"Params:    {n_trainable:,} trainable / {n_total:,} total "
           f"(custom CNN, trained from scratch)\n")
-    # Differential LR: layer4 at LR/10, embed head at full LR
     optimizer = Adam(model.param_groups(LR), weight_decay=WEIGHT_DECAY)
     scheduler = StepLR(optimizer, step_size=LR_STEP, gamma=LR_GAMMA)
     os.makedirs(SAVE_DIR, exist_ok=True)
@@ -651,7 +646,7 @@ def main() -> None:
 
         for ep_idx in range(EPISODES_PER_EPOCH):
             optimizer.zero_grad()
-            loss = run_episode(model, train_sampler, device, train=True)
+            loss = run_episode(model, train_sampler, device)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             optimizer.step()
