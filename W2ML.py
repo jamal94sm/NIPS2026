@@ -54,7 +54,7 @@ RESUME    = None                  # path to a .pth checkpoint to resume from
 # 'cross_spectrum' : train on TRAIN_SPECTRA, test on TEST_SPECTRA
 #                   (still with TRAIN_RATIO subject split)
 EVAL_PROTOCOL  = 'cross_subject'
-TRAIN_RATIO    = 0.5              # fraction of subjects used for training
+TRAIN_RATIO    = 0.8              # fraction of subjects used for training
                                   # e.g. 0.5 → 50/50, 0.7 → 70/30
 
 ALL_SPECTRA    = ['460', '630', '700', '850', '940', 'White']
@@ -69,7 +69,7 @@ N           = 32    # number of classes per episode          (paper: 32)
 K           = 4     # support images per class               (paper: 4)
 Q_PER_CLASS = 4     # query images per class  (not specified; match K)
 
-EPISODES_PER_EPOCH = 500
+EPISODES_PER_EPOCH = 200
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 EMBED_DIM  = 128    # embedding dimensionality — matches FC3 output (paper: 128)
@@ -86,7 +86,7 @@ LR           = 2e-4             # Adam base lr                (paper: 0.0002)
 WEIGHT_DECAY = 1e-4
 LR_STEP      = 20               # StepLR: decay every N epochs
 LR_GAMMA     = 0.5
-GRAD_CLIP    = 5.0
+GRAD_CLIP    = 2.0
 
 DEVICE      = 'cuda'            # 'cuda' or 'cpu'
 NUM_WORKERS = 4
