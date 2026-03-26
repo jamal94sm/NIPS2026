@@ -42,106 +42,200 @@ from tqdm import tqdm
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-DATA_ROOT = "/home/pai-ng/Jamal/CASIA-MS-ROI"       # folder containing all ROI .jpg files
-SAVE_DIR  = "checkpoints"         # where best.pth / latest.pth are written
-RESUME    = None                  # path to a .pth checkpoint to resume from
-                                  # e.g. "checkpoints/best.pth"
+DATA_ROOT = "/home/pai-ng/Jamal/CASIA-MS-ROI"   # folder containing all ROI .jpg files
+SAVE_DIR  = "checkpoints"       # where best.pth / latest.pth are written
+RESUME    = None                # path to a .pth checkpoint to resume from
+                                # e.g. "checkpoints/best.pth"
 
 # ── Evaluation protocol ───────────────────────────────────────────────────────
-# 'cross_subject'  : train on TRAIN_RATIO of subjects, test on remainder
-#                   (all 6 spectra used for both splits)
-# 'cross_spectrum' : train on TRAIN_SPECTRA, test on TEST_SPECTRA
-#                   (still with TRAIN_RATIO subject split)
 EVAL_PROTOCOL  = 'cross_subject'
-TRAIN_RATIO    = 0.8              # fraction of subjects used for training
-                                  # e.g. 0.5 → 50/50, 0.7 → 70/30
+TRAIN_RATIO    = 0.8
 
 ALL_SPECTRA    = ['460', '630', '700', '850', '940', 'White']
-TRAIN_SPECTRA  = ['460', '630', '700']   # used only for cross_spectrum
-TEST_SPECTRA   = ['850', '940', 'White'] # used only for cross_spectrum
+TRAIN_SPECTRA  = ['460', '630', '700']
+TEST_SPECTRA   = ['850', '940', 'White']
 
 # ── Image ─────────────────────────────────────────────────────────────────────
-IMG_SIZE = 128                    # custom CNN trained from scratch; 128×128
+IMG_SIZE = 128
 
-# ── Episode sampling  (Table 1) ───────────────────────────────────────────────
-N           = 32    # number of classes per episode          (paper: 32)
-K           = 28     # support images per class               (paper: 4)
-Q_PER_CLASS = 6     # query images per class  (not specified; match K)
+# ── Episode sampling ──────────────────────────────────────────────────────────
+N           = 32    # number of classes per episode
+# K is NO LONGER set here — it is computed dynamically from the data as:
+#   K = min_images_per_identity_in_training_set - Q_PER_CLASS
+# This ensures every identity can contribute support + query without running out.
+Q_PER_CLASS = 5     # query images per class (fixed); the rest become support (K)
 
 EPISODES_PER_EPOCH = 200
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-EMBED_DIM  = 128    # embedding dimensionality — matches FC3 output (paper: 128)
+EMBED_DIM  = 128
 
-# ── Loss hyper-parameters  (Section 3.3, optimal from Tables 5 & 6) ──────────
-ALPHA  = 2.0        # positive weighting scale               (paper: 2,  fixed)
-BETA   = 40.0       # negative weighting scale               (paper: 40, fixed)
-GAMMA  = 0.5        # similarity margin for weighting        (paper: 0.5 optimal)
-MARGIN = 0.05       # hard-mining margin m                   (paper: 0.05 optimal)
+# ── Loss hyper-parameters (Section 3.3) ──────────────────────────────────────
+ALPHA  = 2.0
+BETA   = 40.0
+GAMMA  = 0.5
+MARGIN = 0.05
 
 # ── Training ──────────────────────────────────────────────────────────────────
 NUM_EPOCHS   = 60
-LR           = 2e-4             # Adam base lr                (paper: 0.0002)
+LR           = 2e-4
 WEIGHT_DECAY = 1e-4
-LR_STEP      = 20               # StepLR: decay every N epochs
+LR_STEP      = 20
 LR_GAMMA     = 0.5
 GRAD_CLIP    = 5.0
 
-DEVICE      = 'cuda'            # 'cuda' or 'cpu'
+DEVICE      = 'cuda'
 NUM_WORKERS = 4
 SEED        = 42
-LOG_INTERVAL = 50               # print every N episodes
+LOG_INTERVAL = 50
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SECTION 1 — DATASET  (dataset.py)
+#  SECTION 1 — DATASET
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def parse_casia_filename(fname: str) -> Optional[Tuple[str, str, str, str]]:
     """
     Parse  {subjectID}_{handSide}_{spectrum}_{iteration}.ext
     Returns (subject_id, side, spectrum, iteration) or None.
-    Identity = subjectID + side  →  left/right treated as distinct classes.
+
+    CASIA-MS example:  001_L_460_01.jpg
+      → subject='001', side='L', spectrum='460', iteration='01'
+
+    Identity = subjectID + '_' + side  (left/right treated as distinct classes).
+
+    NOTE: subjectID is assumed to contain NO underscores (e.g. '001', '002').
+    If your dataset uses multi-part IDs, adjust the split index accordingly.
     """
     name  = os.path.splitext(fname)[0]
     parts = name.split('_')
+    # Minimum 4 parts: subjectID, side, spectrum, iteration
     if len(parts) < 4:
         return None
-    return parts[0], parts[1], parts[2], parts[3]
+    # parts[-1] = iteration, parts[-2] = spectrum, parts[-3] = side,
+    # parts[:-3] joined = subjectID (handles IDs that contain underscores)
+    iteration = parts[-1]
+    spectrum  = parts[-2]
+    side      = parts[-3]
+    subject   = '_'.join(parts[:-3])   # robust to multi-part subject IDs
+    return subject, side, spectrum, iteration
 
 
-def get_all_subjects(root: str) -> List[str]:
-    subjects = set()
-    for fname in os.listdir(root):
+def build_identity_index(root: str,
+                         spectra: Optional[List[str]] = None
+                         ) -> Dict[str, List[str]]:
+    """
+    Single-pass scan of DATA_ROOT.
+    Returns  {identity_string: [list_of_full_file_paths]}
+    where identity = '{subjectID}_{side}'.
+
+    Having one consolidated scan avoids the double-pass inconsistency that
+    existed in the original get_all_subjects + split_subjects pair.
+    """
+    allowed = set(spectra) if spectra else set(ALL_SPECTRA)
+    index: Dict[str, List[str]] = defaultdict(list)
+    for fname in sorted(os.listdir(root)):
+        if not fname.lower().endswith(('.jpg', '.jpeg', '.png')):
+            continue
         parsed = parse_casia_filename(fname)
-        if parsed:
-            subjects.add(parsed[0])
-    return sorted(subjects)
+        if parsed is None:
+            continue
+        subject, side, spectrum, _ = parsed
+        if spectrum not in allowed:
+            continue
+        identity = f"{subject}_{side}"
+        index[identity].append(os.path.join(root, fname))
+    return dict(index)
 
 
-def split_subjects(root: str, train_ratio: float = TRAIN_RATIO
+def split_subjects(root: str,
+                   train_ratio: float = TRAIN_RATIO,
+                   spectra: Optional[List[str]] = None
                    ) -> Tuple[List[str], List[str]]:
     """
-    Open-set subject split with configurable ratio (Section 4.2).
-    first (train_ratio * 100)% of subjects → train,
-    remaining subjects → test.  Zero category overlap guaranteed.
-    Returns (train_identities, test_identities)  where identity = 'sub_side'.
+    Open-set subject split (Section 4.2).
+
+    Returns (train_identities, test_identities).
+    Zero category overlap guaranteed.
+    Sorted subject list → deterministic split (same as original).
     """
     if not 0.0 < train_ratio < 1.0:
         raise ValueError(f"TRAIN_RATIO must be in (0, 1), got {train_ratio}")
-    subjects   = get_all_subjects(root)
-    n_train    = max(1, int(len(subjects) * train_ratio))
-    train_subs = set(subjects[:n_train])
-    test_subs  = set(subjects[n_train:])
 
-    all_ids = sorted({
-        f"{p[0]}_{p[1]}"
-        for fname in os.listdir(root)
-        if (p := parse_casia_filename(fname)) is not None
-    })
-    train_ids = [i for i in all_ids if i.rsplit('_', 1)[0] in train_subs]
-    test_ids  = [i for i in all_ids if i.rsplit('_', 1)[0] in test_subs]
+    index = build_identity_index(root, spectra)
+
+    # Derive unique subject IDs from the identities (strip the '_side' suffix)
+    # Identities have the form '{subjectID}_{side}', where side ∈ {L, R}.
+    # We split on the last '_' to recover the subject.
+    subjects = sorted({ident.rsplit('_', 1)[0] for ident in index})
+    n_train  = max(1, int(len(subjects) * train_ratio))
+    train_subjects = set(subjects[:n_train])
+    test_subjects  = set(subjects[n_train:])
+
+    all_identities = sorted(index.keys())
+    train_ids = [i for i in all_identities if i.rsplit('_', 1)[0] in train_subjects]
+    test_ids  = [i for i in all_identities if i.rsplit('_', 1)[0] in test_subjects]
     return train_ids, test_ids
+
+
+def print_identity_counts(dataset: 'CASIAMSDataset',
+                          tag: str = '',
+                          top_n_outliers: int = 10) -> None:
+    """
+    Print per-identity image counts for a CASIAMSDataset.
+
+    Shows:
+      • Summary statistics (min / median / max / mean)
+      • Distribution histogram (bucketed)
+      • The `top_n_outliers` identities with the fewest images (potential issues)
+      • The `top_n_outliers` identities with the most images
+    """
+    counts: Dict[str, int] = defaultdict(int)
+    # Reverse the identity_to_idx map so we can print human-readable names
+    idx_to_identity = {v: k for k, v in dataset.identity_to_idx.items()}
+
+    for _, label, _ in dataset.samples:
+        counts[idx_to_identity[label]] += 1
+
+    if not counts:
+        print(f"  [{tag}] No samples found.")
+        return
+
+    values = sorted(counts.values())
+    n      = len(values)
+    print(f"\n{'─'*60}")
+    print(f"  Identity image counts  [{tag}]")
+    print(f"{'─'*60}")
+    print(f"  Total identities : {n}")
+    print(f"  Total images     : {sum(values)}")
+    print(f"  Min              : {values[0]}")
+    print(f"  Median           : {values[n // 2]}")
+    print(f"  Mean             : {sum(values) / n:.1f}")
+    print(f"  Max              : {values[-1]}")
+
+    # Histogram
+    bucket_size = max(1, (values[-1] - values[0]) // 10 + 1)
+    buckets: Dict[int, int] = defaultdict(int)
+    for v in values:
+        buckets[(v // bucket_size) * bucket_size] += 1
+    print(f"\n  Count distribution (bucket size = {bucket_size}):")
+    for bucket_start in sorted(buckets):
+        bar = '█' * buckets[bucket_start]
+        print(f"    [{bucket_start:4d}–{bucket_start + bucket_size - 1:4d}]  "
+              f"{bar}  ({buckets[bucket_start]})")
+
+    # Bottom outliers
+    sorted_by_count = sorted(counts.items(), key=lambda x: x[1])
+    print(f"\n  {top_n_outliers} identities with fewest images:")
+    for ident, cnt in sorted_by_count[:top_n_outliers]:
+        print(f"    {ident:<20s}  {cnt:3d} images")
+
+    # Top identities
+    print(f"\n  {top_n_outliers} identities with most images:")
+    for ident, cnt in sorted_by_count[-top_n_outliers:][::-1]:
+        print(f"    {ident:<20s}  {cnt:3d} images")
+
+    print(f"{'─'*60}\n")
 
 
 class CASIAMSDataset(Dataset):
@@ -173,10 +267,10 @@ class CASIAMSDataset(Dataset):
             parsed = parse_casia_filename(fname)
             if parsed is None:
                 continue
-            sub, side, spectrum, _ = parsed
+            subject, side, spectrum, _ = parsed
             if spectrum not in self.spectra:
                 continue
-            identity = f"{sub}_{side}"
+            identity = f"{subject}_{side}"
             if identity not in valid_ids:
                 continue
             label = self.identity_to_idx[identity]
@@ -206,7 +300,7 @@ def get_transforms(train: bool = True) -> T.Compose:
             T.RandomGrayscale(p=0.1),
             T.ToTensor(),
             T.Normalize(mean, std),
-            T.RandomErasing(p=0.2, scale=(0.02, 0.15)),   # must be after ToTensor
+            T.RandomErasing(p=0.2, scale=(0.02, 0.15)),
         ])
     return T.Compose([
         T.Resize((IMG_SIZE, IMG_SIZE)),
@@ -216,20 +310,55 @@ def get_transforms(train: bool = True) -> T.Compose:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SECTION 2 — EPISODE SAMPLER  (Algorithm 1, steps 1–2)
+#  SECTION 2 — EPISODE SAMPLER
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_dynamic_k(dataset: CASIAMSDataset,
+                      q_per_class: int = Q_PER_CLASS) -> int:
+    """
+    Compute K = min_per_identity_count - q_per_class.
+
+    We use the minimum image count across ALL identities in the dataset so that
+    every identity can participate in every episode without running out of images.
+    A warning is printed if the resulting K is small.
+    """
+    counts: Dict[int, int] = defaultdict(int)
+    for _, label, _ in dataset.samples:
+        counts[label] += 1
+
+    if not counts:
+        raise ValueError("Dataset is empty — cannot compute K.")
+
+    min_count = min(counts.values())
+    k = min_count - q_per_class
+
+    if k <= 0:
+        raise ValueError(
+            f"min images per identity = {min_count}, Q_PER_CLASS = {q_per_class}. "
+            f"K = {k} ≤ 0. Either reduce Q_PER_CLASS or ensure each identity "
+            f"has more than {q_per_class} images."
+        )
+    if k < 4:
+        print(f"  WARNING: K={k} is very small (min_count={min_count}, "
+              f"Q_PER_CLASS={q_per_class}). "
+              f"Consider filtering out identities with few samples.")
+    return k
+
 
 class EpisodeSampler:
     """
     Samples one episode: N classes × (K support + Q_PER_CLASS query) images.
+
+    K is passed in at construction time (computed dynamically from the dataset).
     """
 
-    def __init__(self, dataset: CASIAMSDataset):
+    def __init__(self, dataset: CASIAMSDataset, k: int):
+        self.k   = k
         self._label_to_indices: Dict[int, List[int]] = defaultdict(list)
         for i, (_, label, _) in enumerate(dataset.samples):
             self._label_to_indices[label].append(i)
 
-        min_needed = K + Q_PER_CLASS
+        min_needed = k + Q_PER_CLASS
         self.valid_labels: List[int] = [
             lbl for lbl, idxs in self._label_to_indices.items()
             if len(idxs) >= min_needed
@@ -237,8 +366,13 @@ class EpisodeSampler:
         if len(self.valid_labels) < N:
             raise ValueError(
                 f"Only {len(self.valid_labels)} classes have ≥ {min_needed} "
-                f"samples, but N={N} are needed per episode."
+                f"samples (K={k} + Q={Q_PER_CLASS}), but N={N} are needed "
+                f"per episode.\n"
+                f"  → Either lower N, lower Q_PER_CLASS, or check for missing "
+                f"images in your dataset."
             )
+        print(f"  EpisodeSampler ready:  K={k}  Q={Q_PER_CLASS}  "
+              f"valid_classes={len(self.valid_labels)}/{len(self._label_to_indices)}")
         self.dataset = dataset
 
     def sample_episode(
@@ -257,11 +391,11 @@ class EpisodeSampler:
 
         for local_lbl, global_lbl in enumerate(chosen):
             pool   = self._label_to_indices[global_lbl]
-            picked = random.sample(pool, K + Q_PER_CLASS)
-            for idx in picked[:K]:
+            picked = random.sample(pool, self.k + Q_PER_CLASS)
+            for idx in picked[:self.k]:
                 img, _, _ = self.dataset[idx]
                 s_imgs.append(img);  s_labels.append(local_lbl)
-            for idx in picked[K:]:
+            for idx in picked[self.k:]:
                 img, _, _ = self.dataset[idx]
                 q_imgs.append(img);  q_labels.append(local_lbl)
 
@@ -274,14 +408,14 @@ class EpisodeSampler:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SECTION 3 — MODEL  (custom CNN, trained from scratch)
+#  SECTION 3 — MODEL
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class W2MLModel(nn.Module):
     """
     Custom CNN trained from scratch (no pretrained weights).
 
-    Architecture (from paper Figure):
+    Architecture:
       Conv1 : 3×3, 16 filters, stride 4, Leaky ReLU(0.1)
       MaxPool: 2×2, stride 1
       Conv2 : 5×5, 32 filters, stride 2, Leaky ReLU(0.1)
@@ -293,8 +427,6 @@ class W2MLModel(nn.Module):
       FC2   : 512,  Leaky ReLU(0.1)
       FC3   : 128,  no activation  ← embedding output
       L2-normalise → EMBED_DIM-d unit hypersphere
-
-    Input: IMG_SIZE × IMG_SIZE (128×128 recommended for this architecture)
     """
 
     def __init__(self):
@@ -302,38 +434,33 @@ class W2MLModel(nn.Module):
         lrelu = partial(nn.LeakyReLU, negative_slope=0.1, inplace=True)
 
         self.features = nn.Sequential(
-            # Conv block 1
             nn.Conv2d(3, 16, kernel_size=3, stride=4, padding=1, bias=False),
             nn.BatchNorm2d(16),
             lrelu(),
             nn.MaxPool2d(kernel_size=2, stride=1),
 
-            # Conv block 2
             nn.Conv2d(16, 32, kernel_size=5, stride=2, padding=2, bias=False),
             nn.BatchNorm2d(32),
             lrelu(),
             nn.MaxPool2d(kernel_size=2, stride=1),
 
-            # Conv block 3
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(64),
             lrelu(),
 
-            # Conv block 4
             nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(128),
             lrelu(),
             nn.MaxPool2d(kernel_size=2, stride=1),
         )
 
-        # Compute flattened feature size dynamically
         with torch.no_grad():
             dummy = torch.zeros(1, 3, IMG_SIZE, IMG_SIZE)
             feat_size = self.features(dummy).view(1, -1).shape[1]
 
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(feat_size, 1024, bias=False),  # feat_size=25088 for 128×128 input
+            nn.Linear(feat_size, 1024, bias=False),
             nn.BatchNorm1d(1024),
             lrelu(),
             nn.Dropout(p=0.3),
@@ -343,18 +470,18 @@ class W2MLModel(nn.Module):
             lrelu(),
             nn.Dropout(p=0.3),
 
-            nn.Linear(512, EMBED_DIM, bias=False),   # FC3 — no activation
+            nn.Linear(512, EMBED_DIM, bias=False),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.normalize(self.classifier(self.features(x)), p=2, dim=1)
 
     def param_groups(self, lr: float) -> list:
-        """Single group — all parameters trained from scratch at the same LR."""
         return [{'params': self.parameters(), 'lr': lr}]
 
     def trainable_parameters(self):
         return list(self.parameters())
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 4 — W2ML LOSS  (Equations 2–8)
@@ -365,69 +492,60 @@ def build_meta_support_sets(
     support_labels: torch.Tensor,   # (N*K,)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Eq. 2 — S_j_meta = mean_i f(x^j_i),  then re-normalise.
+    Eq. 2 — S_j_meta = mean_i f(x^j_i), then re-normalise.
     Returns meta_embs (N, D) and meta_labels (N,).
     """
     unique_labels = torch.unique(support_labels, sorted=True)
     meta_embs = torch.stack([
         support_embs[support_labels == lbl].mean(0) for lbl in unique_labels
-    ])                                                      # (N, D)
+    ])
     return F.normalize(meta_embs, p=2, dim=1), unique_labels
 
 
 def mine_hard_pairs(
-    pos_dists: torch.Tensor,   # (P,)
-    neg_dists: torch.Tensor,   # (N_neg,)
+    pos_dists: torch.Tensor,
+    neg_dists: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Eq. 4 — positive selected iff  d_pos < max(d_neg) + m
     Eq. 5 — negative selected iff  d_neg > min(d_pos) - m
-    Returns boolean masks (hard_pos_mask, hard_neg_mask).
     """
-    hard_pos_mask = pos_dists < neg_dists.max() + MARGIN    # Eq. 4
-    hard_neg_mask = neg_dists > pos_dists.min() - MARGIN    # Eq. 5
+    hard_pos_mask = pos_dists < neg_dists.max() + MARGIN
+    hard_neg_mask = neg_dists > pos_dists.min() - MARGIN
     return hard_pos_mask, hard_neg_mask
 
 
 def w2ml_loss(
-    query_embs:   torch.Tensor,   # (Q, D)  L2-normalised
-    query_labels: torch.Tensor,   # (Q,)
-    meta_embs:    torch.Tensor,   # (N, D)  L2-normalised
-    meta_labels:  torch.Tensor,   # (N,)
+    query_embs:   torch.Tensor,
+    query_labels: torch.Tensor,
+    meta_embs:    torch.Tensor,
+    meta_labels:  torch.Tensor,
 ) -> torch.Tensor:
     """
     Eq. 8 — Episode loss averaged over all l query samples.
 
     Loss is expressed in DISTANCE space (d = 1 − cosine_similarity).
-    Substituting S = 1 − d into the original similarity-space MS Loss gives:
 
       Positive term: (1/α) · log(1 + Σ_P exp(+α(d_p − γ)))
-                     penalises large positive distances  ✓
-
       Negative term: (1/β) · log(1 + Σ_N exp(−β(d_n − γ)))
-                     penalises small negative distances  ✓
-
-    FIX vs. original code: both exponent signs were inverted, causing the model
-    to push same-class embeddings apart and pull different-class ones together.
     """
-    MAX_EXP = 80.0   # clamp to prevent inf with β=40
+    MAX_EXP = 80.0
     dist_mat = 1.0 - torch.mm(query_embs, meta_embs.t())   # (Q, N)
 
     per_query_losses = []
 
     for q_idx in range(query_embs.size(0)):
         q_lbl    = query_labels[q_idx]
-        dists    = dist_mat[q_idx]                          # (N,)
-        pos_mask = meta_labels == q_lbl                     # (N,) bool
+        dists    = dist_mat[q_idx]
+        pos_mask = meta_labels == q_lbl
         neg_mask = ~pos_mask
 
         if pos_mask.sum() == 0 or neg_mask.sum() == 0:
             continue
 
-        pos_dists = dists[pos_mask]   # (P,)  typically 1
-        neg_dists = dists[neg_mask]   # (N-1,)
+        pos_dists = dists[pos_mask]
+        neg_dists = dists[neg_mask]
 
-        # Hard-mining  (Eq. 4 & 5)
         hp_mask, hn_mask = mine_hard_pairs(pos_dists, neg_dists)
         if hp_mask.sum() == 0 or hn_mask.sum() == 0:
             continue
@@ -435,25 +553,22 @@ def w2ml_loss(
         hp = pos_dists[hp_mask]
         hn = neg_dists[hn_mask]
 
-        # FIX: distance-space signs (were both inverted in original code)
-        # Eq. 8 positive term — penalise large positive distances
-        pos_exp  = torch.clamp(+ALPHA * (hp - GAMMA), max=MAX_EXP)   # was: -ALPHA
+        pos_exp  = torch.clamp(+ALPHA * (hp - GAMMA), max=MAX_EXP)
         pos_term = (1.0 / ALPHA) * torch.log1p(torch.exp(pos_exp).sum())
 
-        # Eq. 8 negative term — penalise small negative distances
-        neg_exp  = torch.clamp(-BETA  * (hn - GAMMA), max=MAX_EXP)   # was: +BETA
+        neg_exp  = torch.clamp(-BETA  * (hn - GAMMA), max=MAX_EXP)
         neg_term = (1.0 / BETA)  * torch.log1p(torch.exp(neg_exp).sum())
 
         per_query_losses.append(pos_term + neg_term)
 
     if not per_query_losses:
-        return dist_mat.sum() * 0.0   # safe zero with gradient
+        return dist_mat.sum() * 0.0
 
-    return torch.stack(per_query_losses).mean()   # Eq. 8 : 1/l · Σ
+    return torch.stack(per_query_losses).mean()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SECTION 5 — EVALUATION  (Section 4.3)
+#  SECTION 5 — EVALUATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -462,7 +577,6 @@ def extract_features(
     dataset: CASIAMSDataset,
     device:  torch.device,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Forward full dataset → (embeddings (N,D), labels (N,))."""
     loader = DataLoader(
         dataset, batch_size=64, shuffle=False,
         num_workers=NUM_WORKERS, pin_memory=True,
@@ -476,10 +590,6 @@ def extract_features(
 
 
 def identification(embs: np.ndarray, labels: np.ndarray) -> float:
-    """
-    Rank-1 identification accuracy.
-    Gallery = first sample per class; probe = all remaining.
-    """
     unique_labels = np.unique(labels)
     g_embs, g_labs, p_embs, p_labs = [], [], [], []
 
@@ -497,7 +607,6 @@ def identification(embs: np.ndarray, labels: np.ndarray) -> float:
 
 
 def compute_eer(genuine: np.ndarray, imposter: np.ndarray) -> float:
-    """EER via FAR / FRR sweep over 1 000 thresholds."""
     thresholds = np.linspace(
         min(genuine.min(), imposter.min()),
         max(genuine.max(), imposter.max()),
@@ -511,13 +620,11 @@ def compute_eer(genuine: np.ndarray, imposter: np.ndarray) -> float:
 
 def verification(embs: np.ndarray, labels: np.ndarray,
                  max_imp: int = 200_000) -> float:
-    """EER from all genuine pairs + sampled imposter pairs."""
     rng   = np.random.default_rng(42)
     l2idx = defaultdict(list)
     for i, lbl in enumerate(labels):
         l2idx[int(lbl)].append(i)
 
-    # All genuine pairs
     genuine = []
     for idxs in l2idx.values():
         for i in range(len(idxs)):
@@ -525,11 +632,10 @@ def verification(embs: np.ndarray, labels: np.ndarray,
                 genuine.append(1.0 - float(embs[idxs[i]] @ embs[idxs[j]]))
     genuine = np.array(genuine, dtype=np.float32)
 
-    # Sampled imposter pairs
     uniq    = list(l2idx.keys())
     n_imp   = min(max_imp, len(genuine))
     imposter = []
-    for _ in range(n_imp * 5):            # over-sample then truncate
+    for _ in range(n_imp * 5):
         if len(imposter) >= n_imp:
             break
         a, b = rng.choice(uniq, 2, replace=False)
@@ -556,7 +662,7 @@ def evaluate(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SECTION 6 — TRAINING LOOP  (Algorithm 1, full)
+#  SECTION 6 — TRAINING LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_episode(
@@ -564,14 +670,12 @@ def run_episode(
     sampler: EpisodeSampler,
     device:  torch.device,
 ) -> torch.Tensor:
-    """One episode (training only): sample → forward → W2ML loss."""
     s_imgs, s_labels, q_imgs, q_labels = sampler.sample_episode()
     s_imgs, s_labels = s_imgs.to(device), s_labels.to(device)
     q_imgs, q_labels = q_imgs.to(device), q_labels.to(device)
 
-    # model is already in train mode — forward with grad enabled
-    s_embs = model(s_imgs)                                    # (N*K, D)
-    q_embs = model(q_imgs)                                    # (N*Q, D)
+    s_embs = model(s_imgs)
+    q_embs = model(q_imgs)
     meta_embs, meta_labels = build_meta_support_sets(s_embs, s_labels)
     return w2ml_loss(q_embs, q_labels, meta_embs, meta_labels)
 
@@ -583,7 +687,9 @@ def main() -> None:
     device = torch.device(DEVICE if torch.cuda.is_available() else 'cpu')
     print(f"\nW2ML Palmprint Recognition")
     print(f"  Device   : {device}")
-    print(f"  Protocol : {EVAL_PROTOCOL}\n")
+    print(f"  Protocol : {EVAL_PROTOCOL}")
+    print(f"  Q_PER_CLASS (fixed) : {Q_PER_CLASS}")
+    print(f"  K will be computed dynamically from training data\n")
 
     # ── Build datasets ───────────────────────────────────────────────────
     train_ids, test_ids = split_subjects(DATA_ROOT, TRAIN_RATIO)
@@ -592,28 +698,43 @@ def main() -> None:
           f"(ratio={TRAIN_RATIO:.0%}/{1-TRAIN_RATIO:.0%})")
 
     if EVAL_PROTOCOL == 'cross_subject':
-        tr_spec  = ALL_SPECTRA
-        te_spec  = ALL_SPECTRA
+        tr_spec = ALL_SPECTRA
+        te_spec = ALL_SPECTRA
     elif EVAL_PROTOCOL == 'cross_spectrum':
-        tr_spec  = TRAIN_SPECTRA
-        te_spec  = TEST_SPECTRA
+        tr_spec = TRAIN_SPECTRA
+        te_spec = TEST_SPECTRA
         print(f"  Train spectra : {tr_spec}")
         print(f"  Test  spectra : {te_spec}")
     else:
         raise ValueError(f"Unknown EVAL_PROTOCOL: {EVAL_PROTOCOL}")
 
+    # Eval datasets (no augmentation)
     train_dataset = CASIAMSDataset(DATA_ROOT, train_ids, tr_spec,
-                                   get_transforms(train=False))  # no augment for eval
+                                   get_transforms(train=False))
     test_dataset  = CASIAMSDataset(DATA_ROOT, test_ids,  te_spec,
                                    get_transforms(train=False))
 
-    # Separate augmented dataset used only during training episodes
+    # Augmented dataset used only during training episodes
     train_dataset_aug = CASIAMSDataset(DATA_ROOT, train_ids, tr_spec,
                                        get_transforms(train=True))
 
     print(f"Samples:   {len(train_dataset)} train / {len(test_dataset)} test\n")
 
-    train_sampler = EpisodeSampler(train_dataset_aug)
+    # ── Print per-identity image counts ─────────────────────────────────
+    # Uses the non-augmented dataset (same file list, no transform difference)
+    print_identity_counts(train_dataset, tag='TRAIN')
+    print_identity_counts(test_dataset,  tag='TEST')
+
+    # ── Compute K dynamically ────────────────────────────────────────────
+    # K = min images per identity in the AUGMENTED training set - Q_PER_CLASS
+    # (aug dataset has identical files to train_dataset, just different transforms)
+    K = compute_dynamic_k(train_dataset_aug, Q_PER_CLASS)
+    print(f"Dynamic K  : {K}  (= min_per_identity - Q_PER_CLASS = "
+          f"min_per_identity - {Q_PER_CLASS})")
+    print(f"Images per episode class : {K} support + {Q_PER_CLASS} query = "
+          f"{K + Q_PER_CLASS} total\n")
+
+    train_sampler = EpisodeSampler(train_dataset_aug, k=K)
 
     # ── Model ────────────────────────────────────────────────────────────
     model = W2MLModel().to(device)
@@ -664,7 +785,6 @@ def main() -> None:
               f"avg_loss={epoch_loss/EPISODES_PER_EPOCH:.4f}  "
               f"time={elapsed:.0f}s")
 
-        # ── Epoch-end evaluation — train and test ────────────────────────
         print("  Evaluating train set ...")
         tr_metrics = evaluate(model, train_dataset, device, tag='train')
 
@@ -677,7 +797,6 @@ def main() -> None:
         print(f"  Summary  │  Train: Acc={tr_acc*100:.2f}%  EER={tr_eer*100:.2f}%"
               f"  │  Test:  Acc={te_acc*100:.2f}%  EER={te_eer*100:.2f}%")
 
-        # Save best checkpoint based on test EER (lower is better)
         if te_eer < best_eer or (te_eer == best_eer and te_acc > best_acc):
             best_eer, best_acc = te_eer, te_acc
             torch.save({
@@ -686,6 +805,7 @@ def main() -> None:
                 'optimizer': optimizer.state_dict(),
                 'best_eer':  best_eer,
                 'best_acc':  best_acc,
+                'K':         K,
             }, os.path.join(SAVE_DIR, 'best.pth'))
             print(f"  ✓ Best checkpoint saved  "
                   f"(Test EER={best_eer*100:.2f}%  Test Acc={best_acc*100:.2f}%)")
@@ -695,6 +815,7 @@ def main() -> None:
             'model':    model.state_dict(),
             'best_eer': best_eer,
             'best_acc': best_acc,
+            'K':        K,
         }, os.path.join(SAVE_DIR, 'latest.pth'))
         print()
 
@@ -710,7 +831,8 @@ def main() -> None:
                 print(f"  [{spec}] no samples — skip"); continue
             evaluate(model, ds, device, tag=f'spectrum={spec}')
 
-    print(f"\nDone.  Best Test EER={best_eer*100:.2f}%  Best Test Acc={best_acc*100:.2f}%")
+    print(f"\nDone.  Best Test EER={best_eer*100:.2f}%  "
+          f"Best Test Acc={best_acc*100:.2f}%  K={K}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
