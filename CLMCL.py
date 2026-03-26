@@ -17,7 +17,7 @@ Identity mapping
 
 Protocols
 ---------
-    cross_subject  — 80/20 identity split, 8-fold CV, all spectra pooled.
+    cross_subject  — 80/20 identity split, 1 fold, all spectra pooled.
     cross_spectrum — Leave-one-spectrum-out (same IDs, unseen spectrum).
 
 Bug fixes vs previous version
@@ -105,8 +105,8 @@ CFG = {
     'patience'      : 15,           # stop if test EER doesn't improve for N epochs
 
     # ── Cross-subject protocol ────────────────────────────────────────
-    'train_ratio'   : 0.80,         # paper: "80% identities for training"
-    'n_folds'       : 8,            # paper: "repeated 8 times"
+    'train_ratio'   : 0.80,         # 80% of identities for training
+    'n_folds'       : 1,            # single fold (one fixed 80/20 split)
 
     # ── Misc ──────────────────────────────────────────────────────────
     'out_dir'       : './clmcl_results',
@@ -796,13 +796,21 @@ def run_cross_subject(cfg):
         fold_results.append(result)
 
     print('\n' + '═'*64)
-    print('  CROSS-SUBJECT — AGGREGATE  (mean ± std over folds)')
-    print(f'  {"Metric":26s}  {"Mean":>10}  {"Std":>10}')
-    print('  ' + '─'*50)
-    for k, lbl in [('rank1','Rank-1 (%)'), ('eer','EER (%)'),
-                   ('tar_001','TAR@FAR=0.01% (%)'), ('tar_01','TAR@FAR=0.1% (%)')]:
-        vals = [r[k] for r in fold_results]
-        print(f'  {lbl:26s}  {np.mean(vals):10.4f}  {np.std(vals):10.4f}')
+    if cfg['n_folds'] > 1:
+        print('  CROSS-SUBJECT — AGGREGATE  (mean ± std over folds)')
+        print(f'  {"Metric":26s}  {"Mean":>10}  {"Std":>10}')
+        print('  ' + '─'*50)
+        for k, lbl in [('rank1','Rank-1 (%)'), ('eer','EER (%)'),
+                       ('tar_001','TAR@FAR=0.01% (%)'), ('tar_01','TAR@FAR=0.1% (%)')]:
+            vals = [r[k] for r in fold_results]
+            print(f'  {lbl:26s}  {np.mean(vals):10.4f}  {np.std(vals):10.4f}')
+    else:
+        print('  CROSS-SUBJECT — FINAL RESULTS  (single fold)')
+        print(f'  {"Metric":26s}  {"Value":>10}')
+        print('  ' + '─'*38)
+        for k, lbl in [('rank1','Rank-1 (%)'), ('eer','EER (%)'),
+                       ('tar_001','TAR@FAR=0.01% (%)'), ('tar_01','TAR@FAR=0.1% (%)')]:
+            print(f'  {lbl:26s}  {fold_results[0][k]:10.4f}')
 
     plot_roc_folds(fold_results, out_dir)
     save_fold_results(fold_results,
@@ -879,7 +887,8 @@ def main():
     parser.add_argument('--data_root',  default=CFG['data_root'])
     parser.add_argument('--max_epochs', type=int, default=CFG['max_epochs'])
     parser.add_argument('--patience',   type=int, default=CFG['patience'])
-    parser.add_argument('--n_folds',    type=int, default=CFG['n_folds'])
+    parser.add_argument('--n_folds',    type=int, default=CFG['n_folds'],
+                        help='Number of random train/test splits (default: 1)')
     parser.add_argument('--batch_size', type=int, default=CFG['batch_size'])
     parser.add_argument('--dropout',    type=float, default=CFG['dropout'])
     parser.add_argument('--out_dir',    default=CFG['out_dir'])
