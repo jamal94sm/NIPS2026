@@ -79,7 +79,7 @@ Q_PER_CLASS = 5
 EPISODES_PER_EPOCH = 200
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-BACKBONE   = 'resnet18'
+BACKBONE   = 'custom'
 EMBED_DIM  = 128
 
 LR_LAYER4  = 2e-5
