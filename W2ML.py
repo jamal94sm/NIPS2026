@@ -614,12 +614,12 @@ class W2MLModel(nn.Module):
             nn.Linear(feat_size, 1024, bias=False),
             nn.BatchNorm1d(1024),
             lrelu(),
-            nn.Dropout(p=0.3),
+            nn.Dropout(p=0.5),
 
             nn.Linear(1024, 512, bias=False),
             nn.BatchNorm1d(512),
             lrelu(),
-            nn.Dropout(p=0.3),
+            nn.Dropout(p=0.5),
 
             nn.Linear(512, EMBED_DIM, bias=False),
         )
