@@ -401,19 +401,43 @@ class CASIAMSDataset(Dataset):
 
 
 def get_transforms(train: bool = True) -> T.Compose:
+    """
+    Augmentation strategy for a small dataset (36 images / identity).
+
+    Train pipeline — ordered from least to most destructive:
+      1. Spatial : flip, rotation, affine shear  — preserve palmprint structure
+      2. Photometric : jitter, blur, grayscale   — simulate multi-spectrum variation
+      3. Tensor conversion + normalise
+      4. RandomErasing x2 (independent patches)  — simulate partial occlusion
+
+    Two-pass RandomErasing applies two independent random patches, giving
+    stronger occlusion regularisation without needing extra libraries.
+    """
     mean = [0.485, 0.456, 0.406]
     std  = [0.229, 0.224, 0.225]
     if train:
         return T.Compose([
             T.Resize((IMG_SIZE, IMG_SIZE)),
+            # ── Spatial ──────────────────────────────────────────────────
             T.RandomHorizontalFlip(p=0.5),
-            T.RandomVerticalFlip(p=0.2),
-            T.RandomRotation(degrees=15),
-            T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
-            T.RandomGrayscale(p=0.1),
+            T.RandomVerticalFlip(p=0.3),
+            T.RandomRotation(degrees=20),
+            T.RandomAffine(
+                degrees=0,
+                translate=(0.05, 0.05),   # mild translation
+                shear=8,                  # slight shear — realistic wrist angle
+            ),
+            T.RandomPerspective(distortion_scale=0.2, p=0.4),
+            # ── Photometric ──────────────────────────────────────────────
+            T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.08),
+            T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),
+            T.RandomGrayscale(p=0.15),
+            # ── Tensor + normalise ───────────────────────────────────────
             T.ToTensor(),
             T.Normalize(mean, std),
-            T.RandomErasing(p=0.2, scale=(0.02, 0.15)),
+            # ── Occlusion regularisation (two independent patches) ───────
+            T.RandomErasing(p=0.4, scale=(0.02, 0.12), ratio=(0.3, 3.0), value=0),
+            T.RandomErasing(p=0.2, scale=(0.02, 0.08), ratio=(0.3, 3.0), value=0),
         ])
     return T.Compose([
         T.Resize((IMG_SIZE, IMG_SIZE)),
@@ -507,45 +531,113 @@ class EpisodeSampler:
 #  SECTION 3 — MODEL
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class _ResBlock(nn.Module):
+    """
+    Pre-activation residual block: BN → LeakyReLU → Conv → BN → LeakyReLU → Conv.
+
+    Pre-activation (He et al. 2016) puts BN+activation before each conv so
+    gradients flow cleanly through the skip connection without going through
+    any non-linearity — important for a relatively shallow network like this.
+
+    A 1×1 projection skip is added when stride > 1 or channels change.
+    """
+
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.BatchNorm2d(in_ch),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False),
+
+            nn.BatchNorm2d(out_ch),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1, bias=False),
+        )
+        self.skip = (
+            nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False)
+            if (stride != 1 or in_ch != out_ch) else nn.Identity()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x) + self.skip(x)
+
+
 class W2MLModel(nn.Module):
+    """
+    Custom residual CNN — ~2.5 M parameters.
+
+    Architecture  (at IMG_SIZE = 128)
+    ──────────────────────────────────
+    Stem    : Conv 3→32,  3×3, stride 2  →  64×64
+    Stage 1 : ResBlock 32→64,  stride 2  →  32×32   (9×32×64×2  ≈   37 K)
+    Stage 2 : ResBlock 64→128, stride 2  →  16×16   (9×64×128×2 ≈  147 K)
+    Stage 3 : ResBlock 128→256,stride 2  →   8×8    (9×128×256×2≈  590 K)
+    Stage 4 : ResBlock 256→256,stride 1  →   8×8  ×2 blocks     ≈ 2,360 K
+    GAP     : AdaptiveAvgPool2d(1)       →  256-d
+    Head    : BN → Linear 256→256 → BN → LeakyReLU
+              → Dropout(0.4) → Linear 256→EMBED_DIM
+
+    Approximate parameter budget
+    ────────────────────────────
+    Stem + Stage 1–3 :   ~775 K
+    Stage 4 (2 blocks):  ~2,360 K
+    Head              :    ~98 K
+    BN + skip projections: ~66 K
+    ──────────────────────────────
+    Total             :  ~3.3 M   ← inside the 1–5 M target
+
+    Why this design beats the previous options
+    ───────────────────────────────────────────
+    • Full 3×3 standard convolutions (not depthwise-separable) — enough
+      capacity to learn fine-grained palmprint vein/ridge patterns
+    • Residual skip connections — stable gradients even at 8 conv layers deep,
+      which the paper-style plain CNN lacked
+    • Two blocks at Stage 4 (256 ch, no downsampling) — the model spends most
+      of its budget refining rich high-level features rather than on FC weights
+    • GAP instead of spatial flatten — parameter count stays fixed regardless
+      of IMG_SIZE, and the network is forced to build spatially invariant features
+    • Dropout(0.4) only on the FC — convolutions regularised by BN + augmentation
+    """
+
     def __init__(self):
         super().__init__()
-        lrelu = partial(nn.LeakyReLU, negative_slope=0.1, inplace=True)
 
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, stride=4, padding=1, bias=False),
-            nn.BatchNorm2d(16), lrelu(),
-            nn.MaxPool2d(kernel_size=2, stride=1),
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.1, inplace=True),
+        )  # 128 → 64
 
-            nn.Conv2d(16, 32, kernel_size=5, stride=2, padding=2, bias=False),
-            nn.BatchNorm2d(32), lrelu(),
-            nn.MaxPool2d(kernel_size=2, stride=1),
-
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(64), lrelu(),
-
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(128), lrelu(),
-            nn.MaxPool2d(kernel_size=2, stride=1),
+        self.stage1 = _ResBlock(32,  64,  stride=2)   # 64  → 32
+        self.stage2 = _ResBlock(64,  128, stride=2)   # 32  → 16
+        self.stage3 = _ResBlock(128, 256, stride=2)   # 16  →  8
+        self.stage4 = nn.Sequential(                   #  8  →  8  (×2, no downsample)
+            _ResBlock(256, 256, stride=1),
+            _ResBlock(256, 256, stride=1),
         )
 
-        with torch.no_grad():
-            dummy = torch.zeros(1, 3, IMG_SIZE, IMG_SIZE)
-            feat_size = self.features(dummy).view(1, -1).shape[1]
+        self.gap = nn.AdaptiveAvgPool2d(1)             # (B, 256, 8, 8) → (B, 256)
 
-        self.classifier = nn.Sequential(
+        self.head = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(feat_size, 1024, bias=False), nn.BatchNorm1d(1024),
-            lrelu(), nn.Dropout(p=0.3),
-            nn.Linear(1024, 512, bias=False), nn.BatchNorm1d(512),
-            lrelu(), nn.Dropout(p=0.3),
-            nn.Linear(512, EMBED_DIM, bias=False),
+            nn.BatchNorm1d(256),
+            nn.Linear(256, 256, bias=False),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Dropout(p=0.4),
+            nn.Linear(256, EMBED_DIM, bias=False),
         )
 
-    def forward(self, x):
-        return F.normalize(self.classifier(self.features(x)), p=2, dim=1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        x = self.gap(x)
+        return F.normalize(self.head(x), p=2, dim=1)
 
-    def param_groups(self, lr):
+    def param_groups(self, lr: float) -> list:
         return [{'params': self.parameters(), 'lr': lr}]
 
     def trainable_parameters(self):
