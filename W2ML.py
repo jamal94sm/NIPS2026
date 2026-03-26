@@ -10,6 +10,12 @@ Hard-mining inspired by: "Multi-Similarity Loss With General Pair Weighting
 Single-file implementation for CASIA-MS dataset.
 Filename format:  {subjectID}_{handSide}_{spectrum}_{iteration}.jpg
   e.g.            001_L_460_01.jpg
+
+FIX (data loading):
+  Spectrum names are now normalised to lowercase at parse time.
+  ALL_SPECTRA / TRAIN_SPECTRA / TEST_SPECTRA use lowercase 'white'.
+  A startup diagnostic verifies every expected spectrum is present on disk
+  and warns about any unexpected ones, preventing silent under-loading.
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -42,45 +48,42 @@ from tqdm import tqdm
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-DATA_ROOT = "/home/pai-ng/Jamal/CASIA-MS-ROI"   # folder containing all ROI .jpg files
-SAVE_DIR  = "checkpoints"       # where best.pth / latest.pth are written
-RESUME    = None                # path to a .pth checkpoint to resume from
-                                # e.g. "checkpoints/best.pth"
+DATA_ROOT = "/home/pai-ng/Jamal/CASIA-MS-ROI"
+SAVE_DIR  = "checkpoints"
+RESUME    = None
 
 # ── Evaluation protocol ───────────────────────────────────────────────────────
 EVAL_PROTOCOL  = 'cross_subject'
 TRAIN_RATIO    = 0.8
 
-ALL_SPECTRA    = ['460', '630', '700', '850', '940', 'White']
+# ── Spectrum lists — all lowercase so they match parse_casia_filename output ──
+#    parse_casia_filename does  spectrum = parts[-2].lower()
+#    so 'White', 'WHITE', 'white' in filenames all map to 'white' here.
+ALL_SPECTRA    = ['460', '630', '700', '850', '940', 'wht']   # ← lowercase; 'WHT' in filenames → 'wht'
 TRAIN_SPECTRA  = ['460', '630', '700']
-TEST_SPECTRA   = ['850', '940', 'White']
+TEST_SPECTRA   = ['850', '940', 'wht']                         # ← lowercase
+
+# Expected dataset shape — used by the startup diagnostic
+EXPECTED_IDENTITIES  = 200   # unique subjectID × side pairs
+EXPECTED_SPECTRA     = 6     # entries in ALL_SPECTRA
+EXPECTED_ITERATIONS  = 6     # captures per (identity, spectrum)
+EXPECTED_PER_IDENTITY = EXPECTED_SPECTRA * EXPECTED_ITERATIONS  # 36
 
 # ── Image ─────────────────────────────────────────────────────────────────────
 IMG_SIZE = 128
 
 # ── Episode sampling ──────────────────────────────────────────────────────────
-N           = 32    # number of classes per episode
-# K is NO LONGER set here — it is computed dynamically from the data as:
-#   K = min_images_per_identity_in_training_set - Q_PER_CLASS
-# This ensures every identity can contribute support + query without running out.
-Q_PER_CLASS = 5     # query images per class (fixed); the rest become support (K)
+N           = 32
+Q_PER_CLASS = 5
 
 EPISODES_PER_EPOCH = 200
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-# Choose backbone:
-#   'custom'   — lightweight CNN trained from scratch (original paper default)
-#   'resnet18' — ResNet-18 pretrained on ImageNet, layer1-3 frozen,
-#                layer4 + embedding head fine-tuned (paper Section 4.2)
 BACKBONE   = 'resnet18'
 EMBED_DIM  = 128
 
-# Differential learning rates (only used when BACKBONE = 'resnet18')
-#   LR_LAYER4 : fine-tune rate for the unfrozen ResNet layer4
-#   LR_HEAD   : full learning rate for the new 128-d embedding head
-# The frozen layers (layer1-3) receive no gradient at all.
-LR_LAYER4  = 2e-5   # 10× lower than head — gentle fine-tuning of layer4
-LR_HEAD    = 2e-4   # matches the paper's Adam base lr (same as LR above)
+LR_LAYER4  = 2e-5
+LR_HEAD    = 2e-4
 
 # ── Loss hyper-parameters (Section 3.3) ──────────────────────────────────────
 ALPHA  = 2.0
@@ -103,6 +106,121 @@ LOG_INTERVAL = 50
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  SECTION 0 — STARTUP DIAGNOSTIC
+#  Scans DATA_ROOT once and verifies the dataset matches expectations.
+#  Catches spectrum name mismatches, missing files, etc. before training starts.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_dataset_diagnostic(root: str) -> None:
+    """
+    One-pass scan of DATA_ROOT.  Prints:
+      • Total images found / skipped
+      • Spectra actually present on disk  vs  ALL_SPECTRA
+      • Identities found  vs  EXPECTED_IDENTITIES
+      • Images per identity: min / median / max  vs  EXPECTED_PER_IDENTITY
+      • Any spectrum in ALL_SPECTRA with zero images  ← catches case bugs
+      • Any spectrum found on disk NOT in ALL_SPECTRA ← catches typos
+    Raises RuntimeError if a critical mismatch is detected.
+    """
+    from collections import Counter
+    print(f"\n{'═'*60}")
+    print(f"  DATASET DIAGNOSTIC  —  {root}")
+    print(f"{'═'*60}")
+
+    found_spectra:   Counter = Counter()
+    identity_counts: Dict[str, int] = defaultdict(int)
+    skipped = 0
+
+    for fname in sorted(os.listdir(root)):
+        if not fname.lower().endswith(('.jpg', '.jpeg', '.png')):
+            continue
+        parsed = _parse_raw(fname)     # internal helper, no filtering
+        if parsed is None:
+            skipped += 1
+            continue
+        subject, side, spectrum, _ = parsed
+        found_spectra[spectrum] += 1
+        identity_counts[f"{subject}_{side}"] += 1
+
+    total = sum(found_spectra.values())
+    print(f"  Total images parsed  : {total:,}")
+    print(f"  Skipped (bad names)  : {skipped}")
+    print(f"  Unique identities    : {len(identity_counts)}  "
+          f"(expected {EXPECTED_IDENTITIES})")
+
+    # ── Spectrum audit ────────────────────────────────────────────────────
+    expected_set = set(ALL_SPECTRA)
+    found_set    = set(found_spectra.keys())
+
+    missing_from_disk = expected_set - found_set
+    extra_on_disk     = found_set    - expected_set
+
+    print(f"\n  Spectra found on disk : {sorted(found_set)}")
+    print(f"  ALL_SPECTRA (config)  : {sorted(expected_set)}")
+
+    if missing_from_disk:
+        # This is the critical failure mode: spectrum exists in config but not
+        # on disk → those images will be silently excluded from every dataset.
+        raise RuntimeError(
+            f"\n  ✗ CRITICAL — spectra in ALL_SPECTRA with ZERO images on disk:\n"
+            f"      {sorted(missing_from_disk)}\n"
+            f"  Likely cause: case mismatch between filenames and ALL_SPECTRA.\n"
+            f"  Filenames use: {sorted(found_set)}\n"
+            f"  Fix: ensure ALL_SPECTRA matches exactly, or update the filenames."
+        )
+    if extra_on_disk:
+        print(f"  ⚠  Spectra on disk NOT in ALL_SPECTRA (will be ignored): "
+              f"{sorted(extra_on_disk)}")
+
+    print(f"\n  Images per spectrum:")
+    for spec in sorted(found_spectra):
+        marker = "✓" if spec in expected_set else "⚠"
+        print(f"    {marker}  {spec:<10}  {found_spectra[spec]:,}")
+
+    # ── Per-identity counts ───────────────────────────────────────────────
+    counts = sorted(identity_counts.values())
+    n      = len(counts)
+    median = counts[n // 2]
+    mean   = sum(counts) / n if n else 0
+    print(f"\n  Images per identity:")
+    print(f"    Min    : {counts[0]}  "
+          f"{'✓' if counts[0] == EXPECTED_PER_IDENTITY else f'⚠ expected {EXPECTED_PER_IDENTITY}'}")
+    print(f"    Median : {median}")
+    print(f"    Mean   : {mean:.1f}")
+    print(f"    Max    : {counts[-1]}")
+
+    if counts[0] < EXPECTED_PER_IDENTITY:
+        low = [(ident, cnt) for ident, cnt in identity_counts.items()
+               if cnt < EXPECTED_PER_IDENTITY]
+        print(f"\n  ⚠  {len(low)} identities below {EXPECTED_PER_IDENTITY} images:")
+        for ident, cnt in sorted(low, key=lambda x: x[1])[:20]:
+            print(f"      {ident:<20}  {cnt}")
+        if len(low) > 20:
+            print(f"      … and {len(low)-20} more")
+    else:
+        print(f"\n  ✓ All identities have {EXPECTED_PER_IDENTITY} images each.")
+
+    print(f"{'═'*60}\n")
+
+
+def _parse_raw(fname: str) -> Optional[Tuple[str, str, str, str]]:
+    """
+    Internal helper used only by the diagnostic.
+    Parses without any spectrum filtering, so we can see the raw on-disk names.
+    Spectrum is still normalised to lowercase (same as parse_casia_filename).
+    """
+    name  = os.path.splitext(fname)[0]
+    parts = name.split('_')
+    if len(parts) < 4:
+        return None
+    iteration = parts[-1]
+    spectrum  = parts[-2].lower()   # ← normalise here too
+    side      = parts[-3]
+    subject   = '_'.join(parts[:-3])
+    return subject, side, spectrum, iteration
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 1 — DATASET
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -116,20 +234,17 @@ def parse_casia_filename(fname: str) -> Optional[Tuple[str, str, str, str]]:
 
     Identity = subjectID + '_' + side  (left/right treated as distinct classes).
 
-    NOTE: subjectID is assumed to contain NO underscores (e.g. '001', '002').
-    If your dataset uses multi-part IDs, adjust the split index accordingly.
+    NOTE: spectrum is normalised to lowercase so that 'White', 'WHITE', and
+    'white' in filenames all resolve to 'white', matching ALL_SPECTRA entries.
     """
     name  = os.path.splitext(fname)[0]
     parts = name.split('_')
-    # Minimum 4 parts: subjectID, side, spectrum, iteration
     if len(parts) < 4:
         return None
-    # parts[-1] = iteration, parts[-2] = spectrum, parts[-3] = side,
-    # parts[:-3] joined = subjectID (handles IDs that contain underscores)
     iteration = parts[-1]
-    spectrum  = parts[-2]
+    spectrum  = parts[-2].lower()   # ← FIX: normalise to lowercase
     side      = parts[-3]
-    subject   = '_'.join(parts[:-3])   # robust to multi-part subject IDs
+    subject   = '_'.join(parts[:-3])
     return subject, side, spectrum, iteration
 
 
@@ -140,10 +255,9 @@ def build_identity_index(root: str,
     Single-pass scan of DATA_ROOT.
     Returns  {identity_string: [list_of_full_file_paths]}
     where identity = '{subjectID}_{side}'.
-
-    Having one consolidated scan avoids the double-pass inconsistency that
-    existed in the original get_all_subjects + split_subjects pair.
     """
+    # spectra list is already lowercase (from ALL_SPECTRA or caller);
+    # parse_casia_filename also returns lowercase spectrum → safe comparison.
     allowed = set(spectra) if spectra else set(ALL_SPECTRA)
     index: Dict[str, List[str]] = defaultdict(list)
     for fname in sorted(os.listdir(root)):
@@ -166,19 +280,12 @@ def split_subjects(root: str,
                    ) -> Tuple[List[str], List[str]]:
     """
     Open-set subject split (Section 4.2).
-
     Returns (train_identities, test_identities).
-    Zero category overlap guaranteed.
-    Sorted subject list → deterministic split (same as original).
     """
     if not 0.0 < train_ratio < 1.0:
         raise ValueError(f"TRAIN_RATIO must be in (0, 1), got {train_ratio}")
 
     index = build_identity_index(root, spectra)
-
-    # Derive unique subject IDs from the identities (strip the '_side' suffix)
-    # Identities have the form '{subjectID}_{side}', where side ∈ {L, R}.
-    # We split on the last '_' to recover the subject.
     subjects = sorted({ident.rsplit('_', 1)[0] for ident in index})
     n_train  = max(1, int(len(subjects) * train_ratio))
     train_subjects = set(subjects[:n_train])
@@ -193,17 +300,7 @@ def split_subjects(root: str,
 def print_identity_counts(dataset: 'CASIAMSDataset',
                           tag: str = '',
                           top_n_outliers: int = 10) -> None:
-    """
-    Print per-identity image counts for a CASIAMSDataset.
-
-    Shows:
-      • Summary statistics (min / median / max / mean)
-      • Distribution histogram (bucketed)
-      • The `top_n_outliers` identities with the fewest images (potential issues)
-      • The `top_n_outliers` identities with the most images
-    """
     counts: Dict[str, int] = defaultdict(int)
-    # Reverse the identity_to_idx map so we can print human-readable names
     idx_to_identity = {v: k for k, v in dataset.identity_to_idx.items()}
 
     for _, label, _ in dataset.samples:
@@ -220,12 +317,12 @@ def print_identity_counts(dataset: 'CASIAMSDataset',
     print(f"{'─'*60}")
     print(f"  Total identities : {n}")
     print(f"  Total images     : {sum(values)}")
-    print(f"  Min              : {values[0]}")
+    print(f"  Min              : {values[0]}  "
+          f"{'✓' if values[0] == EXPECTED_PER_IDENTITY else f'⚠ expected {EXPECTED_PER_IDENTITY}'}")
     print(f"  Median           : {values[n // 2]}")
     print(f"  Mean             : {sum(values) / n:.1f}")
     print(f"  Max              : {values[-1]}")
 
-    # Histogram
     bucket_size = max(1, (values[-1] - values[0]) // 10 + 1)
     buckets: Dict[int, int] = defaultdict(int)
     for v in values:
@@ -236,13 +333,11 @@ def print_identity_counts(dataset: 'CASIAMSDataset',
         print(f"    [{bucket_start:4d}–{bucket_start + bucket_size - 1:4d}]  "
               f"{bar}  ({buckets[bucket_start]})")
 
-    # Bottom outliers
     sorted_by_count = sorted(counts.items(), key=lambda x: x[1])
     print(f"\n  {top_n_outliers} identities with fewest images:")
     for ident, cnt in sorted_by_count[:top_n_outliers]:
         print(f"    {ident:<20s}  {cnt:3d} images")
 
-    # Top identities
     print(f"\n  {top_n_outliers} identities with most images:")
     for ident, cnt in sorted_by_count[-top_n_outliers:][::-1]:
         print(f"    {ident:<20s}  {cnt:3d} images")
@@ -254,6 +349,9 @@ class CASIAMSDataset(Dataset):
     """
     CASIA-MS ROI dataset with optional spectrum filtering.
     Returns (img_tensor, int_label, spectrum_str) per sample.
+
+    Spectrum strings are always lowercase (normalised in parse_casia_filename).
+    Pass spectra as lowercase strings, e.g. ['460', 'white'] not ['White'].
     """
 
     def __init__(
@@ -264,7 +362,9 @@ class CASIAMSDataset(Dataset):
         transform=None,
     ):
         self.root      = root
-        self.spectra   = set(spectra) if spectra else set(ALL_SPECTRA)
+        # Normalise to lowercase for safety even if caller passes mixed case
+        self.spectra   = (set(s.lower() for s in spectra)
+                          if spectra else set(ALL_SPECTRA))
         self.transform = transform
 
         self.identity_to_idx: Dict[str, int] = {
@@ -280,6 +380,7 @@ class CASIAMSDataset(Dataset):
             if parsed is None:
                 continue
             subject, side, spectrum, _ = parsed
+            # spectrum is already lowercase from parse_casia_filename
             if spectrum not in self.spectra:
                 continue
             identity = f"{subject}_{side}"
@@ -327,13 +428,6 @@ def get_transforms(train: bool = True) -> T.Compose:
 
 def compute_dynamic_k(dataset: CASIAMSDataset,
                       q_per_class: int = Q_PER_CLASS) -> int:
-    """
-    Compute K = min_per_identity_count - q_per_class.
-
-    We use the minimum image count across ALL identities in the dataset so that
-    every identity can participate in every episode without running out of images.
-    A warning is printed if the resulting K is small.
-    """
     counts: Dict[int, int] = defaultdict(int)
     for _, label, _ in dataset.samples:
         counts[label] += 1
@@ -360,8 +454,6 @@ def compute_dynamic_k(dataset: CASIAMSDataset,
 class EpisodeSampler:
     """
     Samples one episode: N classes × (K support + Q_PER_CLASS query) images.
-
-    K is passed in at construction time (computed dynamically from the dataset).
     """
 
     def __init__(self, dataset: CASIAMSDataset, k: int):
@@ -390,14 +482,6 @@ class EpisodeSampler:
     def sample_episode(
         self,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Returns
-        -------
-        support_imgs   : (N*K, C, H, W)
-        support_labels : (N*K,)   local labels 0 … N-1
-        query_imgs     : (N*Q, C, H, W)
-        query_labels   : (N*Q,)   local labels 0 … N-1
-        """
         chosen = random.sample(self.valid_labels, N)
         s_imgs, s_labels, q_imgs, q_labels = [], [], [], []
 
@@ -424,45 +508,24 @@ class EpisodeSampler:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class W2MLModel(nn.Module):
-    """
-    Custom CNN trained from scratch (no pretrained weights).
-
-    Architecture:
-      Conv1 : 3×3, 16 filters, stride 4, Leaky ReLU(0.1)
-      MaxPool: 2×2, stride 1
-      Conv2 : 5×5, 32 filters, stride 2, Leaky ReLU(0.1)
-      MaxPool: 2×2, stride 1
-      Conv3 : 3×3, 64 filters, stride 1, Leaky ReLU(0.1)
-      Conv4 : 3×3, 128 filters, stride 1, Leaky ReLU(0.1)
-      MaxPool: 2×2, stride 1
-      FC1   : 1024, Leaky ReLU(0.1)
-      FC2   : 512,  Leaky ReLU(0.1)
-      FC3   : 128,  no activation  ← embedding output
-      L2-normalise → EMBED_DIM-d unit hypersphere
-    """
-
     def __init__(self):
         super().__init__()
         lrelu = partial(nn.LeakyReLU, negative_slope=0.1, inplace=True)
 
         self.features = nn.Sequential(
             nn.Conv2d(3, 16, kernel_size=3, stride=4, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            lrelu(),
+            nn.BatchNorm2d(16), lrelu(),
             nn.MaxPool2d(kernel_size=2, stride=1),
 
             nn.Conv2d(16, 32, kernel_size=5, stride=2, padding=2, bias=False),
-            nn.BatchNorm2d(32),
-            lrelu(),
+            nn.BatchNorm2d(32), lrelu(),
             nn.MaxPool2d(kernel_size=2, stride=1),
 
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            lrelu(),
+            nn.BatchNorm2d(64), lrelu(),
 
             nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-            lrelu(),
+            nn.BatchNorm2d(128), lrelu(),
             nn.MaxPool2d(kernel_size=2, stride=1),
         )
 
@@ -472,23 +535,17 @@ class W2MLModel(nn.Module):
 
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(feat_size, 1024, bias=False),
-            nn.BatchNorm1d(1024),
-            lrelu(),
-            nn.Dropout(p=0.3),
-
-            nn.Linear(1024, 512, bias=False),
-            nn.BatchNorm1d(512),
-            lrelu(),
-            nn.Dropout(p=0.3),
-
+            nn.Linear(feat_size, 1024, bias=False), nn.BatchNorm1d(1024),
+            lrelu(), nn.Dropout(p=0.3),
+            nn.Linear(1024, 512, bias=False), nn.BatchNorm1d(512),
+            lrelu(), nn.Dropout(p=0.3),
             nn.Linear(512, EMBED_DIM, bias=False),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return F.normalize(self.classifier(self.features(x)), p=2, dim=1)
 
-    def param_groups(self, lr: float) -> list:
+    def param_groups(self, lr):
         return [{'params': self.parameters(), 'lr': lr}]
 
     def trainable_parameters(self):
@@ -496,122 +553,61 @@ class W2MLModel(nn.Module):
 
 
 class ResNet18Model(nn.Module):
-    """
-    ResNet-18 backbone as used in the paper (Section 4.2).
-
-    Freezing strategy
-    ─────────────────
-    Frozen  (requires_grad=False) : conv1, bn1, maxpool, layer1, layer2, layer3
-    Unfrozen (fine-tuned)         : layer4  ← rich semantic features, adapt to palmprint
-    Unfrozen (trained from init)  : embedding head (Linear 512→EMBED_DIM, no bias)
-
-    The original ResNet-18 avgpool + fc are replaced by:
-        AdaptiveAvgPool2d(1) → Flatten → Linear(512, EMBED_DIM, bias=False)
-    followed by L2 normalisation onto the unit hypersphere.
-
-    Param groups (for differential LR in Adam)
-    ──────────────────────────────────────────
-      group 0 — layer4          : LR_LAYER4  (gentle fine-tune)
-      group 1 — embedding head  : LR_HEAD    (full rate, new weights)
-
-    IMG_SIZE note
-    ─────────────
-    The paper uses 224×224 ROIs.  This model works at any size ≥ 32 px because
-    of the AdaptiveAvgPool2d, but 224 is recommended for best transfer quality.
-    Set IMG_SIZE = 224 in the PARAMETERS block when using this backbone.
-    """
-
-    # Modules that stay frozen — listed by attribute name on the ResNet object
     _FROZEN_MODULES = ('conv1', 'bn1', 'relu', 'maxpool',
                        'layer1', 'layer2', 'layer3')
 
     def __init__(self):
         super().__init__()
         import torchvision.models as models
-
         base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
 
-        # ── Freeze layers 1–3 ────────────────────────────────────────────
         for name in self._FROZEN_MODULES:
-            module = getattr(base, name)
-            for param in module.parameters():
+            for param in getattr(base, name).parameters():
                 param.requires_grad = False
 
-        # ── Keep layer4 (unfrozen by default) ────────────────────────────
         self.frozen_body = nn.Sequential(
             base.conv1, base.bn1, base.relu, base.maxpool,
             base.layer1, base.layer2, base.layer3,
         )
-        self.layer4 = base.layer4          # unfrozen — fine-tuned at LR_LAYER4
+        self.layer4  = base.layer4
+        self.pool    = nn.AdaptiveAvgPool2d(1)
+        self.head    = nn.Linear(512, EMBED_DIM, bias=False)
 
-        # ── New embedding head (replaces avgpool + fc) ────────────────────
-        # ResNet-18 layer4 output: (B, 512, H/32, W/32)
-        self.pool     = nn.AdaptiveAvgPool2d(1)
-        self.head     = nn.Linear(512, EMBED_DIM, bias=False)  # trained at LR_HEAD
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.frozen_body(x)   # frozen — no grad flows here
-        x = self.layer4(x)        # fine-tuned
+    def forward(self, x):
+        x = self.frozen_body(x)
+        x = self.layer4(x)
         x = self.pool(x).flatten(1)
-        x = self.head(x)
-        return F.normalize(x, p=2, dim=1)
+        return F.normalize(self.head(x), p=2, dim=1)
 
-    def param_groups(self, lr: float) -> list:
-        """
-        Two groups with differential learning rates.
-        `lr` argument is accepted for API compatibility but ignored here —
-        LR_LAYER4 and LR_HEAD from the global config are used directly.
-        """
+    def param_groups(self, lr):
         return [
-            {'params': self.layer4.parameters(),
-             'lr': LR_LAYER4,
-             'name': 'layer4'},
-            {'params': self.head.parameters(),
-             'lr': LR_HEAD,
-             'name': 'head'},
+            {'params': self.layer4.parameters(), 'lr': LR_LAYER4, 'name': 'layer4'},
+            {'params': self.head.parameters(),   'lr': LR_HEAD,   'name': 'head'},
         ]
 
     def trainable_parameters(self):
         return [p for p in self.parameters() if p.requires_grad]
 
     @staticmethod
-    def frozen_module_names() -> Tuple[str, ...]:
+    def frozen_module_names():
         return ResNet18Model._FROZEN_MODULES
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-
 def build_model(backbone: str = BACKBONE) -> nn.Module:
-    """
-    Factory that returns the selected model.
-
-    backbone='custom'   → W2MLModel  (from-scratch CNN, any IMG_SIZE)
-    backbone='resnet18' → ResNet18Model  (ImageNet pretrained, IMG_SIZE=224 recommended)
-    """
     backbone = backbone.lower().strip()
     if backbone == 'custom':
         return W2MLModel()
     elif backbone == 'resnet18':
         return ResNet18Model()
     else:
-        raise ValueError(
-            f"Unknown backbone '{backbone}'. "
-            f"Choose 'custom' or 'resnet18'."
-        )
+        raise ValueError(f"Unknown backbone '{backbone}'. Choose 'custom' or 'resnet18'.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 4 — W2ML LOSS  (Equations 2–8)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def build_meta_support_sets(
-    support_embs:   torch.Tensor,   # (N*K, D)
-    support_labels: torch.Tensor,   # (N*K,)
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Eq. 2 — S_j_meta = mean_i f(x^j_i), then re-normalise.
-    Returns meta_embs (N, D) and meta_labels (N,).
-    """
+def build_meta_support_sets(support_embs, support_labels):
     unique_labels = torch.unique(support_labels, sorted=True)
     meta_embs = torch.stack([
         support_embs[support_labels == lbl].mean(0) for lbl in unique_labels
@@ -619,38 +615,17 @@ def build_meta_support_sets(
     return F.normalize(meta_embs, p=2, dim=1), unique_labels
 
 
-def mine_hard_pairs(
-    pos_dists: torch.Tensor,
-    neg_dists: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Eq. 4 — positive selected iff  d_pos < max(d_neg) + m
-    Eq. 5 — negative selected iff  d_neg > min(d_pos) - m
-    """
+def mine_hard_pairs(pos_dists, neg_dists):
     hard_pos_mask = pos_dists < neg_dists.max() + MARGIN
     hard_neg_mask = neg_dists > pos_dists.min() - MARGIN
     return hard_pos_mask, hard_neg_mask
 
 
-def w2ml_loss(
-    query_embs:   torch.Tensor,
-    query_labels: torch.Tensor,
-    meta_embs:    torch.Tensor,
-    meta_labels:  torch.Tensor,
-) -> torch.Tensor:
-    """
-    Eq. 8 — Episode loss averaged over all l query samples.
-
-    Loss is expressed in DISTANCE space (d = 1 − cosine_similarity).
-
-      Positive term: (1/α) · log(1 + Σ_P exp(+α(d_p − γ)))
-      Negative term: (1/β) · log(1 + Σ_N exp(−β(d_n − γ)))
-    """
-    MAX_EXP = 80.0
-    dist_mat = 1.0 - torch.mm(query_embs, meta_embs.t())   # (Q, N)
+def w2ml_loss(query_embs, query_labels, meta_embs, meta_labels):
+    MAX_EXP  = 80.0
+    dist_mat = 1.0 - torch.mm(query_embs, meta_embs.t())
 
     per_query_losses = []
-
     for q_idx in range(query_embs.size(0)):
         q_lbl    = query_labels[q_idx]
         dists    = dist_mat[q_idx]
@@ -662,7 +637,6 @@ def w2ml_loss(
 
         pos_dists = dists[pos_mask]
         neg_dists = dists[neg_mask]
-
         hp_mask, hn_mask = mine_hard_pairs(pos_dists, neg_dists)
         if hp_mask.sum() == 0 or hn_mask.sum() == 0:
             continue
@@ -673,14 +647,13 @@ def w2ml_loss(
         pos_exp  = torch.clamp(+ALPHA * (hp - GAMMA), max=MAX_EXP)
         pos_term = (1.0 / ALPHA) * torch.log1p(torch.exp(pos_exp).sum())
 
-        neg_exp  = torch.clamp(-BETA  * (hn - GAMMA), max=MAX_EXP)
+        neg_exp  = torch.clamp(-BETA * (hn - GAMMA), max=MAX_EXP)
         neg_term = (1.0 / BETA)  * torch.log1p(torch.exp(neg_exp).sum())
 
         per_query_losses.append(pos_term + neg_term)
 
     if not per_query_losses:
         return dist_mat.sum() * 0.0
-
     return torch.stack(per_query_losses).mean()
 
 
@@ -689,15 +662,9 @@ def w2ml_loss(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def extract_features(
-    model:   nn.Module,
-    dataset: CASIAMSDataset,
-    device:  torch.device,
-) -> Tuple[np.ndarray, np.ndarray]:
-    loader = DataLoader(
-        dataset, batch_size=64, shuffle=False,
-        num_workers=NUM_WORKERS, pin_memory=True,
-    )
+def extract_features(model, dataset, device):
+    loader = DataLoader(dataset, batch_size=64, shuffle=False,
+                        num_workers=NUM_WORKERS, pin_memory=True)
     model.eval()
     all_embs, all_labels = [], []
     for imgs, labels, *_ in tqdm(loader, desc='  Extracting', leave=False):
@@ -706,37 +673,31 @@ def extract_features(
     return np.concatenate(all_embs), np.concatenate(all_labels).astype(np.int32)
 
 
-def identification(embs: np.ndarray, labels: np.ndarray) -> float:
+def identification(embs, labels):
     unique_labels = np.unique(labels)
     g_embs, g_labs, p_embs, p_labs = [], [], [], []
-
     for lbl in unique_labels:
         idxs = np.where(labels == lbl)[0]
         g_embs.append(embs[idxs[0]]);  g_labs.append(lbl)
         for i in idxs[1:]:
             p_embs.append(embs[i]);  p_labs.append(lbl)
-
     g_embs = np.array(g_embs);  g_labs = np.array(g_labs)
     p_embs = np.array(p_embs);  p_labs = np.array(p_labs)
-
-    preds = g_labs[np.argmax(p_embs @ g_embs.T, axis=1)]
+    preds  = g_labs[np.argmax(p_embs @ g_embs.T, axis=1)]
     return float((preds == p_labs).mean())
 
 
-def compute_eer(genuine: np.ndarray, imposter: np.ndarray) -> float:
+def compute_eer(genuine, imposter):
     thresholds = np.linspace(
         min(genuine.min(), imposter.min()),
-        max(genuine.max(), imposter.max()),
-        1000,
-    )
+        max(genuine.max(), imposter.max()), 1000)
     far = np.array([(imposter <= t).mean() for t in thresholds])
     frr = np.array([(genuine  >  t).mean() for t in thresholds])
     idx = np.argmin(np.abs(far - frr))
     return float((far[idx] + frr[idx]) / 2.0)
 
 
-def verification(embs: np.ndarray, labels: np.ndarray,
-                 max_imp: int = 200_000) -> float:
+def verification(embs, labels, max_imp=200_000):
     rng   = np.random.default_rng(42)
     l2idx = defaultdict(list)
     for i, lbl in enumerate(labels):
@@ -749,8 +710,8 @@ def verification(embs: np.ndarray, labels: np.ndarray,
                 genuine.append(1.0 - float(embs[idxs[i]] @ embs[idxs[j]]))
     genuine = np.array(genuine, dtype=np.float32)
 
-    uniq    = list(l2idx.keys())
-    n_imp   = min(max_imp, len(genuine))
+    uniq     = list(l2idx.keys())
+    n_imp    = min(max_imp, len(genuine))
     imposter = []
     for _ in range(n_imp * 5):
         if len(imposter) >= n_imp:
@@ -760,16 +721,10 @@ def verification(embs: np.ndarray, labels: np.ndarray,
         ib   = rng.choice(l2idx[b])
         imposter.append(1.0 - float(embs[ia] @ embs[ib]))
     imposter = np.array(imposter[:n_imp], dtype=np.float32)
-
     return compute_eer(genuine, imposter)
 
 
-def evaluate(
-    model:   nn.Module,
-    dataset: CASIAMSDataset,
-    device:  torch.device,
-    tag:     str = '',
-) -> Dict[str, float]:
+def evaluate(model, dataset, device, tag=''):
     embs, labels = extract_features(model, dataset, device)
     acc = identification(embs, labels)
     eer = verification(embs, labels)
@@ -782,15 +737,10 @@ def evaluate(
 #  SECTION 6 — TRAINING LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_episode(
-    model:   nn.Module,
-    sampler: EpisodeSampler,
-    device:  torch.device,
-) -> torch.Tensor:
+def run_episode(model, sampler, device):
     s_imgs, s_labels, q_imgs, q_labels = sampler.sample_episode()
     s_imgs, s_labels = s_imgs.to(device), s_labels.to(device)
     q_imgs, q_labels = q_imgs.to(device), q_labels.to(device)
-
     s_embs = model(s_imgs)
     q_embs = model(q_imgs)
     meta_embs, meta_labels = build_meta_support_sets(s_embs, s_labels)
@@ -802,12 +752,18 @@ def main() -> None:
     random.seed(SEED)
     np.random.seed(SEED)
     device = torch.device(DEVICE if torch.cuda.is_available() else 'cpu')
+
     print(f"\nW2ML Palmprint Recognition")
     print(f"  Device    : {device}")
     print(f"  Backbone  : {BACKBONE}")
     print(f"  Protocol  : {EVAL_PROTOCOL}")
     print(f"  Q_PER_CLASS (fixed) : {Q_PER_CLASS}")
     print(f"  K will be computed dynamically from training data\n")
+
+    # ── Step 0: Run diagnostic before anything else ──────────────────────
+    # This will raise RuntimeError early if a spectrum name mismatch is found,
+    # rather than silently training on an incomplete dataset.
+    run_dataset_diagnostic(DATA_ROOT)
 
     # ── Build datasets ───────────────────────────────────────────────────
     train_ids, test_ids = split_subjects(DATA_ROOT, TRAIN_RATIO)
@@ -826,26 +782,18 @@ def main() -> None:
     else:
         raise ValueError(f"Unknown EVAL_PROTOCOL: {EVAL_PROTOCOL}")
 
-    # Eval datasets (no augmentation)
-    train_dataset = CASIAMSDataset(DATA_ROOT, train_ids, tr_spec,
-                                   get_transforms(train=False))
-    test_dataset  = CASIAMSDataset(DATA_ROOT, test_ids,  te_spec,
-                                   get_transforms(train=False))
-
-    # Augmented dataset used only during training episodes
+    train_dataset     = CASIAMSDataset(DATA_ROOT, train_ids, tr_spec,
+                                       get_transforms(train=False))
+    test_dataset      = CASIAMSDataset(DATA_ROOT, test_ids,  te_spec,
+                                       get_transforms(train=False))
     train_dataset_aug = CASIAMSDataset(DATA_ROOT, train_ids, tr_spec,
                                        get_transforms(train=True))
 
     print(f"Samples:   {len(train_dataset)} train / {len(test_dataset)} test\n")
 
-    # ── Print per-identity image counts ─────────────────────────────────
-    # Uses the non-augmented dataset (same file list, no transform difference)
     print_identity_counts(train_dataset, tag='TRAIN')
     print_identity_counts(test_dataset,  tag='TEST')
 
-    # ── Compute K dynamically ────────────────────────────────────────────
-    # K = min images per identity in the AUGMENTED training set - Q_PER_CLASS
-    # (aug dataset has identical files to train_dataset, just different transforms)
     K = compute_dynamic_k(train_dataset_aug, Q_PER_CLASS)
     print(f"Dynamic K  : {K}  (= min_per_identity - Q_PER_CLASS = "
           f"min_per_identity - {Q_PER_CLASS})")
@@ -914,7 +862,6 @@ def main() -> None:
 
         print("  Evaluating train set ...")
         tr_metrics = evaluate(model, train_dataset, device, tag='train')
-
         print("  Evaluating test set ...")
         te_metrics = evaluate(model, test_dataset,  device, tag=EVAL_PROTOCOL)
 
