@@ -82,7 +82,7 @@ MARGIN = 0.05       # hard-mining margin m                   (paper: 0.05 optima
 
 # ── Training ──────────────────────────────────────────────────────────────────
 NUM_EPOCHS   = 60
-LR           = 2e-4             # Adam base lr                (paper: 0.0002)
+LR           = 1e-3             # Adam base lr                (paper: 0.0002)
 WEIGHT_DECAY = 1e-4
 LR_STEP      = 20               # StepLR: decay every N epochs
 LR_GAMMA     = 0.5
