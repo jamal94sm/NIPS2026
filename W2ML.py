@@ -65,7 +65,7 @@ IMG_SIZE = 128                    # custom CNN trained from scratch; 128×128
 
 # ── Episode sampling  (Table 1) ───────────────────────────────────────────────
 N           = 32    # number of classes per episode          (paper: 32)
-K           = 30     # support images per class               (paper: 4)
+K           = 28     # support images per class               (paper: 4)
 Q_PER_CLASS = 6     # query images per class  (not specified; match K)
 
 EPISODES_PER_EPOCH = 200
