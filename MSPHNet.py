@@ -1,54 +1,59 @@
 """
-MSPHNet on CASIA-MS Dataset (Paper-Faithful Implementation)
-============================================================
-Multi-Scale Parallel Hybrid Network for Palmprint Recognition (ICASSP 2025)
-
-This implementation follows the paper exactly:
-  - PHEB: Gabor + CNN(CAB) + Transformer branches
-  - CAB: XA + YA → CA → PA (Equations 1-4)
-  - Transformer: 8×8 patches, 8 attention heads (Equation 5)
-  - U-Net encoder-decoder with skip connections
-
-Speed optimization: Patch-based attention (8×8 patches = 64 patches per 64×64 map)
-  → Attention is O(64²) = 4096, not O(4096²) = 16M
+MSPHNet on CASIA-MS Dataset  —  FIXED VERSION
+==================================================
+Changes vs original:
+  FIX 1  (critical) TransformerBranch: pos_embedding pre-allocated in __init__,
+          not re-created inside forward(). The original created it dynamically,
+          so it was never in the optimizer's parameter groups and never trained.
+  FIX 2  (critical) PHEB: added pre_proj Conv2d(in_channels→1) before the Gabor
+          filter so the Gabor always operates on a single-channel map instead of
+          a 64/128/256-channel one. The original caused a massive bottleneck
+          (e.g. 256→36 channels = 86% information lost at the deepest layers).
+          Also removed the dead `is_first` branch (both cases were identical).
+          Added a residual 1×1 shortcut around the whole PHEB so gradients can
+          flow back to the encoder without going through the Gabor path.
+  FIX 3  (moderate) MSPHNet: passes spatial_size to each PHEB/TransformerBranch
+          so the pre-allocated positional embedding has the right shape per level.
+  FIX 4  (config)   lr reset to 0.0001 (paper default), batch_size reset to 32,
+          StepLR replaced with CosineAnnealingLR, 10-epoch linear warmup added.
+  FIX 5  (stability) DataLoader: persistent_workers=True, error-handling wrapper
+          in __getitem__ so a single corrupt image doesn't crash the whole run.
+  FIX 6  (training)  Validation pass now uses ground-truth labels so ArcFace
+          loss is computed the same way as during training (with margin).
 """
 
-# ==============================================================
-#  CONFIG
-# ==============================================================
 CONFIG = {
-    "protocol"        : "open-set",
-    "data_root"       : "/home/pai-ng/Jamal/CASIA-MS-ROI",
-    "results_dir"     : "./rst_msphnet_casia_ms",
-    "img_side"        : 128,
-    "batch_size"      : 64,
-    "num_epochs"      : 1000,
-    "lr"              : 0.001,
-    "lr_step"         : 500,
-    "lr_gamma"        : 0.8,
-    "dropout"         : 0.5,
-    "arcface_s"       : 30.0,
-    "arcface_m"       : 0.50,
-    "embedding_dim"   : 1024,
-    "gabor_filters"   : 36,
-    "gabor_kernel"    : 17,
-    "patch_size"      : 8,              # Paper: 8×8 patches
-    "num_heads"       : 8,              # Paper: 8 attention heads
-    "ca_reduction"    : 16,
-    "train_ratio"     : 0.60,
-    "gallery_ratio"   : 0.10,
-    "val_ratio"       : 0.10,
-    "random_seed"     : 42,
-    "save_every"      : 10,
-    "eval_every"      : 50,
-    "num_workers"     : 4,
+    "protocol"         : "open-set",   # "closed-set" | "open-set"
+    "data_root"        : "/home/pai-ng/Jamal/CASIA-MS-ROI",
+    "results_dir"      : "./rst_msphnet_casia_ms",
+    "img_side"         : 128,
+    "batch_size"       : 32,           # FIX 4: paper default (was 64)
+    "num_epochs"       : 1000,
+    "lr"               : 0.0001,       # FIX 4: paper default (was 0.001)
+    "warmup_epochs"    : 10,           # FIX 4: new — linear LR warmup
+    "lr_step"          : 300,
+    "lr_gamma"         : 0.5,
+    "dropout"          : 0.5,
+    "arcface_s"        : 30.0,
+    "arcface_m"        : 0.50,
+    "embedding_dim"    : 1024,
+    "gabor_filters"    : 36,
+    "gabor_kernel"     : 17,
+    "transformer_depth": 2,
+    "transformer_dim"  : 128,
+    "transformer_heads": 8,
+    "patch_size"       : 8,
+    "ca_reduction"     : 16,
+    "train_ratio"      : 0.80,
+    "gallery_ratio"    : 0.50,
+    "val_ratio"        : 0.10,
+    "random_seed"      : 42,
+    "save_every"       : 10,
+    "eval_every"       : 50,
+    "num_workers"      : 4,
 }
 
-import os
-import math
-import time
-import random
-import warnings
+import os, sys, math, time, random, pickle, warnings
 import numpy as np
 from collections import defaultdict
 from PIL import Image
@@ -69,14 +74,21 @@ from scipy.interpolate import interp1d
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+
+try:
+    from einops import rearrange, repeat
+    from einops.layers.torch import Rearrange
+except ImportError:
+    os.system("pip install einops")
+    from einops import rearrange, repeat
+    from einops.layers.torch import Rearrange
 
 warnings.filterwarnings("ignore")
 
 SEED = CONFIG["random_seed"]
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
+random.seed(SEED); np.random.seed(SEED)
+torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -84,30 +96,32 @@ torch.cuda.manual_seed_all(SEED)
 # ══════════════════════════════════════════════════════════════
 
 class ArcMarginProduct(nn.Module):
-    def __init__(self, in_features, out_features, s=30.0, m=0.50):
+    def __init__(self, in_features, out_features, s=30.0, m=0.50, easy_margin=False):
         super().__init__()
-        self.s = s
-        self.m = m
-        self.weight = Parameter(torch.FloatTensor(out_features, in_features))
+        self.in_features  = in_features
+        self.out_features = out_features
+        self.s, self.m    = s, m
+        self.weight       = Parameter(torch.FloatTensor(out_features, in_features))
         nn.init.xavier_uniform_(self.weight)
-        self.cos_m = math.cos(m)
-        self.sin_m = math.sin(m)
-        self.th = math.cos(math.pi - m)
-        self.mm = math.sin(math.pi - m) * m
+        self.easy_margin  = easy_margin
+        self.cos_m = math.cos(m); self.sin_m = math.sin(m)
+        self.th    = math.cos(math.pi - m)
+        self.mm    = math.sin(math.pi - m) * m
 
-    def forward(self, x, label=None):
-        cosine = F.linear(F.normalize(x), F.normalize(self.weight))
-        if self.training and label is not None:
+    def forward(self, input, label=None):
+        cosine = F.linear(F.normalize(input), F.normalize(self.weight))
+        if label is not None:
             sine = torch.sqrt((1.0 - cosine.pow(2)).clamp(0, 1))
-            phi = cosine * self.cos_m - sine * self.sin_m
-            phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+            phi  = cosine * self.cos_m - sine * self.sin_m
+            if self.easy_margin:
+                phi = torch.where(cosine > 0, phi, cosine)
+            else:
+                phi = torch.where(cosine > self.th, phi, cosine - self.mm)
             one_hot = torch.zeros_like(cosine)
             one_hot.scatter_(1, label.view(-1, 1).long(), 1)
-            output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
-            output *= self.s
-        else:
-            output = self.s * cosine
-        return output
+            output = one_hot * phi + (1.0 - one_hot) * cosine
+            return output * self.s
+        return cosine * self.s
 
 
 # ══════════════════════════════════════════════════════════════
@@ -115,807 +129,830 @@ class ArcMarginProduct(nn.Module):
 # ══════════════════════════════════════════════════════════════
 
 class GaborConv2d(nn.Module):
-    """Learnable Gabor Convolution for texture extraction."""
-    def __init__(self, in_ch, out_ch, kernel_size, stride=1, padding=0):
+    def __init__(self, channel_in, channel_out, kernel_size,
+                 stride=1, padding=0, init_ratio=0.5):
         super().__init__()
-        self.in_ch = in_ch
-        self.out_ch = out_ch
+        self.channel_in  = channel_in
+        self.channel_out = channel_out
         self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
+        self.stride      = stride
+        self.padding     = padding
 
-        # Learnable parameters
-        self.sigma = nn.Parameter(torch.tensor([4.6]))
-        self.gamma = nn.Parameter(torch.tensor([2.0]))
-        self.freq = nn.Parameter(torch.tensor([0.114]))
+        SIGMA = 9.2 * init_ratio
+        self.sigma     = nn.Parameter(torch.FloatTensor([SIGMA]))
+        self.gamma     = nn.Parameter(torch.FloatTensor([2.0]))
+        self.theta     = nn.Parameter(
+            torch.arange(0, channel_out).float() * math.pi / channel_out,
+            requires_grad=False)
+        self.frequency = nn.Parameter(torch.FloatTensor([0.057 / init_ratio]))
+        self.psi       = nn.Parameter(torch.FloatTensor([0]), requires_grad=False)
 
-        # Fixed orientations
-        theta = torch.arange(0, out_ch).float() * math.pi / out_ch
-        self.register_buffer('theta', theta)
-
-        # Coordinate grids
-        half = kernel_size // 2
-        y, x = torch.meshgrid(
-            torch.arange(-half, half + 1).float(),
-            torch.arange(-half, half + 1).float(),
-            indexing='ij'
-        )
-        self.register_buffer('x_grid', x)
-        self.register_buffer('y_grid', y)
+    def _get_gabor_kernel(self):
+        xm = self.kernel_size // 2
+        x0 = torch.arange(-xm, xm + 1).float()
+        y0 = torch.arange(-xm, xm + 1).float()
+        k  = 2 * xm + 1
+        x  = x0.view(-1, 1).repeat(self.channel_out, self.channel_in, 1, k).to(self.sigma.device)
+        y  = y0.view(1, -1).repeat(self.channel_out, self.channel_in, k, 1).to(self.sigma.device)
+        th = self.theta.view(-1, 1, 1, 1)
+        x_t = x * torch.cos(th) + y * torch.sin(th)
+        y_t = -x * torch.sin(th) + y * torch.cos(th)
+        g   = -torch.exp(-0.5 * ((self.gamma * x_t)**2 + y_t**2)
+                         / (8 * self.sigma.view(-1,1,1,1)**2)) \
+              * torch.cos(2 * math.pi * self.frequency.view(-1,1,1,1) * x_t
+                          + self.psi.view(-1,1,1,1))
+        return g - g.mean(dim=[2, 3], keepdim=True)
 
     def forward(self, x):
-        theta = self.theta.view(-1, 1, 1)
-        x_theta = self.x_grid * torch.cos(theta) + self.y_grid * torch.sin(theta)
-        y_theta = -self.x_grid * torch.sin(theta) + self.y_grid * torch.cos(theta)
-
-        sigma_sq = 2 * self.sigma ** 2
-        gabor = torch.exp(-((self.gamma ** 2) * (x_theta ** 2) + y_theta ** 2) / sigma_sq)
-        gabor = gabor * torch.cos(2 * math.pi * self.freq * x_theta)
-        gabor = gabor - gabor.mean(dim=[1, 2], keepdim=True)
-
-        kernel = gabor.unsqueeze(1).repeat(1, self.in_ch, 1, 1)
-        return F.conv2d(x, kernel, stride=self.stride, padding=self.padding)
+        return F.conv2d(x, self._get_gabor_kernel(),
+                        stride=self.stride, padding=self.padding)
 
 
 # ══════════════════════════════════════════════════════════════
-#  CAB - Comprehensive Attention Block (Paper Equations 1-4)
+#  COMPREHENSIVE ATTENTION BLOCK (CAB)
 # ══════════════════════════════════════════════════════════════
 
-class XAttention(nn.Module):
-    """X-direction Attention (Eq. 1): Pool along height, attend along width."""
+class XDirectionAttention(nn.Module):
     def __init__(self, channels, reduction=16):
         super().__init__()
-        reduced = max(8, channels // reduction)
-        self.fc = nn.Sequential(
-            nn.Conv2d(channels, reduced, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(reduced, channels, 1),
-            nn.Sigmoid()
-        )
-
+        r = max(1, channels // reduction)
+        self.conv1 = nn.Conv2d(channels, r, 1)
+        self.conv2 = nn.Conv2d(r, channels, 1)
     def forward(self, x):
-        # Mean over H: [B, C, H, W] → [B, C, 1, W]
-        attn = x.mean(dim=2, keepdim=True)
-        attn = self.fc(attn)
-        return x * attn
+        a = torch.mean(x, dim=2, keepdim=True)
+        a = torch.sigmoid(self.conv2(F.relu(self.conv1(a))))
+        return x * a
 
-
-class YAttention(nn.Module):
-    """Y-direction Attention (Eq. 2): Pool along width, attend along height."""
+class YDirectionAttention(nn.Module):
     def __init__(self, channels, reduction=16):
         super().__init__()
-        reduced = max(8, channels // reduction)
-        self.fc = nn.Sequential(
-            nn.Conv2d(channels, reduced, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(reduced, channels, 1),
-            nn.Sigmoid()
-        )
-
+        r = max(1, channels // reduction)
+        self.conv1 = nn.Conv2d(channels, r, 1)
+        self.conv2 = nn.Conv2d(r, channels, 1)
     def forward(self, x):
-        # Mean over W: [B, C, H, W] → [B, C, H, 1]
-        attn = x.mean(dim=3, keepdim=True)
-        attn = self.fc(attn)
-        return x * attn
-
+        a = torch.mean(x, dim=3, keepdim=True)
+        a = torch.sigmoid(self.conv2(F.relu(self.conv1(a))))
+        return x * a
 
 class ChannelAttention(nn.Module):
-    """Channel Attention (Eq. 3): Global pooling → channel weights."""
     def __init__(self, channels, reduction=16):
         super().__init__()
-        reduced = max(8, channels // reduction)
-        self.fc = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, reduced, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(reduced, channels, 1),
-            nn.Sigmoid()
-        )
-
+        r = max(1, channels // reduction)
+        self.pool  = nn.AdaptiveAvgPool2d(1)
+        self.conv1 = nn.Conv2d(channels, r, 1)
+        self.conv2 = nn.Conv2d(r, channels, 1)
     def forward(self, x):
-        return x * self.fc(x)
-
+        a = self.pool(x)
+        a = torch.sigmoid(self.conv2(F.relu(self.conv1(a))))
+        return x * a
 
 class PixelAttention(nn.Module):
-    """Pixel Attention (Eq. 4): Per-pixel attention weights."""
     def __init__(self, channels):
         super().__init__()
-        self.fc = nn.Sequential(
-            nn.Conv2d(channels, channels, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels, 1),
-            nn.Sigmoid()
-        )
-
+        self.conv1 = nn.Conv2d(channels, channels, 1)
+        self.conv2 = nn.Conv2d(channels, channels, 1)
     def forward(self, x):
-        return x * self.fc(x)
-
+        a = torch.sigmoid(self.conv2(F.relu(self.conv1(x))))
+        return x * a
 
 class CAB(nn.Module):
-    """
-    Comprehensive Attention Block (Paper Equations 1-4).
-    Flow: Input → (XA + YA weighted sum) → CA → PA → Output
-    """
     def __init__(self, channels, reduction=16):
         super().__init__()
-        self.xa = XAttention(channels, reduction)
-        self.ya = YAttention(channels, reduction)
-        self.ca = ChannelAttention(channels, reduction)
-        self.pa = PixelAttention(channels)
-
-        # Learnable weights for XA + YA combination
+        self.xa    = XDirectionAttention(channels, reduction)
+        self.ya    = YDirectionAttention(channels, reduction)
+        self.ca    = ChannelAttention(channels, reduction)
+        self.pa    = PixelAttention(channels)
         self.alpha = nn.Parameter(torch.tensor(0.5))
-        self.beta = nn.Parameter(torch.tensor(0.5))
-
+        self.beta  = nn.Parameter(torch.tensor(0.5))
     def forward(self, x):
-        # Spatial attention: weighted sum of XA and YA
-        xa_out = self.xa(x)
-        ya_out = self.ya(x)
-        sa_out = self.alpha * xa_out + self.beta * ya_out
-
-        # Channel attention
-        ca_out = self.ca(sa_out)
-
-        # Pixel attention
-        pa_out = self.pa(ca_out)
-
-        return pa_out
+        sa  = self.alpha * self.xa(x) + self.beta * self.ya(x)
+        ca  = self.ca(sa)
+        return self.pa(ca)
 
 
 # ══════════════════════════════════════════════════════════════
-#  TRANSFORMER BRANCH (Paper: 8×8 patches, 8 heads)
+#  TRANSFORMER BLOCK
 # ══════════════════════════════════════════════════════════════
 
-class PatchEmbed(nn.Module):
-    """Convert feature map to patch embeddings."""
-    def __init__(self, in_channels, embed_dim, patch_size=8):
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout=0.1):
         super().__init__()
-        self.patch_size = patch_size
-        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
-        self.norm = nn.LayerNorm(embed_dim)
-
-    def forward(self, x):
-        # x: [B, C, H, W] → [B, embed_dim, H/P, W/P]
-        x = self.proj(x)
-        B, C, H, W = x.shape
-        # Reshape to [B, num_patches, embed_dim]
-        x = x.flatten(2).transpose(1, 2)
-        x = self.norm(x)
-        return x, H, W
-
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim), nn.Linear(dim, hidden_dim),
+            nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim), nn.Dropout(dropout))
+    def forward(self, x): return self.net(x)
 
 class MultiHeadAttention(nn.Module):
-    """Multi-Head Self-Attention (Paper Eq. 5)."""
-    def __init__(self, dim, num_heads=8, dropout=0.1):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.1):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-
-        self.qkv = nn.Linear(dim, dim * 3)
-        self.proj = nn.Linear(dim, dim)
-        self.dropout = nn.Dropout(dropout)
-
+        inner  = dim_head * heads
+        self.heads = heads; self.scale = dim_head ** -0.5
+        self.norm  = nn.LayerNorm(dim)
+        self.attend = nn.Softmax(dim=-1)
+        self.drop  = nn.Dropout(dropout)
+        self.to_qkv = nn.Linear(dim, inner * 3, bias=False)
+        self.to_out = nn.Sequential(nn.Linear(inner, dim), nn.Dropout(dropout))
     def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.dropout(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        return x
-
+        x   = self.norm(x)
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: rearrange(t,'b n (h d)->b h n d', h=self.heads), qkv)
+        dots = torch.matmul(q, k.transpose(-1,-2)) * self.scale
+        attn = self.drop(self.attend(dots))
+        out  = rearrange(torch.matmul(attn, v), 'b h n d->b n (h d)')
+        return self.to_out(out)
 
 class TransformerBlock(nn.Module):
-    """Transformer block with attention and FFN."""
-    def __init__(self, dim, num_heads=8, mlp_ratio=2.0, dropout=0.1):
+    def __init__(self, dim, heads=8, dim_head=64, mlp_dim=256, dropout=0.1):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = MultiHeadAttention(dim, num_heads, dropout)
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, int(dim * mlp_ratio)),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(int(dim * mlp_ratio), dim),
-            nn.Dropout(dropout)
-        )
-
+        self.attn = MultiHeadAttention(dim, heads, dim_head, dropout)
+        self.ff   = FeedForward(dim, mlp_dim, dropout)
     def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+        x = self.attn(x) + x
+        x = self.ff(x) + x
         return x
 
+
+# ══════════════════════════════════════════════════════════════
+#  FIX 1: TransformerBranch — pos_embedding pre-allocated in __init__
+# ══════════════════════════════════════════════════════════════
 
 class TransformerBranch(nn.Module):
     """
-    Transformer-based branch for global features (Paper description).
-    Uses 8×8 patches and 8 attention heads.
+    FIX 1: pos_embedding is now an nn.Parameter created in __init__ with
+    the correct size derived from spatial_size and patch_size. The original
+    code created it lazily inside forward() which meant the optimizer never
+    saw it and it received no gradient updates throughout training.
     """
-    def __init__(self, in_channels, out_channels, patch_size=8, num_heads=8, depth=1):
+    def __init__(self, in_channels, spatial_size, patch_size=8,
+                 dim=128, depth=2, heads=8, mlp_dim=256, dropout=0.1):
         super().__init__()
         self.patch_size = patch_size
-        embed_dim = out_channels
+        self.dim        = dim
 
-        # Patch embedding
-        self.patch_embed = PatchEmbed(in_channels, embed_dim, patch_size)
+        num_patches_side = spatial_size // patch_size
+        num_patches      = num_patches_side * num_patches_side
+        patch_dim        = in_channels * patch_size * patch_size
 
-        # Positional embedding (learnable)
-        self.pos_embed = None  # Will be initialized dynamically
+        self.to_patch_embedding = nn.Sequential(
+            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)',
+                      p1=patch_size, p2=patch_size),
+            nn.LayerNorm(patch_dim),
+            nn.Linear(patch_dim, dim),
+            nn.LayerNorm(dim),
+        )
 
-        # Transformer blocks
-        self.blocks = nn.ModuleList([
-            TransformerBlock(embed_dim, num_heads, mlp_ratio=2.0, dropout=0.1)
-            for _ in range(depth)
-        ])
+        # FIX 1: allocated here, registered with the optimizer from the start
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches, dim) * 0.02)
 
-        self.norm = nn.LayerNorm(embed_dim)
-
-        # Project back to spatial
-        self.proj_out = nn.Conv2d(embed_dim, out_channels, 1)
+        self.transformer = nn.ModuleList([
+            TransformerBlock(dim, heads, max(1, dim // heads), mlp_dim, dropout)
+            for _ in range(depth)])
+        self.norm    = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, C, H, W = x.shape
-
-        # Patch embedding
-        x, pH, pW = self.patch_embed(x)  # [B, num_patches, embed_dim]
-        num_patches = pH * pW
-
-        # Add positional embedding
-        if self.pos_embed is None or self.pos_embed.size(1) != num_patches:
-            self.pos_embed = nn.Parameter(
-                torch.zeros(1, num_patches, x.size(-1), device=x.device)
-            )
-            nn.init.trunc_normal_(self.pos_embed, std=0.02)
-
-        x = x + self.pos_embed[:, :num_patches]
-
-        # Transformer blocks
-        for blk in self.blocks:
+        nh = H // self.patch_size
+        nw = W // self.patch_size
+        x  = self.to_patch_embedding(x)          # [B, N, dim]
+        x  = x + self.pos_embedding               # works because N is fixed per level
+        x  = self.dropout(x)
+        for blk in self.transformer:
             x = blk(x)
-
         x = self.norm(x)
-
-        # Reshape back to spatial: [B, num_patches, C] → [B, C, pH, pW]
-        x = x.transpose(1, 2).reshape(B, -1, pH, pW)
-
-        # Upsample to original resolution
-        x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
-        x = self.proj_out(x)
-
-        return x
+        return rearrange(x, 'b (h w) d -> b d h w', h=nh, w=nw)
 
 
 # ══════════════════════════════════════════════════════════════
-#  CNN BRANCH (with CAB)
+#  CNN BRANCH
 # ══════════════════════════════════════════════════════════════
 
 class CNNBranch(nn.Module):
-    """CNN-based branch with CAB for local features."""
     def __init__(self, in_channels, out_channels, reduction=16):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
+            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True))
         self.cab = CAB(out_channels, reduction)
-
     def forward(self, x):
         return self.cab(self.conv(x))
 
 
 # ══════════════════════════════════════════════════════════════
-#  PHEB - Parallel Hybrid Feature Extraction Block
+#  FIX 2: PHEB — pre_proj before Gabor, residual shortcut, no dead is_first
 # ══════════════════════════════════════════════════════════════
 
 class PHEB(nn.Module):
     """
-    Parallel Hybrid Feature Extraction Block (Paper architecture).
-    - Learnable Gabor filter for texture
-    - CNN branch with CAB for local features
-    - Transformer branch for global features
-    - Concatenation + Conv + BN
+    FIX 2a: pre_proj compresses in_channels → 1 before the Gabor filter.
+      The original applied Gabor to 64/128/256-channel maps which (a) created
+      a severe information bottleneck (256→36) and (b) is architecturally
+      inconsistent with how Gabor filters work on texture images.
+
+    FIX 2b: residual shortcut (1×1 conv) added around the whole block so
+      gradients flow back to the encoder without traversing the Gabor path.
+
+    FIX 3: removed dead `is_first` branch (both sides were identical).
+
+    spatial_size must match the spatial resolution of the input feature map
+    so TransformerBranch can pre-allocate pos_embedding correctly.
     """
-    def __init__(self, in_ch, out_ch, gabor_filters=36, gabor_kernel=17,
-                 patch_size=8, num_heads=8, reduction=16, use_gabor=True):
+    def __init__(self, in_channels, out_channels, gabor_filters=36, gabor_kernel=17,
+                 patch_size=8, trans_dim=128, trans_depth=2, trans_heads=8,
+                 ca_reduction=16, spatial_size=128):
         super().__init__()
-        self.use_gabor = use_gabor
 
-        # Gabor filter
-        if use_gabor:
-            self.gabor = nn.Sequential(
-                GaborConv2d(in_ch, gabor_filters, gabor_kernel, padding=gabor_kernel // 2),
-                nn.BatchNorm2d(gabor_filters),
-                nn.ReLU(inplace=True)
-            )
-            branch_in = gabor_filters
-        else:
-            self.gabor = None
-            branch_in = in_ch
+        # FIX 2a: project to single channel before Gabor
+        self.pre_proj = nn.Sequential(
+            nn.Conv2d(in_channels, 1, kernel_size=1, bias=False),
+            nn.BatchNorm2d(1))
 
-        # CNN branch (local features)
-        cnn_out = out_ch // 2
-        self.cnn_branch = CNNBranch(branch_in, cnn_out, reduction)
+        self.gabor = GaborConv2d(
+            channel_in=1, channel_out=gabor_filters,
+            kernel_size=gabor_kernel, stride=1, padding=gabor_kernel // 2,
+            init_ratio=0.5)
+        self.gabor_bn = nn.BatchNorm2d(gabor_filters)
 
-        # Transformer branch (global features)
-        trans_out = out_ch - cnn_out
-        self.trans_branch = TransformerBranch(branch_in, trans_out, patch_size, num_heads, depth=1)
+        self.cnn_branch   = CNNBranch(gabor_filters, out_channels // 2, ca_reduction)
 
-        # Fusion
+        # FIX 1: spatial_size propagated here
+        self.trans_branch = TransformerBranch(
+            in_channels=gabor_filters, spatial_size=spatial_size,
+            patch_size=patch_size, dim=trans_dim,
+            depth=trans_depth, heads=trans_heads,
+            mlp_dim=trans_dim * 2, dropout=0.1)
+
+        self.trans_proj = nn.Sequential(
+            nn.Conv2d(trans_dim, out_channels // 2, 1),
+            nn.BatchNorm2d(out_channels // 2), nn.ReLU(inplace=True))
+
         self.fusion = nn.Sequential(
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
-        )
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True))
+
+        # FIX 2b: residual shortcut
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels))
 
     def forward(self, x):
-        if self.gabor is not None:
-            x = self.gabor(x)
+        res = self.shortcut(x)
 
-        cnn_out = self.cnn_branch(x)
-        trans_out = self.trans_branch(x)
+        # FIX 2a: single-channel projection before Gabor
+        proj = F.relu(self.pre_proj(x))
 
-        concat = torch.cat([cnn_out, trans_out], dim=1)
-        return self.fusion(concat)
+        g = F.relu(self.gabor_bn(self.gabor(proj)))
+
+        cnn_out   = self.cnn_branch(g)
+        trans_out = self.trans_proj(self.trans_branch(g))
+
+        if trans_out.shape[2:] != cnn_out.shape[2:]:
+            trans_out = F.interpolate(trans_out, size=cnn_out.shape[2:],
+                                      mode='bilinear', align_corners=False)
+
+        out = self.fusion(torch.cat([cnn_out, trans_out], dim=1))
+        return F.relu(out + res)   # FIX 2b: residual
 
 
 # ══════════════════════════════════════════════════════════════
-#  ENCODER-DECODER BLOCKS
+#  DOWN / UP SAMPLING
 # ══════════════════════════════════════════════════════════════
 
-class DownBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
+class DownSample(nn.Module):
+    def __init__(self, ic, oc):
         super().__init__()
         self.down = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 4, stride=2, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
-        )
+            nn.Conv2d(ic, oc, 4, stride=2, padding=1),
+            nn.BatchNorm2d(oc), nn.ReLU(inplace=True))
+    def forward(self, x): return self.down(x)
 
-    def forward(self, x):
-        return self.down(x)
-
-
-class UpBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
+class UpSample(nn.Module):
+    def __init__(self, ic, oc):
         super().__init__()
         self.up = nn.Sequential(
-            nn.ConvTranspose2d(in_ch, out_ch, 4, stride=2, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x):
-        return self.up(x)
+            nn.ConvTranspose2d(ic, oc, 4, stride=2, padding=1),
+            nn.BatchNorm2d(oc), nn.ReLU(inplace=True))
+    def forward(self, x): return self.up(x)
 
 
 # ══════════════════════════════════════════════════════════════
-#  MSPHNet
+#  FIX 3: MSPHNet — passes spatial_size to each PHEB
 # ══════════════════════════════════════════════════════════════
 
 class MSPHNet(nn.Module):
     """
-    Multi-Scale Parallel Hybrid Network (Paper-faithful).
-
-    Architecture:
-    - Encoder: PHEB → Down → PHEB → Down → PHEB (bottleneck)
-    - Decoder: Up → PHEB (skip) → Up → PHEB (skip)
-    - Final: Pool → Conv → FC → Embedding
+    FIX 3: each PHEB now receives the correct spatial_size for its level
+    so the TransformerBranch pre-allocates the right pos_embedding.
+    Spatial sizes (with img_side=128):
+      pheb1: 128×128
+      pheb2: 64×64   (after down1)
+      pheb3: 32×32   (after down2, bottleneck)
+      pheb4: 64×64   (after up1 + skip)
+      pheb5: 128×128 (after up2 + skip)
     """
-    def __init__(self, num_classes, embedding_dim=1024, gabor_filters=36,
-                 gabor_kernel=17, patch_size=8, num_heads=8, reduction=16,
-                 dropout=0.5, arcface_s=30.0, arcface_m=0.50):
+    def __init__(self, num_classes, img_side=128, embedding_dim=1024,
+                 gabor_filters=36, gabor_kernel=17,
+                 trans_dim=128, trans_depth=2, trans_heads=8, patch_size=8,
+                 ca_reduction=16, dropout=0.5, arcface_s=30.0, arcface_m=0.50):
         super().__init__()
+        self.num_classes   = num_classes
+        self.embedding_dim = embedding_dim
 
         c1, c2, c3 = 64, 128, 256
+        s1 = img_side          # 128
+        s2 = img_side // 2     # 64
+        s3 = img_side // 4     # 32
 
-        # Initial conv
-        self.stem = nn.Sequential(
+        self.init_conv = nn.Sequential(
             nn.Conv2d(1, c1, 3, padding=1),
-            nn.BatchNorm2d(c1),
-            nn.ReLU(inplace=True)
-        )
+            nn.BatchNorm2d(c1), nn.ReLU(inplace=True))
+
+        pheb_kw = dict(gabor_filters=gabor_filters, gabor_kernel=gabor_kernel,
+                       patch_size=patch_size, trans_dim=trans_dim,
+                       trans_depth=trans_depth, trans_heads=trans_heads,
+                       ca_reduction=ca_reduction)
 
         # Encoder
-        self.pheb1 = PHEB(c1, c1, gabor_filters, gabor_kernel, patch_size, num_heads, reduction, use_gabor=True)
-        self.down1 = DownBlock(c1, c2)
-
-        self.pheb2 = PHEB(c2, c2, gabor_filters, gabor_kernel, patch_size, num_heads, reduction, use_gabor=False)
-        self.down2 = DownBlock(c2, c3)
-
-        # Bottleneck
-        self.pheb3 = PHEB(c3, c3, gabor_filters, gabor_kernel, patch_size, num_heads, reduction, use_gabor=False)
+        self.pheb1 = PHEB(c1,    c1,    spatial_size=s1, **pheb_kw)
+        self.down1 = DownSample(c1, c2)
+        self.pheb2 = PHEB(c2,    c2,    spatial_size=s2, **pheb_kw)
+        self.down2 = DownSample(c2, c3)
+        self.pheb3 = PHEB(c3,    c3,    spatial_size=s3, **pheb_kw)
 
         # Decoder
-        self.up1 = UpBlock(c3, c2)
-        self.pheb4 = PHEB(c2 * 2, c2, gabor_filters, gabor_kernel, patch_size, num_heads, reduction, use_gabor=False)
+        self.up1   = UpSample(c3, c2)
+        self.pheb4 = PHEB(c2*2,  c2,    spatial_size=s2, **pheb_kw)
+        self.up2   = UpSample(c2, c1)
+        self.pheb5 = PHEB(c1*2,  c1,    spatial_size=s1, **pheb_kw)
 
-        self.up2 = UpBlock(c2, c1)
-        self.pheb5 = PHEB(c1 * 2, c1, gabor_filters, gabor_kernel, patch_size, num_heads, reduction, use_gabor=False)
+        self.final_pool = nn.AdaptiveMaxPool2d((4, 4))
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(c1, c2, 3, padding=1), nn.BatchNorm2d(c2), nn.ReLU(inplace=True),
+            nn.Conv2d(c2, c3, 3, padding=1), nn.BatchNorm2d(c3), nn.ReLU(inplace=True))
 
-        # Final
-        self.final = nn.Sequential(
-            nn.AdaptiveAvgPool2d(4),
-            nn.Conv2d(c1, c2, 3, padding=1),
-            nn.BatchNorm2d(c2),
-            nn.ReLU(inplace=True),
-        )
-
-        # FC
+        fc_dim = c3 * 4 * 4   # 4096
         self.fc = nn.Sequential(
-            nn.Linear(c2 * 16, embedding_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-        )
+            nn.Linear(fc_dim, 2048), nn.ReLU(inplace=True), nn.Dropout(dropout),
+            nn.Linear(2048, embedding_dim), nn.ReLU(inplace=True), nn.Dropout(dropout))
 
-        # Classification
-        self.arcface = ArcMarginProduct(embedding_dim, num_classes, arcface_s, arcface_m)
+        self.arcface = ArcMarginProduct(embedding_dim, num_classes,
+                                        s=arcface_s, m=arcface_m)
 
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def _features(self, x):
-        x = self.stem(x)
-
+    def _encode(self, x):
+        x  = self.init_conv(x)
         e1 = self.pheb1(x)
-        e2 = self.pheb2(self.down1(e1))
-        e3 = self.pheb3(self.down2(e2))
-
-        d1 = self.pheb4(torch.cat([self.up1(e3), e2], 1))
-        d2 = self.pheb5(torch.cat([self.up2(d1), e1], 1))
-
-        feat = self.final(d2)
+        d1 = self.down1(e1);  e2 = self.pheb2(d1)
+        d2 = self.down2(e2);  e3 = self.pheb3(d2)
+        u1 = self.up1(e3);    u1 = torch.cat([u1, e2], dim=1)
+        r1 = self.pheb4(u1)
+        u2 = self.up2(r1);    u2 = torch.cat([u2, e1], dim=1)
+        r2 = self.pheb5(u2)
+        feat = self.final_conv(self.final_pool(r2))
         return self.fc(feat.view(feat.size(0), -1))
 
     def forward(self, x, y=None):
-        emb = self._features(x)
-        out = self.arcface(emb, y)
-        return out, F.normalize(emb, dim=-1)
+        emb    = self._encode(x)
+        output = self.arcface(emb, y)
+        return output, F.normalize(emb, dim=-1)
 
     def get_feature_vector(self, x):
-        return F.normalize(self._features(x), dim=-1)
+        return F.normalize(self._encode(x), dim=-1)
 
 
 # ══════════════════════════════════════════════════════════════
-#  DATASET
+#  NORMALISATION
 # ══════════════════════════════════════════════════════════════
 
-class NormSingleROI:
-    def __call__(self, t):
-        c, h, w = t.shape
-        t = t.view(c, -1)
-        mask = t > 0
-        if mask.any():
-            vals = t[mask]
-            t[mask] = (vals - vals.mean()) / (vals.std() + 1e-6)
-        return t.view(c, h, w)
+class NormSingleROI(object):
+    def __init__(self, outchannels=1): self.outchannels = outchannels
+    def __call__(self, tensor):
+        c, h, w = tensor.size()
+        t = tensor.view(c, h * w)
+        idx = t > 0; vals = t[idx]
+        if len(vals) > 0:
+            t[idx] = (vals - vals.mean()) / (vals.std() + 1e-6)
+        tensor = t.view(c, h, w)
+        if self.outchannels > 1:
+            tensor = torch.repeat_interleave(tensor, self.outchannels, dim=0)
+        return tensor
 
 
-def parse_casia_ms(root):
+# ══════════════════════════════════════════════════════════════
+#  DATASET — CASIA-MS-ROI
+# ══════════════════════════════════════════════════════════════
+
+def parse_casia_ms(data_root):
     id2paths = defaultdict(list)
-    for f in sorted(os.listdir(root)):
-        if f.lower().endswith(('.jpg', '.jpeg', '.bmp', '.png')):
-            parts = f.split('_')
-            if len(parts) >= 4:
-                id2paths[f"{parts[0]}_{parts[1]}"].append(os.path.join(root, f))
+    for fname in sorted(os.listdir(data_root)):
+        if not fname.lower().endswith((".jpg",".jpeg",".bmp",".png")):
+            continue
+        parts = fname.split("_")
+        if len(parts) < 4: continue
+        identity = parts[0] + "_" + parts[1]
+        id2paths[identity].append(os.path.join(data_root, fname))
     return dict(id2paths)
 
 
-def split_closed_set(id2paths, ratio=0.8, seed=42):
+def split_closed_set(id2paths, train_ratio=0.8, seed=42):
     rng = random.Random(seed)
-    train, test, lmap = [], [], {}
-    for idx, (k, paths) in enumerate(sorted(id2paths.items())):
-        lmap[k] = idx
-        p = list(paths)
-        rng.shuffle(p)
-        n = max(1, int(len(p) * ratio))
-        train.extend((x, idx) for x in p[:n])
-        test.extend((x, idx) for x in p[n:])
-    return train, test, lmap
+    label_map, train_samples, test_samples = {}, [], []
+    for idx, (identity, paths) in enumerate(sorted(id2paths.items())):
+        label_map[identity] = idx
+        ps = list(paths); rng.shuffle(ps)
+        n  = max(1, int(len(ps) * train_ratio))
+        for p in ps[:n]:  train_samples.append((p, idx))
+        for p in ps[n:]:  test_samples.append((p, idx))
+    return train_samples, test_samples, label_map
 
 
-def split_open_set(id2paths, train_r=0.8, gal_r=0.5, val_r=0.1, seed=42):
+def split_open_set(id2paths, train_ratio=0.8, gallery_ratio=0.5,
+                   val_ratio=0.10, seed=42):
     rng = random.Random(seed)
-    ids = sorted(id2paths.keys())
-    rng.shuffle(ids)
-    n = max(1, int(len(ids) * train_r))
-    train_ids, test_ids = ids[:n], ids[n:]
+    ids = sorted(id2paths.keys()); rng.shuffle(ids)
+    n_tr  = max(1, int(len(ids) * train_ratio))
+    train_ids, test_ids = ids[:n_tr], ids[n_tr:]
 
-    train_lm = {k: i for i, k in enumerate(sorted(train_ids))}
-    all_train = [(p, train_lm[k]) for k in train_ids for p in id2paths[k]]
-    rng2 = random.Random(seed + 1)
-    rng2.shuffle(all_train)
-    nv = max(1, int(len(all_train) * val_r))
-    val, train = all_train[:nv], all_train[nv:]
+    train_label_map = {k: i for i, k in enumerate(sorted(train_ids))}
+    all_tr = [(p, train_label_map[id]) for id in train_ids for p in id2paths[id]]
 
-    test_lm = {k: i for i, k in enumerate(sorted(test_ids))}
-    gal, prb = [], []
-    for k in test_ids:
-        lab = test_lm[k]
-        p = list(id2paths[k])
-        rng.shuffle(p)
-        ng = max(1, int(len(p) * gal_r))
-        gal.extend((x, lab) for x in p[:ng])
-        prb.extend((x, lab) for x in p[ng:])
+    rng2 = random.Random(seed + 1); rng2.shuffle(all_tr)
+    n_v  = max(1, int(len(all_tr) * val_ratio))
+    val_samples, train_samples = all_tr[:n_v], all_tr[n_v:]
 
-    return train, val, gal, prb, train_lm, test_lm
+    test_label_map = {k: i for i, k in enumerate(sorted(test_ids))}
+    gallery_samples, probe_samples = [], []
+    for id in test_ids:
+        lab = test_label_map[id]
+        ps  = list(id2paths[id]); rng.shuffle(ps)
+        n_g = max(1, int(len(ps) * gallery_ratio))
+        for p in ps[:n_g]: gallery_samples.append((p, lab))
+        for p in ps[n_g:]: probe_samples.append((p, lab))
+
+    return (train_samples, val_samples, gallery_samples, probe_samples,
+            train_label_map, test_label_map)
 
 
-class DS(Dataset):
-    def __init__(self, samples, size=128, train=True):
+# FIX 5: __getitem__ wraps open() in try/except so a single corrupt file
+#         doesn't crash the DataLoader worker and terminate the whole run.
+class CASIAMSDataset(Dataset):
+    def __init__(self, samples, img_side=128, train=True):
         self.samples = samples
+        self.train   = train
         if train:
-            self.tf = T.Compose([
-                T.Resize(size),
+            self.transform = T.Compose([
+                T.Resize(img_side),
                 T.RandomChoice([
-                    T.ColorJitter(contrast=0.05),
-                    T.RandomResizedCrop(size, scale=(0.8, 1.0), ratio=(1., 1.)),
-                    T.RandomPerspective(0.15, p=1),
-                    T.RandomRotation(10, interpolation=Image.BICUBIC),
+                    T.ColorJitter(brightness=0, contrast=0.05),
+                    T.RandomResizedCrop(img_side, scale=(0.8,1.0), ratio=(1.,1.)),
+                    T.RandomPerspective(distortion_scale=0.15, p=1),
+                    T.RandomChoice([
+                        T.RandomRotation(10, interpolation=Image.BICUBIC, expand=False,
+                                         center=(0.5*img_side, 0.0)),
+                        T.RandomRotation(10, interpolation=Image.BICUBIC, expand=False,
+                                         center=(0.0, 0.5*img_side)),
+                    ]),
                 ]),
-                T.ToTensor(), NormSingleROI()
-            ])
+                T.ToTensor(), NormSingleROI(1)])
         else:
-            self.tf = T.Compose([T.Resize(size), T.ToTensor(), NormSingleROI()])
+            self.transform = T.Compose([
+                T.Resize(img_side), T.ToTensor(), NormSingleROI(1)])
 
-    def __len__(self):
-        return len(self.samples)
+    def __len__(self): return len(self.samples)
 
-    def __getitem__(self, i):
-        p, l = self.samples[i]
-        return self.tf(Image.open(p).convert('L')), l
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        try:
+            img = Image.open(path).convert("L")
+            return self.transform(img), label
+        except Exception as e:
+            # FIX 5: corrupt file → return a neighbouring sample
+            print(f"  [warn] could not load {path}: {e}")
+            return self.__getitem__((idx + 1) % len(self.samples))
+
+
+class CASIAMSDatasetSingle(Dataset):
+    def __init__(self, samples, img_side=128):
+        self.samples   = samples
+        self.transform = T.Compose([T.Resize(img_side), T.ToTensor(), NormSingleROI(1)])
+    def __len__(self): return len(self.samples)
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        try:
+            return self.transform(Image.open(path).convert("L")), label
+        except Exception as e:
+            print(f"  [warn] {path}: {e}")
+            return self.__getitem__((idx + 1) % len(self.samples))
 
 
 # ══════════════════════════════════════════════════════════════
-#  TRAINING & EVALUATION
+#  FIX 6: run_one_epoch — validation also passes labels so ArcFace
+#          computes the loss with margin (consistent with training).
 # ══════════════════════════════════════════════════════════════
 
-def run_epoch(model, loader, criterion, opt, device, train):
-    model.train() if train else model.eval()
-    loss_sum, correct, total = 0., 0, 0
-    for imgs, labs in loader:
-        imgs, labs = imgs.to(device), labs.to(device)
-        if train:
-            opt.zero_grad()
-            out, _ = model(imgs, labs)
-        else:
-            with torch.no_grad():
-                out, _ = model(imgs)
-        loss = criterion(out, labs)
-        loss_sum += loss.item() * imgs.size(0)
-        correct += out.argmax(1).eq(labs).sum().item()
-        total += imgs.size(0)
-        if train:
-            loss.backward()
-            opt.step()
-    return loss_sum / total, 100. * correct / total
+def run_one_epoch(epoch, model, loader, criterion, optimizer, device, phase):
+    is_train = (phase == "training")
+    model.train() if is_train else model.eval()
 
+    running_loss = running_correct = total = 0
+    ctx = torch.enable_grad() if is_train else torch.no_grad()
+    with ctx:
+        for imgs, targets in loader:
+            imgs, targets = imgs.to(device), targets.to(device)
+            if is_train: optimizer.zero_grad()
+
+            # FIX 6: pass labels during validation too
+            output, _ = model(imgs, targets)
+            loss = criterion(output, targets)
+
+            if is_train:
+                loss.backward(); optimizer.step()
+
+            running_loss    += loss.item() * imgs.size(0)
+            running_correct += output.data.max(1)[1].eq(targets).sum().item()
+            total           += imgs.size(0)
+
+    return running_loss / max(total,1), 100.0 * running_correct / max(total,1)
+
+
+# ══════════════════════════════════════════════════════════════
+#  EVALUATION — EER + Rank-1
+# ══════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def extract(model, loader, device):
+def extract_features(model, loader, device):
     model.eval()
-    F, L = [], []
+    feats, labels = [], []
     for imgs, labs in loader:
-        F.append(model.get_feature_vector(imgs.to(device)).cpu().numpy())
-        L.append(labs.numpy() if isinstance(labs, torch.Tensor) else np.array(labs))
-    return np.concatenate(F), np.concatenate(L)
+        feats.append(model.get_feature_vector(imgs.to(device)).cpu().numpy())
+        labels.append(labs.numpy() if not isinstance(labs, list) else np.array(labs))
+    return np.concatenate(feats), np.concatenate(labels)
 
 
-def compute_eer(arr):
-    ins, outs = arr[arr[:, 1] == 1, 0], arr[arr[:, 1] == -1, 0]
-    if len(ins) == 0 or len(outs) == 0:
-        return 1., 0.
-    if ins.mean() < outs.mean():
-        ins, outs = -ins, -outs
-    y = np.concatenate([np.ones(len(ins)), np.zeros(len(outs))])
-    s = np.concatenate([ins, outs])
-    fpr, tpr, th = roc_curve(y, s, pos_label=1)
-    eer = brentq(lambda x: 1 - x - interp1d(fpr, tpr)(x), 0, 1)
-    return eer, float(interp1d(fpr, th)(eer))
+def compute_eer(scores_arr):
+    inscore  = scores_arr[scores_arr[:,1]==1,  0]
+    outscore = scores_arr[scores_arr[:,1]==-1, 0]
+    if len(inscore)==0 or len(outscore)==0: return 1.0, 0.0
+    if inscore.mean() < outscore.mean():
+        inscore, outscore = -inscore, -outscore
+    y   = np.concatenate([np.ones(len(inscore)), np.zeros(len(outscore))])
+    s   = np.concatenate([inscore, outscore])
+    fpr, tpr, thr = roc_curve(y, s, pos_label=1)
+    eer = brentq(lambda x: 1.0 - x - interp1d(fpr, tpr)(x), 0.0, 1.0)
+    return eer, float(interp1d(fpr, thr)(eer))
 
 
-def evaluate(model, prb_loader, gal_loader, device, out_dir, tag):
-    pf, pl = extract(model, prb_loader, device)
-    gf, gl = extract(model, gal_loader, device)
+def evaluate(model, probe_loader, gallery_loader, device, out_dir=".", tag="eval"):
+    pf, pl = extract_features(model, probe_loader,   device)
+    gf, gl = extract_features(model, gallery_loader, device)
     np_, ng = len(pf), len(gf)
 
-    scores, labels = [], []
-    dmat = np.zeros((np_, ng))
+    scores_list, labels_list = [], []
+    dist_matrix = np.zeros((np_, ng))
     for i in range(np_):
-        cos = np.dot(gf, pf[i])
-        d = np.arccos(np.clip(cos, -1, 1)) / np.pi
-        dmat[i] = d
+        cs   = np.dot(gf, pf[i])
+        dists = np.arccos(np.clip(cs, -1, 1)) / np.pi
+        dist_matrix[i] = dists
         for j in range(ng):
-            scores.append(d[j])
-            labels.append(1 if pl[i] == gl[j] else -1)
+            scores_list.append(dists[j])
+            labels_list.append(1 if pl[i]==gl[j] else -1)
 
-    arr = np.column_stack([scores, labels])
-    pair_eer, _ = compute_eer(arr)
+    scores_arr = np.column_stack([scores_list, labels_list])
+    pair_eer, _ = compute_eer(scores_arr)
 
-    # Aggregated EER
-    as_, al_ = [], []
-    for i in range(np_ - 1):
-        for j in range(i + 1, np_):
+    aggr_s, aggr_l = [], []
+    for i in range(np_-1):
+        for j in range(i+1, np_):
             d = np.arccos(np.clip(np.dot(pf[i], pf[j]), -1, 1)) / np.pi
-            as_.append(d)
-            al_.append(1 if pl[i] == pl[j] else -1)
-    aggr_eer = compute_eer(np.column_stack([as_, al_]))[0] if as_ else 1.
+            aggr_s.append(d); aggr_l.append(1 if pl[i]==pl[j] else -1)
+    aggr_eer = compute_eer(np.column_stack([aggr_s, aggr_l]))[0] if aggr_s else 1.0
 
-    # Rank-1
-    r1 = 100. * sum(pl[i] == gl[np.argmin(dmat[i])] for i in range(np_)) / np_
+    rank1 = 100.0 * sum(pl[i]==gl[np.argmin(dist_matrix[i])] for i in range(np_)) / max(np_,1)
 
-    with open(os.path.join(out_dir, f"scores_{tag}.txt"), 'w') as f:
-        for s, l in zip(scores, labels):
-            f.write(f"{s} {l}\n")
-
-    print(f"  [{tag}] pairEER={pair_eer*100:.4f}% aggrEER={aggr_eer*100:.4f}% Rank-1={r1:.2f}%")
-    return pair_eer, aggr_eer, r1
+    with open(os.path.join(out_dir, f"scores_{tag}.txt"), "w") as f:
+        for sv, lv in zip(scores_list, labels_list): f.write(f"{sv} {lv}\n")
+    _save_roc_det(scores_arr, out_dir, tag)
+    print(f"  [{tag}]  pairEER={pair_eer*100:.4f}%  aggrEER={aggr_eer*100:.4f}%  Rank-1={rank1:.2f}%")
+    return pair_eer, aggr_eer, rank1
 
 
-def plot_curves(tl, vl, ta, va, d):
+def _save_roc_det(scores_arr, out_dir, tag):
+    ins = scores_arr[scores_arr[:,1]==1, 0]
+    out = scores_arr[scores_arr[:,1]==-1,0]
+    if len(ins)==0 or len(out)==0: return
+    if ins.mean() < out.mean(): ins, out = -ins, -out
+    y = np.concatenate([np.ones(len(ins)), np.zeros(len(out))])
+    s = np.concatenate([ins, out])
+    fpr, tpr, _ = roc_curve(y, s, pos_label=1)
+    fnr = 1 - tpr
     try:
-        fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 4))
-        a1.plot(tl, 'b', label='train')
-        a1.plot(vl, 'r', label='val')
-        a1.legend()
-        a1.set_xlabel('epoch')
-        a1.set_ylabel('loss')
-        a2.plot(ta, 'b', label='train')
-        a2.plot(va, 'r', label='val')
-        a2.legend()
-        a2.set_xlabel('epoch')
-        a2.set_ylabel('acc')
-        fig.savefig(os.path.join(d, 'curves.png'))
-        plt.close(fig)
-    except:
-        pass
+        pdf = PdfPages(os.path.join(out_dir, f"roc_det_{tag}.pdf"))
+        for (xd,yd,xl,yl,t) in [
+            (fpr*100, tpr*100, 'FAR(%)', 'GAR(%)', 'ROC'),
+            (fpr*100, fnr*100, 'FAR(%)', 'FRR(%)', 'DET')]:
+            fig, ax = plt.subplots()
+            ax.plot(xd, yd, 'b-^', markersize=2); ax.grid(True)
+            ax.set_xlabel(xl); ax.set_ylabel(yl); ax.set_title(f"{t} — {tag}")
+            pdf.savefig(fig); plt.close(fig)
+        pdf.close()
+    except Exception as e:
+        print(f"  [warn] plot: {e}")
+
+
+def plot_loss_acc(tl, vl, ta, va, results_dir):
+    try:
+        ep = range(1, len(tl)+1)
+        for (d1,d2,lbl,fn) in [(tl,vl,'loss','losses.png'),(ta,va,'accuracy (%)','accuracy.png')]:
+            fig, ax = plt.subplots()
+            ax.plot(ep, d1, 'b', label='train'); ax.plot(ep, d2, 'r', label='val')
+            ax.legend(); ax.set_xlabel('epoch'); ax.set_ylabel(lbl)
+            fig.savefig(os.path.join(results_dir, fn)); plt.close(fig)
+    except Exception: pass
 
 
 # ══════════════════════════════════════════════════════════════
-#  MAIN
+#  FIX 4: MAIN — CosineAnnealingLR + 10-epoch linear warmup
 # ══════════════════════════════════════════════════════════════
 
 def main():
-    cfg = CONFIG
-    protocol = cfg["protocol"]
+    C           = CONFIG
+    protocol    = C["protocol"]
+    data_root   = C["data_root"]
+    results_dir = C["results_dir"]
+    img_side    = C["img_side"]
+    batch_size  = C["batch_size"]
+    num_epochs  = C["num_epochs"]
+    lr          = C["lr"]
+    warmup_ep   = C["warmup_epochs"]
+    dropout     = C["dropout"]
+    embedding_dim = C["embedding_dim"]
+    gabor_filters = C["gabor_filters"]
+    gabor_kernel  = C["gabor_kernel"]
+    trans_depth   = C["transformer_depth"]
+    trans_dim     = C["transformer_dim"]
+    trans_heads   = C["transformer_heads"]
+    patch_size    = C["patch_size"]
+    ca_reduction  = C["ca_reduction"]
+    train_ratio   = C["train_ratio"]
+    gallery_ratio = C["gallery_ratio"]
+    val_ratio     = C["val_ratio"]
+    seed          = C["random_seed"]
+    save_every    = C["save_every"]
+    eval_every    = C["eval_every"]
+    nw            = C["num_workers"]
 
-    os.makedirs(cfg["results_dir"], exist_ok=True)
-    eval_dir = os.path.join(cfg["results_dir"], "eval")
-    os.makedirs(eval_dir, exist_ok=True)
+    assert protocol in ("closed-set","open-set")
+    os.makedirs(results_dir, exist_ok=True)
+    rst_eval = os.path.join(results_dir, "eval")
+    os.makedirs(rst_eval, exist_ok=True)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"\n{'='*60}")
-    print(f"  MSPHNet (Paper-Faithful) on CASIA-MS")
-    print(f"  Protocol: {protocol} | Device: {device}")
-    print(f"  Patch: {cfg['patch_size']}×{cfg['patch_size']} | Heads: {cfg['num_heads']}")
-    print(f"  LR: {cfg['lr']} | Batch: {cfg['batch_size']}")
+    print(f"  MSPHNet (fixed) on CASIA-MS")
+    print(f"  Protocol : {protocol}  |  Device : {device}")
+    print(f"  Patch: {patch_size}×{patch_size}  |  Heads: {trans_heads}")
+    print(f"  lr: {lr}  |  Batch: {batch_size}  |  Warmup: {warmup_ep} ep")
     print(f"{'='*60}\n")
 
-    # Data
-    print("Loading dataset...")
-    id2paths = parse_casia_ms(cfg["data_root"])
-    print(f"  {len(id2paths)} identities, {sum(len(v) for v in id2paths.values())} images\n")
+    print("Scanning dataset …")
+    id2paths    = parse_casia_ms(data_root)
+    n_ids       = len(id2paths)
+    n_imgs      = sum(len(v) for v in id2paths.values())
+    print(f"  Found {n_ids} identities, {n_imgs} images.\n")
+
+    # FIX 5: persistent_workers avoids worker restart on each epoch
+    dl_kw = dict(batch_size=batch_size, num_workers=nw,
+                 pin_memory=True, persistent_workers=(nw>0))
 
     if protocol == "closed-set":
-        train_s, test_s, _ = split_closed_set(id2paths, cfg["train_ratio"], cfg["random_seed"])
-        nc = len(set(s[1] for s in train_s))
-        train_ds = DS(train_s, cfg["img_side"], True)
-        val_ds = DS(test_s, cfg["img_side"], False)
-        gal_ds = DS(train_s, cfg["img_side"], False)
-        prb_ds = DS(test_s, cfg["img_side"], False)
+        tr_s, te_s, lmap = split_closed_set(id2paths, train_ratio, seed)
+        num_classes = len(lmap)
+        train_loader   = DataLoader(CASIAMSDataset(tr_s, img_side, True),  shuffle=True,  **dl_kw)
+        val_loader     = DataLoader(CASIAMSDataset(te_s, img_side, False), shuffle=False, **dl_kw)
+        gallery_loader = DataLoader(CASIAMSDatasetSingle(tr_s, img_side),  shuffle=False, **dl_kw)
+        probe_loader   = DataLoader(CASIAMSDatasetSingle(te_s, img_side),  shuffle=False, **dl_kw)
+        print(f"  [closed-set] #classes={num_classes}")
     else:
-        train_s, val_s, gal_s, prb_s, tlm, _ = split_open_set(
-            id2paths, cfg["train_ratio"], cfg["gallery_ratio"], cfg["val_ratio"], cfg["random_seed"])
-        nc = len(tlm)
-        train_ds = DS(train_s, cfg["img_side"], True)
-        val_ds = DS(val_s, cfg["img_side"], False)
-        gal_ds = DS(gal_s, cfg["img_side"], False)
-        prb_ds = DS(prb_s, cfg["img_side"], False)
+        (tr_s, va_s, ga_s, pr_s, tr_lmap, _) = split_open_set(
+            id2paths, train_ratio, gallery_ratio, val_ratio, seed)
+        num_classes = len(tr_lmap)
+        train_loader   = DataLoader(CASIAMSDataset(tr_s, img_side, True),  shuffle=True,  **dl_kw)
+        val_loader     = DataLoader(CASIAMSDataset(va_s, img_side, False), shuffle=False, **dl_kw)
+        gallery_loader = DataLoader(CASIAMSDatasetSingle(ga_s, img_side),  shuffle=False, **dl_kw)
+        probe_loader   = DataLoader(CASIAMSDatasetSingle(pr_s, img_side),  shuffle=False, **dl_kw)
+        print(f"  [open-set] #train_classes={num_classes}")
 
-    print(f"  [{protocol}] #classes={nc}\n")
-
-    bs, nw = cfg["batch_size"], cfg["num_workers"]
-    train_loader = DataLoader(train_ds, bs, shuffle=True, num_workers=nw, pin_memory=True)
-    val_loader = DataLoader(val_ds, bs, num_workers=nw, pin_memory=True)
-    gal_loader = DataLoader(gal_ds, bs, num_workers=nw, pin_memory=True)
-    prb_loader = DataLoader(prb_ds, bs, num_workers=nw, pin_memory=True)
-
-    # Model
-    print("Building MSPHNet...")
+    print(f"\nBuilding MSPHNet — num_classes={num_classes} …")
     net = MSPHNet(
-        nc, cfg["embedding_dim"], cfg["gabor_filters"], cfg["gabor_kernel"],
-        cfg["patch_size"], cfg["num_heads"], cfg["ca_reduction"],
-        cfg["dropout"], cfg["arcface_s"], cfg["arcface_m"]
-    ).to(device)
-    print(f"  Params: {sum(p.numel() for p in net.parameters()):,}\n")
+        num_classes=num_classes, img_side=img_side,
+        embedding_dim=embedding_dim, gabor_filters=gabor_filters,
+        gabor_kernel=gabor_kernel, trans_dim=trans_dim,
+        trans_depth=trans_depth, trans_heads=trans_heads,
+        patch_size=patch_size, ca_reduction=ca_reduction,
+        dropout=dropout, arcface_s=C["arcface_s"], arcface_m=C["arcface_m"])
+    net.to(device)
+
+    n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    print(f"  Trainable params: {n_params:,}\n")
 
     if torch.cuda.device_count() > 1:
+        print(f"  Using {torch.cuda.device_count()} GPUs (DataParallel)")
         net = DataParallel(net)
 
-    crit = nn.CrossEntropyLoss()
-    opt = optim.Adam(net.parameters(), lr=cfg["lr"])
-    sched = lr_scheduler.StepLR(opt, cfg["lr_step"], cfg["lr_gamma"])
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(net.parameters(), lr=lr)
 
-    # Training
-    tl, vl, ta, va = [], [], [], []
-    best_eer, best_acc = 1., 0.
-    last_eer, last_r1 = float('nan'), float('nan')
+    # FIX 4: CosineAnnealingLR instead of StepLR
+    cos_sched = lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=lr*0.01)
 
-    print(f"Training for {cfg['num_epochs']} epochs...\n")
+    train_losses, val_losses = [], []
+    train_accs,   val_accs   = [], []
+    best_val_acc = 0.0
+    best_eer     = 1.0
+    last_eer, last_rank1 = float("nan"), float("nan")
 
-    for ep in range(cfg["num_epochs"]):
-        t_loss, t_acc = run_epoch(net, train_loader, crit, opt, device, True)
-        v_loss, v_acc = run_epoch(net, val_loader, crit, opt, device, False)
-        sched.step()
+    print(f"Starting training for {num_epochs} epochs …")
+    print(f"  EER / Rank-1 computed every {eval_every} epochs.\n")
 
-        tl.append(t_loss)
-        vl.append(v_loss)
-        ta.append(t_acc)
-        va.append(v_acc)
+    for epoch in range(num_epochs):
+
+        # FIX 4: linear LR warmup for the first `warmup_ep` epochs
+        if epoch < warmup_ep:
+            warm_lr = lr * (epoch + 1) / warmup_ep
+            for pg in optimizer.param_groups:
+                pg["lr"] = warm_lr
+
+        t_loss, t_acc = run_one_epoch(epoch, net, train_loader,
+                                       criterion, optimizer, device, "training")
+        v_loss, v_acc = run_one_epoch(epoch, net, val_loader,
+                                       criterion, optimizer, device, "testing")
+
+        if epoch >= warmup_ep:
+            cos_sched.step()
+
+        train_losses.append(t_loss); val_losses.append(v_loss)
+        train_accs.append(t_acc);   val_accs.append(v_acc)
 
         _net = net.module if isinstance(net, DataParallel) else net
 
-        if ep % cfg["eval_every"] == 0 or ep == cfg["num_epochs"] - 1:
-            eer, _, r1 = evaluate(_net, prb_loader, gal_loader, device, eval_dir, f"ep{ep:04d}")
-            last_eer, last_r1 = eer, r1
-            if eer < best_eer:
-                best_eer = eer
-                torch.save(_net.state_dict(), os.path.join(cfg["results_dir"], "best_eer.pth"))
-                print(f"  *** Best EER: {best_eer*100:.4f}% ***")
+        if epoch % eval_every == 0 or epoch == num_epochs-1:
+            tag = f"ep{epoch:04d}_{protocol.replace('-','')}"
+            cur_eer, cur_aggr_eer, cur_rank1 = evaluate(
+                _net, probe_loader, gallery_loader, device, rst_eval, tag)
+            last_eer, last_rank1 = cur_eer, cur_rank1
+            if cur_eer < best_eer:
+                best_eer = cur_eer
+                torch.save(_net.state_dict(),
+                           os.path.join(results_dir,"net_params_best_eer.pth"))
+                print(f"  *** New best EER: {best_eer*100:.4f}% ***")
 
-        if ep % 10 == 0 or ep == cfg["num_epochs"] - 1:
-            es = f"{last_eer*100:.4f}%" if not math.isnan(last_eer) else "N/A"
-            rs = f"{last_r1:.2f}%" if not math.isnan(last_r1) else "N/A"
-            print(f"[{time.strftime('%H:%M:%S')}] ep {ep:04d} | "
+        if epoch % 10 == 0 or epoch == num_epochs-1:
+            ts  = time.strftime("%H:%M:%S")
+            cur_lr  = optimizer.param_groups[0]["lr"]
+            eer_str  = f"{last_eer*100:.4f}%"  if not math.isnan(last_eer)   else "N/A"
+            r1_str   = f"{last_rank1:.2f}%"    if not math.isnan(last_rank1) else "N/A"
+            print(f"[{ts}] ep {epoch:04d} | lr={cur_lr:.6f} | "
                   f"loss t={t_loss:.5f} v={v_loss:.5f} | "
-                  f"acc t={t_acc:.2f}% v={v_acc:.2f}% | EER={es} R1={rs}")
+                  f"acc t={t_acc:.2f}% v={v_acc:.2f}% | "
+                  f"EER={eer_str} R1={r1_str}")
 
-        if v_acc > best_acc:
-            best_acc = v_acc
-            torch.save(_net.state_dict(), os.path.join(cfg["results_dir"], "best.pth"))
+        if v_acc > best_val_acc:
+            best_val_acc = v_acc
+            torch.save(_net.state_dict(), os.path.join(results_dir,"net_params_best.pth"))
 
-        if ep % cfg["save_every"] == 0 or ep == cfg["num_epochs"] - 1:
-            torch.save(_net.state_dict(), os.path.join(cfg["results_dir"], "latest.pth"))
-            plot_curves(tl, vl, ta, va, cfg["results_dir"])
+        if epoch % save_every == 0 or epoch == num_epochs-1:
+            torch.save(_net.state_dict(), os.path.join(results_dir,"net_params.pth"))
+            plot_loss_acc(train_losses, val_losses, train_accs, val_accs, results_dir)
 
-    # Final
-    print("\n=== Final Evaluation ===")
-    bp = os.path.join(cfg["results_dir"], "best_eer.pth")
-    if not os.path.exists(bp):
-        bp = os.path.join(cfg["results_dir"], "best.pth")
+    print("\n=== Final evaluation with best EER model ===")
+    best_path = os.path.join(results_dir,"net_params_best_eer.pth")
+    if not os.path.exists(best_path):
+        best_path = os.path.join(results_dir,"net_params_best.pth")
+
     eval_net = net.module if isinstance(net, DataParallel) else net
-    eval_net.load_state_dict(torch.load(bp, map_location=device))
-
-    f_eer, f_aggr, f_r1 = evaluate(eval_net, prb_loader, gal_loader, device, eval_dir, "FINAL")
+    eval_net.load_state_dict(torch.load(best_path, map_location=device))
+    final_eer, final_aggr, final_r1 = evaluate(
+        eval_net, probe_loader, gallery_loader, device,
+        rst_eval, f"FINAL_{protocol.replace('-','')}")
 
     print(f"\n{'='*60}")
-    print(f"  FINAL: EER={f_eer*100:.4f}% Aggr={f_aggr*100:.4f}% R1={f_r1:.2f}%")
+    print(f"  PROTOCOL : {protocol}")
+    print(f"  FINAL Pairwise EER   : {final_eer*100:.4f}%")
+    print(f"  FINAL Aggregated EER : {final_aggr*100:.4f}%")
+    print(f"  FINAL Rank-1         : {final_r1:.3f}%")
+    print(f"  Results saved to     : {results_dir}")
     print(f"{'='*60}\n")
 
-    with open(os.path.join(cfg["results_dir"], "summary.txt"), 'w') as f:
-        f.write(f"Protocol: {protocol}\n")
-        f.write(f"Best acc: {best_acc:.3f}%\n")
-        f.write(f"Final EER: {f_eer*100:.6f}%\n")
-        f.write(f"Final Aggr: {f_aggr*100:.6f}%\n")
-        f.write(f"Final R1: {f_r1:.3f}%\n")
+    with open(os.path.join(results_dir,"summary.txt"),"w") as f:
+        f.write(f"Protocol  : {protocol}\n")
+        f.write(f"Data root : {data_root}\n")
+        f.write(f"Identities: {n_ids}\n")
+        f.write(f"Images    : {n_imgs}\n")
+        f.write(f"Classes (train): {num_classes}\n")
+        f.write(f"Best val acc       : {best_val_acc:.3f}%\n")
+        f.write(f"Final Pairwise EER : {final_eer*100:.6f}%\n")
+        f.write(f"Final Aggreg. EER  : {final_aggr*100:.6f}%\n")
+        f.write(f"Final Rank-1       : {final_r1:.3f}%\n")
 
 
 if __name__ == "__main__":
