@@ -34,7 +34,7 @@ CONFIG = {
     "results_dir"     : "./rst_co3net_casia_ms",
     "img_side"        : 128,            # input image size (128×128 → fc=17328)
     "batch_size"      : 1024,           # CO3Net default
-    "num_epochs"      : 500,            # CO3Net default is 3000; adjust as needed
+    "num_epochs"      : 100,            # CO3Net default is 3000; adjust as needed
     "lr"              : 0.001,          # CO3Net default
     "lr_step"         : 500,            # CO3Net default (redstep)
     "lr_gamma"        : 0.8,            # CO3Net default
@@ -45,8 +45,8 @@ CONFIG = {
     "con_weight"      : 0.2,            # contrastive loss weight (weight2)
     "temperature"     : 0.07,           # SupConLoss temperature (CO3Net default)
     "embedding_dim"   : 2048,           # CO3Net fc1 output
-    "train_ratio"     : 0.80,
-    "gallery_ratio"   : 0.50,
+    "train_ratio"     : 0.60,
+    "gallery_ratio"   : 0.10,
     "val_ratio"       : 0.10,
     "random_seed"     : 42,
     "save_every"      : 10,
