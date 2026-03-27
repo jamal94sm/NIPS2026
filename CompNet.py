@@ -38,8 +38,9 @@ CONFIG = {
     "arcface_s"       : 30.0,
     "arcface_m"       : 0.50,
     "embedding_dim"   : 512,
-    "train_ratio"     : 0.80,           # fraction of samples (closed) or IDs (open) for training
-    "gallery_ratio"   : 0.50,           # open-set only: fraction of test-ID samples → gallery
+    "train_ratio"     : 0.60,           # fraction of samples (closed) or IDs (open) for training
+    "gallery_ratio"   : 0.20,           # open-set only: fraction of test-ID samples → gallery
+    "val_ratio"       : 0.10,           # fraction of train samples held out for validation
     "random_seed"     : 42,
     "save_every"      : 10,             # save model every N epochs
     "eval_every"      : 50,             # run full evaluation every N epochs
@@ -55,7 +56,7 @@ import random
 import pickle
 import warnings
 import numpy as np
-from collections import defaultdict
+from collections import defaultdict, Counter
 from PIL import Image
 
 import torch
@@ -362,17 +363,21 @@ def split_closed_set(id2paths, train_ratio=0.80, seed=42):
     return train_samples, test_samples, label_map
 
 
-def split_open_set(id2paths, train_ratio=0.80, gallery_ratio=0.50, seed=42):
+def split_open_set(id2paths, train_ratio=0.80, gallery_ratio=0.50,
+                   val_ratio=0.10, seed=42):
     """
     Open-set split:
       - 80% of identities → training.
       - 20% of identities → test, never seen during training.
+      - Within train identities: `val_ratio` of samples → validation,
+        rest → training.  (FIX: previously val was a copy of train.)
       - Within test identities: `gallery_ratio` of samples → gallery,
         rest → probe.
 
     Returns
     -------
     train_samples   : list of (path, int_label)  — labels from 0 … N_train-1
+    val_samples     : list of (path, int_label)  — same label space as train
     gallery_samples : list of (path, int_label)  — labels from 0 … N_test-1
     probe_samples   : list of (path, int_label)  — same label space as gallery
     train_label_map : dict  identity → int (for training)
@@ -391,14 +396,19 @@ def split_open_set(id2paths, train_ratio=0.80, gallery_ratio=0.50, seed=42):
     test_label_map  = make_label_map(test_ids)
 
     train_samples   = []
+    val_samples     = []
     gallery_samples = []
     probe_samples   = []
 
+    # ── FIX: split each train identity's samples into train / val ──
     for ident in train_ids:
         paths = id2paths[ident][:]
         rng.shuffle(paths)
         label = train_label_map[ident]
-        for p in paths:
+        n_val = max(1, int(len(paths) * val_ratio))
+        for p in paths[:n_val]:
+            val_samples.append((p, label))
+        for p in paths[n_val:]:
             train_samples.append((p, label))
 
     for ident in test_ids:
@@ -413,8 +423,10 @@ def split_open_set(id2paths, train_ratio=0.80, gallery_ratio=0.50, seed=42):
 
     print(f"  [open-set] train IDs: {len(train_ids)} | test IDs: {len(test_ids)}")
     print(f"             train samples: {len(train_samples)} | "
+          f"val samples: {len(val_samples)} | "
           f"gallery: {len(gallery_samples)} | probe: {len(probe_samples)}")
-    return train_samples, gallery_samples, probe_samples, train_label_map, test_label_map
+    return (train_samples, val_samples, gallery_samples, probe_samples,
+            train_label_map, test_label_map)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -720,7 +732,7 @@ def run_one_epoch(epoch, model, loader, criterion, optimizer, device,
 
 
 def evaluate(net, train_loader, test_probe_loader, test_gallery_loader,
-             device, out_dir, tag="eval", train_num_per_class=None):
+             device, out_dir, tag="eval"):
     """
     Shared evaluation for both protocols.
 
@@ -729,6 +741,8 @@ def evaluate(net, train_loader, test_probe_loader, test_gallery_loader,
                        matched against the training gallery)
     For open-set    : train_loader = None (not used for matching),
                       gallery = open-set gallery, probe = open-set probe
+
+    FIX: Always compute both pairwise EER and aggregated EER.
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -758,11 +772,11 @@ def evaluate(net, train_loader, test_probe_loader, test_gallery_loader,
     scores_path = os.path.join(out_dir, f"scores_{tag}.txt")
     save_scores_txt(s, l, scores_path)
 
-    # --- EER ---
+    # --- Pairwise EER ---
     eer, thresh, roc_auc, eer_half, fpr, tpr, thresholds = compute_eer(s, l)
     fnr = 1 - tpr
-    print(f"  EER: {eer*100:.4f}%  |  thresh: {thresh:.4f}  |  AUC: {roc_auc:.6f}")
-    print(f"  EER½: {eer_half*100:.4f}%")
+    print(f"  Pairwise EER: {eer*100:.4f}%  |  thresh: {thresh:.4f}  |  AUC: {roc_auc:.6f}")
+    print(f"  Pairwise EER½: {eer_half*100:.4f}%")
 
     # --- Rank-1 ---
     rank1, _ = compute_rank1(prb_feats, prb_labels,
@@ -780,24 +794,29 @@ def evaluate(net, train_loader, test_probe_loader, test_gallery_loader,
 
     # save text summary
     with open(os.path.join(out_dir, f"rst_{tag}.txt"), "w") as f:
-        f.write(f"EER       : {eer*100:.6f}%\n")
-        f.write(f"EER_half  : {eer_half*100:.6f}%\n")
-        f.write(f"Threshold : {thresh:.4f}\n")
-        f.write(f"AUC       : {roc_auc:.10f}\n")
-        f.write(f"Rank-1    : {rank1:.3f}%\n")
+        f.write(f"Pairwise EER  : {eer*100:.6f}%\n")
+        f.write(f"Pairwise EER½ : {eer_half*100:.6f}%\n")
+        f.write(f"Threshold     : {thresh:.4f}\n")
+        f.write(f"AUC           : {roc_auc:.10f}\n")
+        f.write(f"Rank-1        : {rank1:.3f}%\n")
 
-    # --- aggregated EER (min-distance per gallery class per probe) ---
-    if train_num_per_class is not None:
+    # --- FIX: Always compute aggregated EER (min-distance per gallery class) ---
+    n_gallery_classes = len(set(gal_labels.tolist()))
+    if n_gallery_classes < n_gallery:
+        # multiple gallery samples per class exist → aggregation is meaningful
         print("  Computing aggregated EER …")
         aggr_s, aggr_l = compute_aggregated_eer(dist_matrix, prb_labels, gal_labels)
-        aggr_eer, aggr_thresh, aggr_auc, aggr_eer_half, *_ = compute_eer(aggr_s, aggr_l)
+        (aggr_eer, aggr_thresh, aggr_auc,
+         aggr_eer_half, aggr_fpr, aggr_tpr, _) = compute_eer(aggr_s, aggr_l)
         print(f"  Aggregated EER: {aggr_eer*100:.4f}%  |  AUC: {aggr_auc:.6f}")
         with open(os.path.join(out_dir, f"rst_{tag}.txt"), "a") as f:
             f.write(f"\nAggregated EER      : {aggr_eer*100:.6f}%\n")
             f.write(f"Aggregated EER_half : {aggr_eer_half*100:.6f}%\n")
             f.write(f"Aggregated AUC      : {aggr_auc:.10f}\n")
+    else:
+        aggr_eer = eer   # single sample per class → aggregated = pairwise
 
-    return eer, rank1
+    return eer, aggr_eer, rank1
 
 
 # ══════════════════════════════════════════════════════════════
@@ -821,6 +840,7 @@ def main():
     emb_dim        = CONFIG["embedding_dim"]
     train_ratio    = CONFIG["train_ratio"]
     gallery_ratio  = CONFIG["gallery_ratio"]
+    val_ratio      = CONFIG["val_ratio"]
     seed           = CONFIG["random_seed"]
     save_every     = CONFIG["save_every"]
     eval_every     = CONFIG["eval_every"]
@@ -862,33 +882,30 @@ def main():
         gallery_loader  = DataLoader(train_gal_data, batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
         probe_loader    = val_loader
 
-        # samples per class in the training gallery (for aggregated EER)
-        from collections import Counter
         train_label_counts = Counter(l for _, l in train_samples)
         train_num_per_class = int(np.median(list(train_label_counts.values())))
         print(f"  [closed-set] #classes={num_classes} | "
               f"~{train_num_per_class} train samples/class\n")
 
     else:  # open-set
-        (train_samples, gallery_samples, probe_samples,
+        # ── FIX: split_open_set now returns a proper val split ──
+        (train_samples, val_samples, gallery_samples, probe_samples,
          train_label_map, test_label_map) = split_open_set(
             id2paths, train_ratio=train_ratio,
-            gallery_ratio=gallery_ratio, seed=seed)
+            gallery_ratio=gallery_ratio,
+            val_ratio=val_ratio, seed=seed)
         num_classes = len(train_label_map)
 
         train_dataset   = CASIAMSDataset(train_samples,   img_side=img_side)
-        gallery_dataset = CASIAMSDataset(gallery_samples, img_side=img_side)
-        probe_dataset   = CASIAMSDataset(probe_samples,   img_side=img_side)
-        test_dataset    = CASIAMSDataset(
-            train_samples,  # used only for val classification loss
-            img_side=img_side)
+        val_dataset     = CASIAMSDataset(val_samples,      img_side=img_side)
+        gallery_dataset = CASIAMSDataset(gallery_samples,  img_side=img_side)
+        probe_dataset   = CASIAMSDataset(probe_samples,    img_side=img_side)
 
         train_loader    = DataLoader(train_dataset,   batch_size=batch_size, shuffle=True,  num_workers=nw, pin_memory=True)
-        val_loader      = DataLoader(test_dataset,    batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
+        val_loader      = DataLoader(val_dataset,     batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
         gallery_loader  = DataLoader(gallery_dataset, batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
         probe_loader    = DataLoader(probe_dataset,   batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
 
-        train_num_per_class = None
         print(f"  [open-set] #train_classes={num_classes}\n")
 
     # ---------- model ----------
@@ -936,7 +953,7 @@ def main():
         if epoch % eval_every == 0 or epoch == num_epochs - 1:
             eval_net = _net
             tag = f"ep{epoch:04d}_{protocol.replace('-','')}"
-            cur_eer, cur_rank1 = evaluate(
+            cur_eer, cur_aggr_eer, cur_rank1 = evaluate(
                 eval_net,
                 train_loader,
                 probe_loader,
@@ -944,7 +961,6 @@ def main():
                 device,
                 out_dir=rst_eval,
                 tag=tag,
-                train_num_per_class=train_num_per_class,
             )
             last_eer   = cur_eer
             last_rank1 = cur_rank1
@@ -988,7 +1004,7 @@ def main():
     eval_net = net.module if isinstance(net, DataParallel) else net
     eval_net.load_state_dict(torch.load(best_model_path, map_location=device))
 
-    final_eer, final_rank1 = evaluate(
+    final_eer, final_aggr_eer, final_rank1 = evaluate(
         eval_net,
         train_loader,
         probe_loader,
@@ -996,13 +1012,13 @@ def main():
         device,
         out_dir=rst_eval,
         tag=f"FINAL_{protocol.replace('-','')}",
-        train_num_per_class=train_num_per_class,
     )
 
     print(f"\n{'='*60}")
     print(f"  PROTOCOL : {protocol}")
-    print(f"  FINAL EER    : {final_eer*100:.4f}%")
-    print(f"  FINAL Rank-1 : {final_rank1:.3f}%")
+    print(f"  FINAL Pairwise EER   : {final_eer*100:.4f}%")
+    print(f"  FINAL Aggregated EER : {final_aggr_eer*100:.4f}%")
+    print(f"  FINAL Rank-1         : {final_rank1:.3f}%")
     print(f"  Results saved to: {results_dir}")
     print(f"{'='*60}\n")
 
@@ -1013,9 +1029,10 @@ def main():
         f.write(f"Identities: {n_total_ids}\n")
         f.write(f"Images    : {n_total_imgs}\n")
         f.write(f"Classes (train): {num_classes}\n")
-        f.write(f"Best val acc : {best_val_acc:.3f}%\n")
-        f.write(f"Final EER    : {final_eer*100:.6f}%\n")
-        f.write(f"Final Rank-1 : {final_rank1:.3f}%\n")
+        f.write(f"Best val acc       : {best_val_acc:.3f}%\n")
+        f.write(f"Final Pairwise EER : {final_eer*100:.6f}%\n")
+        f.write(f"Final Aggreg. EER  : {final_aggr_eer*100:.6f}%\n")
+        f.write(f"Final Rank-1       : {final_rank1:.3f}%\n")
 
 
 if __name__ == "__main__":
