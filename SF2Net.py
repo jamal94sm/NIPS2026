@@ -39,9 +39,9 @@ CONFIG = {
     "results_dir"     : "./rst_sf2net_casia_ms",
     "img_side"        : 128,            # input image size (128×128)
     "batch_size"      : 500,            # SF2Net default
-    "num_epochs"      : 1000,           # SF2Net default
+    "num_epochs"      : 100,           # SF2Net default
     "lr"              : 0.001,          # SF2Net default
-    "lr_step"         : 500,            # SF2Net default (redstep)
+    "lr_step"         : 50,            # SF2Net default (redstep)
     "lr_gamma"        : 0.8,            # SF2Net default
     "dropout"         : 0.5,            # SF2Net default
     "arcface_s"       : 30.0,
@@ -51,8 +51,8 @@ CONFIG = {
     "vit_floor_num"   : 10,             # SF2Net default: first-k and last-k in SFE
     "cnn_vit_weight"  : 0.7,            # weight for CNN features (ViT gets 1-weight)
     "embedding_dim"   : 1024,           # SF2Net final embedding
-    "train_ratio"     : 0.80,
-    "gallery_ratio"   : 0.50,
+    "train_ratio"     : 0.60,
+    "gallery_ratio"   : 0.10,
     "val_ratio"       : 0.10,
     "random_seed"     : 42,
     "save_every"      : 10,
