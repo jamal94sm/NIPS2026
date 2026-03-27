@@ -32,7 +32,7 @@ CONFIG = {
     "results_dir"     : "./rst_ppnet_casia_ms",
     "img_side"        : 128,            # input image size (128×128 → fc1=43264)
     "batch_size"      : 8,              # MUST be even (PPNet contrastive loss)
-    "num_epochs"      : 500,            # PPNet default is 3000; 500 for CASIA-MS
+    "num_epochs"      : 100,            # PPNet default is 3000; 500 for CASIA-MS
     "lr"              : 0.0001,         # PPNet default
     "lr_step"         : 100,            # PPNet default
     "lr_gamma"        : 0.8,            # PPNet default
@@ -42,9 +42,9 @@ CONFIG = {
     "w_contra"        : 2e-4,           # PPNet contrastive loss weight
     "w_dis"           : 1e-4,           # PPNet distance penalty weight
     "embedding_dim"   : 512,
-    "train_ratio"     : 0.80,           # fraction of samples (closed) or IDs (open)
-    "gallery_ratio"   : 0.50,           # open-set: fraction of test-ID samples → gallery
-    "val_ratio"       : 0.10,           # fraction of train samples held out for val
+    "train_ratio"     : 0.60,           # fraction of samples (closed) or IDs (open)
+    "gallery_ratio"   : 0.10,           # open-set: fraction of test-ID samples → gallery
+    "val_ratio"       : 0.20,           # fraction of train samples held out for val
     "random_seed"     : 42,
     "save_every"      : 10,             # save model every N epochs
     "eval_every"      : 50,             # run full evaluation every N epochs
