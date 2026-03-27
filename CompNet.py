@@ -264,65 +264,26 @@ class CompNet(nn.Module):
 #  DATASET UTILITIES
 # ══════════════════════════════════════════════════════════════
 
-class NormSingleROI:
-    """Zero-mean / unit-std normalisation over non-black pixels."""
-    def __init__(self, outchannels=1):
-        self.outchannels = outchannels
-
-    def __call__(self, tensor):
-        c, h, w = tensor.size()
-        if c != 1:
-            raise TypeError("Only grayscale images are supported.")
-        tensor = tensor.view(c, h * w)
-        idx = tensor > 0
-        t   = tensor[idx]
-        m, s = t.mean(), t.std()
-        tensor[idx] = (t - m) / (s + 1e-6)
-        tensor = tensor.view(c, h, w)
-        if self.outchannels > 1:
-            tensor = torch.repeat_interleave(tensor, self.outchannels, dim=0)
-        return tensor
-
-
 class CASIAMSDataset(Dataset):
     """
     Dataset for CASIA-MS ROI images.
+    Images are loaded as grayscale, resized to img_side × img_side,
+    and converted to a float tensor in [0, 1].
+    No augmentation or normalisation is applied.
 
     Parameters
     ----------
-    samples   : list of (image_path, int_label)
-    train     : if True, apply data augmentation
-    img_side  : resize target (default 128)
+    samples  : list of (image_path, int_label)
+    img_side : resize target (default 128)
     """
-    def __init__(self, samples, train=True, img_side=128):
+    def __init__(self, samples, img_side=128, **kwargs):
+        # **kwargs absorbs any legacy `train=` keyword without error
         self.samples  = samples
-        self.train    = train
         self.img_side = img_side
-
-        norm = NormSingleROI(outchannels=1)
-        if train:
-            self.transforms = T.Compose([
-                T.Resize(img_side),
-                T.RandomChoice([
-                    T.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
-                    T.RandomResizedCrop(img_side, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
-                    T.RandomPerspective(distortion_scale=0.15, p=1),
-                    T.RandomChoice([
-                        T.RandomRotation(10, resample=Image.BICUBIC, expand=False,
-                                         center=(0.5*img_side, 0.0)),
-                        T.RandomRotation(10, resample=Image.BICUBIC, expand=False,
-                                         center=(0.0, 0.5*img_side)),
-                    ]),
-                ]),
-                T.ToTensor(),
-                norm,
-            ])
-        else:
-            self.transforms = T.Compose([
-                T.Resize(img_side),
-                T.ToTensor(),
-                norm,
-            ])
+        self.to_tensor = T.Compose([
+            T.Resize((img_side, img_side)),
+            T.ToTensor(),           # → float32 in [0, 1], shape [1, H, W]
+        ])
 
     def __len__(self):
         return len(self.samples)
@@ -330,7 +291,7 @@ class CASIAMSDataset(Dataset):
     def __getitem__(self, idx):
         path, label = self.samples[idx]
         img = Image.open(path).convert("L")
-        img = self.transforms(img)
+        img = self.to_tensor(img)
         return img, label
 
 
@@ -749,6 +710,40 @@ def run_one_epoch(epoch, model, loader, criterion, optimizer, device,
 #  EVALUATION PIPELINE
 # ══════════════════════════════════════════════════════════════
 
+def quick_evaluate(net, probe_loader, gallery_loader, device):
+    """
+    Lightweight EER + Rank-1 computation — no files or plots saved.
+    Used for per-epoch console logging during training.
+
+    Returns
+    -------
+    eer    : float  in [0, 1]
+    rank1  : float  percentage
+    """
+    net.eval()
+    gal_feats,  gal_labels  = extract_features(net, gallery_loader, device)
+    prb_feats,  prb_labels  = extract_features(net, probe_loader,   device)
+
+    n_probe   = prb_feats.shape[0]
+    n_gallery = gal_feats.shape[0]
+
+    s, l = [], []
+    dist_matrix = np.zeros((n_probe, n_gallery))
+    for i in range(n_probe):
+        for j in range(n_gallery):
+            d = angular_distance(prb_feats[i], gal_feats[j])
+            dist_matrix[i, j] = d
+            s.append(d)
+            l.append(1 if prb_labels[i] == gal_labels[j] else -1)
+
+    eer, _, _, _, _, _, _ = compute_eer(s, l)
+    rank1, _              = compute_rank1(prb_feats, prb_labels,
+                                          gal_feats, gal_labels,
+                                          scores_matrix=dist_matrix)
+    return eer, rank1
+
+
+
 def evaluate(net, train_loader, test_probe_loader, test_gallery_loader,
              device, out_dir, tag="eval", train_num_per_class=None):
     """
@@ -884,9 +879,9 @@ def main():
             id2paths, train_ratio=train_ratio, seed=seed)
         num_classes = len(label_map)
 
-        train_dataset   = CASIAMSDataset(train_samples, train=True,  img_side=img_side)
-        test_dataset    = CASIAMSDataset(test_samples,  train=False, img_side=img_side)
-        train_gal_data  = CASIAMSDataset(train_samples, train=False, img_side=img_side)
+        train_dataset   = CASIAMSDataset(train_samples, img_side=img_side)
+        test_dataset    = CASIAMSDataset(test_samples,  img_side=img_side)
+        train_gal_data  = CASIAMSDataset(train_samples, img_side=img_side)
 
         train_loader    = DataLoader(train_dataset,  batch_size=batch_size, shuffle=True,  num_workers=nw, pin_memory=True)
         val_loader      = DataLoader(test_dataset,   batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
@@ -907,12 +902,12 @@ def main():
             gallery_ratio=gallery_ratio, seed=seed)
         num_classes = len(train_label_map)
 
-        train_dataset   = CASIAMSDataset(train_samples,   train=True,  img_side=img_side)
-        gallery_dataset = CASIAMSDataset(gallery_samples, train=False, img_side=img_side)
-        probe_dataset   = CASIAMSDataset(probe_samples,   train=False, img_side=img_side)
+        train_dataset   = CASIAMSDataset(train_samples,   img_side=img_side)
+        gallery_dataset = CASIAMSDataset(gallery_samples, img_side=img_side)
+        probe_dataset   = CASIAMSDataset(probe_samples,   img_side=img_side)
         test_dataset    = CASIAMSDataset(
             train_samples,  # used only for val classification loss
-            train=False, img_side=img_side)
+            img_side=img_side)
 
         train_loader    = DataLoader(train_dataset,   batch_size=batch_size, shuffle=True,  num_workers=nw, pin_memory=True)
         val_loader      = DataLoader(test_dataset,    batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
@@ -941,7 +936,23 @@ def main():
     best_val_acc = 0.0
     best_eer     = 1.0
 
-    print(f"\nStarting training for {num_epochs} epochs …\n")
+    # cached quick-eval metrics shown in every-10-epoch print
+    last_train_eer   = float("nan")
+    last_train_rank1 = float("nan")
+    last_test_eer    = float("nan")
+    last_test_rank1  = float("nan")
+
+    # loader used to compute train-side quick metrics
+    # closed-set: probe = test split vs gallery = train split (same as full eval)
+    # open-set  : probe = gallery = train split (self-identification on train IDs)
+    train_probe_loader   = val_loader      if protocol == "closed-set" else DataLoader(
+        CASIAMSDataset(train_samples, img_side=img_side),
+        batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
+    train_gallery_loader = gallery_loader  if protocol == "closed-set" else train_probe_loader
+
+    print(f"\nStarting training for {num_epochs} epochs …")
+    print(f"  EER / Rank-1 computed every {eval_every} epochs and shown in every 10-epoch log.\n")
+
     for epoch in range(num_epochs):
         t_loss, t_acc = run_one_epoch(
             epoch, net, train_loader, criterion, optimizer, device, "training")
@@ -954,32 +965,21 @@ def main():
         train_accs.append(t_acc)
         val_accs.append(v_acc)
 
-        if epoch % 10 == 0 or epoch == num_epochs - 1:
-            ts = time.strftime("%H:%M:%S")
-            print(f"[{ts}] ep {epoch:04d}  "
-                  f"train_loss={t_loss:.5f}  train_acc={t_acc:.2f}%  "
-                  f"val_loss={v_loss:.5f}  val_acc={v_acc:.2f}%")
-
-        # save best by val classification accuracy
         _net = net.module if isinstance(net, DataParallel) else net
-        if v_acc > best_val_acc:
-            best_val_acc = v_acc
-            torch.save(_net.state_dict(),
-                       os.path.join(results_dir, "net_params_best.pth"))
 
-        # periodic save
-        if epoch % save_every == 0 or epoch == num_epochs - 1:
-            torch.save(_net.state_dict(),
-                       os.path.join(results_dir, "net_params.pth"))
-            plot_loss_acc(train_losses, val_losses, train_accs, val_accs, results_dir)
-
-        # periodic evaluation
+        # ── periodic quick evaluation (updates cached EER / Rank-1) ──────────
         if (epoch % eval_every == 0 and epoch > 0) or epoch == num_epochs - 1:
-            print(f"\n--- Evaluation @ epoch {epoch} ---")
-            eval_net = net.module if isinstance(net, DataParallel) else net
-            tag      = f"ep{epoch:04d}_{protocol.replace('-','')}"
+            eval_net = _net
 
-            eer, rank1 = evaluate(
+            # train-side quick metrics
+            tr_eer, tr_r1 = quick_evaluate(
+                eval_net, train_probe_loader, train_gallery_loader, device)
+            last_train_eer   = tr_eer
+            last_train_rank1 = tr_r1
+
+            # test-side quick metrics + full plots/files
+            tag = f"ep{epoch:04d}_{protocol.replace('-','')}"
+            te_eer, te_r1 = evaluate(
                 eval_net,
                 train_loader,
                 probe_loader,
@@ -989,12 +989,43 @@ def main():
                 tag=tag,
                 train_num_per_class=train_num_per_class,
             )
-            if eer < best_eer:
-                best_eer = eer
+            last_test_eer    = te_eer
+            last_test_rank1  = te_r1
+
+            if te_eer < best_eer:
+                best_eer = te_eer
                 torch.save(_net.state_dict(),
                            os.path.join(results_dir, "net_params_best_eer.pth"))
-                print(f"  *** New best EER: {best_eer*100:.4f}% ***")
-            print()
+                print(f"  *** New best test EER: {best_eer*100:.4f}% ***")
+
+        # ── every-10-epoch console print (loss + classification acc + EER/Rank-1) ─
+        if epoch % 10 == 0 or epoch == num_epochs - 1:
+            ts = time.strftime("%H:%M:%S")
+            eer_str = (f"{last_train_eer*100:.3f}% / {last_test_eer*100:.3f}%"
+                       if not math.isnan(last_train_eer)
+                       else "  N/A   /   N/A  ")
+            r1_str  = (f"{last_train_rank1:.2f}% / {last_test_rank1:.2f}%"
+                       if not math.isnan(last_train_rank1)
+                       else "  N/A   /   N/A  ")
+            print(
+                f"[{ts}] ep {epoch:04d} | "
+                f"loss  train={t_loss:.5f}  val={v_loss:.5f} | "
+                f"cls-acc  train={t_acc:.2f}%  val={v_acc:.2f}% | "
+                f"EER  train/test={eer_str} | "
+                f"Rank-1  train/test={r1_str}"
+            )
+
+        # ── save best classification model ────────────────────────────────────
+        if v_acc > best_val_acc:
+            best_val_acc = v_acc
+            torch.save(_net.state_dict(),
+                       os.path.join(results_dir, "net_params_best.pth"))
+
+        # ── periodic checkpoint + loss/acc plots ──────────────────────────────
+        if epoch % save_every == 0 or epoch == num_epochs - 1:
+            torch.save(_net.state_dict(),
+                       os.path.join(results_dir, "net_params.pth"))
+            plot_loss_acc(train_losses, val_losses, train_accs, val_accs, results_dir)
 
     # ---------- final evaluation with best model ----------
     print("\n=== Final evaluation with best EER model ===")
