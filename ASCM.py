@@ -308,14 +308,20 @@ class MultiHeadSelfAttention(nn.Module):
     
     def __init__(self, in_channels: int, num_heads: int = 4):
         super().__init__()
+        self.in_channels = in_channels
         self.num_heads = num_heads
-        self.head_dim = in_channels // num_heads
-        assert in_channels % num_heads == 0, "in_channels must be divisible by num_heads"
         
-        self.query = nn.Linear(in_channels, in_channels)
-        self.key = nn.Linear(in_channels, in_channels)
-        self.value = nn.Linear(in_channels, in_channels)
-        self.out_proj = nn.Linear(in_channels, in_channels)
+        # Use embed_dim that is divisible by num_heads
+        self.embed_dim = ((in_channels // num_heads) + 1) * num_heads if in_channels % num_heads != 0 else in_channels
+        self.head_dim = self.embed_dim // num_heads
+        
+        # Input projection (handles non-divisible in_channels)
+        self.input_proj = nn.Linear(in_channels, self.embed_dim)
+        
+        self.query = nn.Linear(self.embed_dim, self.embed_dim)
+        self.key = nn.Linear(self.embed_dim, self.embed_dim)
+        self.value = nn.Linear(self.embed_dim, self.embed_dim)
+        self.out_proj = nn.Linear(self.embed_dim, in_channels)
         
         self.norm = nn.LayerNorm(in_channels)
         self.scale = self.head_dim ** -0.5
@@ -332,10 +338,13 @@ class MultiHeadSelfAttention(nn.Module):
         # Reshape to sequence: [B, H*W, C]
         x_flat = x.flatten(2).transpose(1, 2)
         
+        # Project to embed_dim
+        x_proj = self.input_proj(x_flat)
+        
         # Compute Q, K, V
-        Q = self.query(x_flat).view(B, H*W, self.num_heads, self.head_dim).transpose(1, 2)
-        K = self.key(x_flat).view(B, H*W, self.num_heads, self.head_dim).transpose(1, 2)
-        V = self.value(x_flat).view(B, H*W, self.num_heads, self.head_dim).transpose(1, 2)
+        Q = self.query(x_proj).view(B, H*W, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.key(x_proj).view(B, H*W, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.value(x_proj).view(B, H*W, self.num_heads, self.head_dim).transpose(1, 2)
         
         # Attention
         attn = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
@@ -343,7 +352,7 @@ class MultiHeadSelfAttention(nn.Module):
         
         # Apply attention to values
         out = torch.matmul(attn, V)
-        out = out.transpose(1, 2).contiguous().view(B, H*W, C)
+        out = out.transpose(1, 2).contiguous().view(B, H*W, self.embed_dim)
         out = self.out_proj(out)
         
         # Residual connection and normalization
