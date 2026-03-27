@@ -40,9 +40,9 @@ CONFIG = {
     "results_dir"     : "./rst_msphnet_casia_ms",
     "img_side"        : 128,            # input image size (128×128)
     "batch_size"      : 32,             # MSPHNet paper default
-    "num_epochs"      : 1000,           # reasonable for palmprint
+    "num_epochs"      : 100,           # reasonable for palmprint
     "lr"              : 0.0001,         # MSPHNet paper default
-    "lr_step"         : 300,            # learning rate decay step
+    "lr_step"         : 30,            # learning rate decay step
     "lr_gamma"        : 0.5,            # learning rate decay factor
     "dropout"         : 0.5,            # dropout rate
     "arcface_s"       : 30.0,           # ArcFace scale
@@ -55,8 +55,8 @@ CONFIG = {
     "transformer_heads": 8,             # number of attention heads (paper)
     "patch_size"      : 8,              # Transformer patch size (paper)
     "ca_reduction"    : 16,             # Channel attention reduction (SE-Net)
-    "train_ratio"     : 0.80,
-    "gallery_ratio"   : 0.50,
+    "train_ratio"     : 0.60,
+    "gallery_ratio"   : 0.10,
     "val_ratio"       : 0.10,
     "random_seed"     : 42,
     "save_every"      : 10,
