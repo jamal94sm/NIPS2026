@@ -4,10 +4,17 @@ Implementation for CASIA-MS Dataset
 
 Based on: "Scale-Aware Competition Network for Palmprint Recognition" (ICASSP 2024)
 Authors: Gao et al.
+
+This implementation follows the paper exactly:
+- ISCM: LGF → LGF → MSA → Softmax (Eq. 2-4)
+- ASCM: Concat → Softmax (Eq. 5-6)
+- Loss: Cross-Entropy + Contrastive Loss
+- Optimizer: Adam, lr=0.0003
 """
 
 import os
 import random
+import math
 import numpy as np
 from PIL import Image
 from collections import defaultdict
@@ -17,6 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.checkpoint import checkpoint
 from sklearn.metrics import roc_curve
 from tqdm import tqdm
 
@@ -26,19 +34,18 @@ from tqdm import tqdm
 class Config:
     # Dataset
     data_root = '/home/pai-ng/Jamal/CASIA-MS-ROI'
-    img_size = 128  # Resize images to this size
+    img_size = 64  # Reduced for memory efficiency (common for palmprint)
     
-    # Model
+    # Model (following paper exactly)
     num_orientations = 6  # Number of Gabor filter orientations
     gabor_scales = [7, 17, 35]  # Tiny, Middle, Large filter sizes
-    num_heads = 4  # Multi-head self-attention heads
+    num_heads = 6  # Changed to match num_orientations for divisibility
     feature_dim = 512  # Final feature dimension
-    attn_spatial_size = 16  # Downsample to this size before attention (memory efficient)
     
-    # Training
-    batch_size = 16  # Reduced for memory
+    # Training (following paper: Section 3)
+    batch_size = 8  # Small batch for memory
     num_epochs = 100
-    learning_rate = 0.0003
+    learning_rate = 0.0003  # Paper: "fixed learning rate of 0.0003"
     contrastive_margin = 0.5
     contrastive_weight = 0.5  # Weight for contrastive loss
     
@@ -51,6 +58,9 @@ class Config:
     
     # Reproducibility
     seed = 42
+    
+    # Memory optimization
+    use_gradient_checkpointing = True
 
 
 def set_seed(seed):
@@ -72,7 +82,7 @@ class CASIAMSDataset(Dataset):
     """
     
     def __init__(self, file_list: List[str], id_to_label: Dict[str, int], 
-                 data_root: str, img_size: int = 128, augment: bool = False):
+                 data_root: str, img_size: int = 64, augment: bool = False):
         self.file_list = file_list
         self.id_to_label = id_to_label
         self.data_root = data_root
@@ -110,7 +120,6 @@ class CASIAMSDataset(Dataset):
             # Random horizontal flip
             if random.random() > 0.5:
                 img = np.fliplr(img).copy()
-            # Random rotation (-10 to 10 degrees)
             # Slight brightness variation
             img = img * (0.9 + 0.2 * random.random())
             img = np.clip(img, 0, 1)
@@ -172,9 +181,8 @@ def prepare_dataset(config: Config):
     print(f"\nTrain identities: {len(train_identities)}")
     print(f"Test identities: {len(test_identities)}")
     
-    # Create label mappings (only for train identities during training)
+    # Create label mappings
     train_id_to_label = {id_: idx for idx, id_ in enumerate(sorted(train_identities))}
-    # For test, we still need labels for evaluation
     test_id_to_label = {id_: idx for idx, id_ in enumerate(sorted(test_identities))}
     
     # Prepare file lists
@@ -215,12 +223,17 @@ def prepare_dataset(config: Config):
 
 
 # ============================================================================
-# Learnable Gabor Filter Layer
+# Learnable Gabor Filter Layer (Section 2.1)
 # ============================================================================
 class LearnableGaborFilter(nn.Module):
     """
-    Learnable Gabor Filter Layer
-    Parameters (λ, θ, ψ, σ, γ) are learnable for each orientation.
+    Learnable Gabor Filter Layer (Equation 1)
+    
+    g(x, y, λ, θ, ψ, σ, γ) = exp(-(x'^2 + γ^2*y'^2)/(2σ^2)) * cos(2πx'/λ + ψ)
+    
+    where x' = x*cos(θ) + y*sin(θ), y' = -x*sin(θ) + y*cos(θ)
+    
+    All parameters (λ, θ, ψ, σ, γ) are learnable.
     """
     
     def __init__(self, in_channels: int, num_orientations: int, kernel_size: int):
@@ -228,19 +241,20 @@ class LearnableGaborFilter(nn.Module):
         self.in_channels = in_channels
         self.num_orientations = num_orientations
         self.kernel_size = kernel_size
+        self.padding = kernel_size // 2
         
-        # Learnable parameters for each orientation
+        # Learnable parameters for each orientation (as per paper Section 2.1)
         # Initialize θ evenly distributed across orientations
-        theta_init = torch.linspace(0, np.pi, num_orientations + 1)[:-1]
-        self.theta = nn.Parameter(theta_init)
+        theta_init = torch.linspace(0, math.pi, num_orientations + 1)[:-1]
+        self.theta = nn.Parameter(theta_init.clone())
         
-        # Initialize other parameters
+        # Initialize other parameters with reasonable defaults
         self.sigma = nn.Parameter(torch.ones(num_orientations) * (kernel_size / 4))
         self.lambd = nn.Parameter(torch.ones(num_orientations) * (kernel_size / 2))
         self.gamma = nn.Parameter(torch.ones(num_orientations) * 0.5)
         self.psi = nn.Parameter(torch.zeros(num_orientations))
         
-        # Create coordinate grids
+        # Create coordinate grids (fixed, not learnable)
         half_size = kernel_size // 2
         y, x = torch.meshgrid(
             torch.arange(-half_size, half_size + 1, dtype=torch.float32),
@@ -249,27 +263,6 @@ class LearnableGaborFilter(nn.Module):
         )
         self.register_buffer('x', x)
         self.register_buffer('y', y)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Input tensor [B, C, H, W]
-        Returns:
-            Output tensor [B, num_orientations, H, W]
-        """
-        batch_size = x.size(0)
-        
-        # Generate Gabor kernels
-        kernels = self._generate_kernels()  # [num_orientations, 1, K, K]
-        
-        # Apply convolution for each input channel and sum
-        outputs = []
-        for i in range(self.in_channels):
-            out = F.conv2d(x[:, i:i+1], kernels, padding=self.kernel_size // 2)
-            outputs.append(out)
-        
-        output = torch.stack(outputs, dim=0).sum(dim=0)
-        return output
     
     def _generate_kernels(self) -> torch.Tensor:
         """Generate Gabor filter kernels from learnable parameters"""
@@ -282,49 +275,70 @@ class LearnableGaborFilter(nn.Module):
             gamma = torch.clamp(self.gamma[i], min=0.1, max=1.0)
             psi = self.psi[i]
             
-            # Rotation
+            # Rotation (Equation 1)
             x_theta = self.x * torch.cos(theta) + self.y * torch.sin(theta)
             y_theta = -self.x * torch.sin(theta) + self.y * torch.cos(theta)
             
-            # Gabor function
+            # Gabor function (Equation 1)
             gaussian = torch.exp(-0.5 * (x_theta**2 + gamma**2 * y_theta**2) / sigma**2)
-            sinusoid = torch.cos(2 * np.pi * x_theta / lambd + psi)
+            sinusoid = torch.cos(2 * math.pi * x_theta / lambd + psi)
             kernel = gaussian * sinusoid
             
-            # Normalize
+            # Normalize kernel
             kernel = kernel - kernel.mean()
             kernel = kernel / (kernel.std() + 1e-8)
             
             kernels.append(kernel)
         
-        kernels = torch.stack(kernels, dim=0).unsqueeze(1)  # [num_orientations, 1, K, K]
+        # Stack kernels: [num_orientations, 1, K, K]
+        kernels = torch.stack(kernels, dim=0).unsqueeze(1)
         return kernels
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor [B, C, H, W]
+        Returns:
+            Output tensor [B, num_orientations, H, W]
+        """
+        # Generate Gabor kernels
+        kernels = self._generate_kernels()  # [num_orientations, 1, K, K]
+        
+        # Expand kernels for multi-channel input
+        # [num_orientations, in_channels, K, K]
+        kernels = kernels.repeat(1, self.in_channels, 1, 1)
+        
+        # Apply convolution (groups=1, sum across input channels)
+        output = F.conv2d(x, kernels, padding=self.padding, groups=1)
+        
+        return output
 
 
 # ============================================================================
-# Multi-Head Self-Attention
+# Multi-Head Self-Attention (Section 2.2.1, Equation 3)
 # ============================================================================
 class MultiHeadSelfAttention(nn.Module):
-    """Multi-Head Self-Attention for capturing long-range dependencies
-    Uses spatial downsampling for memory efficiency"""
+    """
+    Multi-Head Self-Attention for capturing long-range dependencies
     
-    def __init__(self, in_channels: int, num_heads: int = 4, spatial_size: int = 16):
+    F_MSA = Norm(MultiHead(F_LGF))  (Equation 3)
+    
+    Uses memory-efficient chunked attention for large feature maps.
+    """
+    
+    def __init__(self, in_channels: int, num_heads: int):
         super().__init__()
         self.in_channels = in_channels
         self.num_heads = num_heads
-        self.spatial_size = spatial_size  # Downsample to this size for attention
+        self.head_dim = in_channels // num_heads
         
-        # Use embed_dim that is divisible by num_heads
-        self.embed_dim = ((in_channels // num_heads) + 1) * num_heads if in_channels % num_heads != 0 else in_channels
-        self.head_dim = self.embed_dim // num_heads
+        assert in_channels % num_heads == 0, \
+            f"in_channels ({in_channels}) must be divisible by num_heads ({num_heads})"
         
-        # Input projection (handles non-divisible in_channels)
-        self.input_proj = nn.Linear(in_channels, self.embed_dim)
-        
-        self.query = nn.Linear(self.embed_dim, self.embed_dim)
-        self.key = nn.Linear(self.embed_dim, self.embed_dim)
-        self.value = nn.Linear(self.embed_dim, self.embed_dim)
-        self.out_proj = nn.Linear(self.embed_dim, in_channels)
+        self.query = nn.Linear(in_channels, in_channels)
+        self.key = nn.Linear(in_channels, in_channels)
+        self.value = nn.Linear(in_channels, in_channels)
+        self.out_proj = nn.Linear(in_channels, in_channels)
         
         self.norm = nn.LayerNorm(in_channels)
         self.scale = self.head_dim ** -0.5
@@ -337,77 +351,90 @@ class MultiHeadSelfAttention(nn.Module):
             Output tensor [B, C, H, W]
         """
         B, C, H, W = x.shape
+        N = H * W  # Number of spatial tokens
         
-        # Downsample spatially for memory efficiency
-        if H > self.spatial_size or W > self.spatial_size:
-            x_down = F.adaptive_avg_pool2d(x, (self.spatial_size, self.spatial_size))
-            H_down, W_down = self.spatial_size, self.spatial_size
-        else:
-            x_down = x
-            H_down, W_down = H, W
-        
-        # Reshape to sequence: [B, H*W, C]
-        x_flat = x_down.flatten(2).transpose(1, 2)
-        
-        # Project to embed_dim
-        x_proj = self.input_proj(x_flat)
+        # Reshape to sequence: [B, N, C]
+        x_flat = x.flatten(2).transpose(1, 2)
         
         # Compute Q, K, V
-        Q = self.query(x_proj).view(B, H_down*W_down, self.num_heads, self.head_dim).transpose(1, 2)
-        K = self.key(x_proj).view(B, H_down*W_down, self.num_heads, self.head_dim).transpose(1, 2)
-        V = self.value(x_proj).view(B, H_down*W_down, self.num_heads, self.head_dim).transpose(1, 2)
+        Q = self.query(x_flat)
+        K = self.key(x_flat)
+        V = self.value(x_flat)
         
-        # Attention
-        attn = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
+        # Reshape for multi-head attention: [B, num_heads, N, head_dim]
+        Q = Q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        K = K.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        V = V.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # Apply attention to values
-        out = torch.matmul(attn, V)
-        out = out.transpose(1, 2).contiguous().view(B, H_down*W_down, self.embed_dim)
+        # Scaled dot-product attention with chunking for memory efficiency
+        out = self._chunked_attention(Q, K, V, chunk_size=512)
+        
+        # Reshape back: [B, N, C]
+        out = out.transpose(1, 2).contiguous().view(B, N, C)
         out = self.out_proj(out)
         
-        # Reshape back to spatial [B, C, H_down, W_down]
-        out = out.transpose(1, 2).view(B, C, H_down, W_down)
+        # Residual connection and layer normalization (Equation 3)
+        out = self.norm(out + x_flat)
         
-        # Upsample back to original resolution if needed
-        if H > self.spatial_size or W > self.spatial_size:
-            out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
-        
-        # Residual connection and normalization
-        out = out + x
-        # Apply layer norm per-pixel
-        out = out.permute(0, 2, 3, 1)  # [B, H, W, C]
-        out = self.norm(out)
-        out = out.permute(0, 3, 1, 2)  # [B, C, H, W]
+        # Reshape back to spatial: [B, C, H, W]
+        out = out.transpose(1, 2).view(B, C, H, W)
         
         return out
+    
+    def _chunked_attention(self, Q, K, V, chunk_size=512):
+        """Memory-efficient chunked attention"""
+        B, num_heads, N, head_dim = Q.shape
+        
+        if N <= chunk_size:
+            # Standard attention for small sequences
+            attn = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
+            attn = F.softmax(attn, dim=-1)
+            return torch.matmul(attn, V)
+        
+        # Chunked attention for large sequences
+        out_chunks = []
+        for i in range(0, N, chunk_size):
+            end_i = min(i + chunk_size, N)
+            Q_chunk = Q[:, :, i:end_i, :]
+            
+            # Compute attention scores for this chunk
+            attn = torch.matmul(Q_chunk, K.transpose(-2, -1)) * self.scale
+            attn = F.softmax(attn, dim=-1)
+            
+            # Apply attention
+            out_chunk = torch.matmul(attn, V)
+            out_chunks.append(out_chunk)
+        
+        return torch.cat(out_chunks, dim=2)
 
 
 # ============================================================================
-# Inner-Scale Competition Module (ISCM)
+# Inner-Scale Competition Module (Section 2.2.1)
 # ============================================================================
 class ISCM(nn.Module):
     """
-    Inner-Scale Competition Module
-    - Two Learnable Gabor Filter layers
-    - Multi-Head Self-Attention
-    - Softmax-based Competitive Coding along orientation dimension
+    Inner-Scale Competition Module (Section 2.2.1)
+    
+    Architecture:
+    1. F_LGF = G2(G1(X))  - Two LGF layers (Equation 2)
+    2. F_MSA = Norm(MultiHead(F_LGF))  - Multi-head self-attention (Equation 3)
+    3. F_inner = softmax(F_MSA)  - Competition along orientations (Equation 4)
     """
     
-    def __init__(self, num_orientations: int, kernel_size: int, num_heads: int = 4, spatial_size: int = 16):
+    def __init__(self, num_orientations: int, kernel_size: int, num_heads: int):
         super().__init__()
         self.num_orientations = num_orientations
         
-        # Two LGF layers
+        # Two LGF layers: G1 and G2 (Equation 2)
         self.lgf1 = LearnableGaborFilter(1, num_orientations, kernel_size)
         self.lgf2 = LearnableGaborFilter(num_orientations, num_orientations, kernel_size)
         
-        # Batch normalization after LGF
+        # Batch normalization after each LGF
         self.bn1 = nn.BatchNorm2d(num_orientations)
         self.bn2 = nn.BatchNorm2d(num_orientations)
         
-        # Multi-Head Self-Attention with spatial downsampling
-        self.msa = MultiHeadSelfAttention(num_orientations, num_heads, spatial_size)
+        # Multi-Head Self-Attention (Equation 3)
+        self.msa = MultiHeadSelfAttention(num_orientations, num_heads)
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -415,97 +442,103 @@ class ISCM(nn.Module):
             x: Input tensor [B, 1, H, W]
         Returns:
             F_inner: Competition features along orientation [B, num_orientations, H, W]
-            F_msa: Features before softmax (for ASCM) [B, num_orientations, H, W]
+            F_msa: Features after MSA (for ASCM) [B, num_orientations, H, W]
         """
-        # LGF layers
+        # Equation 2: F_LGF = G2(G1(X))
         out = self.lgf1(x)
         out = self.bn1(out)
         out = F.relu(out)
         
         out = self.lgf2(out)
         out = self.bn2(out)
-        out = F.relu(out)
+        F_lgf = F.relu(out)
         
-        # Multi-Head Self-Attention
-        F_msa = self.msa(out)
+        # Equation 3: F_MSA = Norm(MultiHead(F_LGF))
+        F_msa = self.msa(F_lgf)
         
-        # Softmax-based Competitive Coding along orientation (channel) dimension
+        # Equation 4: F_inner = softmax(F_MSA) along orientation dimension
         F_inner = F.softmax(F_msa, dim=1)
         
         return F_inner, F_msa
 
 
 # ============================================================================
-# Across-Scale Competition Module (ASCM)
+# Across-Scale Competition Module (Section 2.2.2)
 # ============================================================================
 class ASCM(nn.Module):
     """
-    Across-Scale Competition Module
-    - Concatenates features from multiple scales
-    - Applies softmax competition across scales
+    Across-Scale Competition Module (Section 2.2.2)
+    
+    Architecture (Equations 5-6):
+    1. F_MSA = Concat(F_ls_MSA, F_ms_MSA, F_ts_MSA)  - Concatenate across scales
+    2. F_across = softmax(F_MSA)  - Competition across scales
+    
+    Note: Paper does NOT include any conv or BN here, just concat + softmax.
     """
     
-    def __init__(self, num_orientations: int, num_scales: int = 3):
+    def __init__(self):
         super().__init__()
-        self.num_scales = num_scales
-        self.num_orientations = num_orientations
-        
-        # 1x1 convolution to combine scale information
-        self.conv = nn.Conv2d(num_orientations * num_scales, num_orientations * num_scales, 1)
-        self.bn = nn.BatchNorm2d(num_orientations * num_scales)
+        # No learnable parameters - just concat and softmax as per paper
     
     def forward(self, features_list: List[torch.Tensor]) -> torch.Tensor:
         """
         Args:
-            features_list: List of F_msa from each scale branch
+            features_list: List of F_MSA from each scale branch
+                          [F_ls_MSA, F_ms_MSA, F_ts_MSA]
                           Each tensor: [B, num_orientations, H, W]
         Returns:
-            F_across: Competition features across scales [B, num_orientations * num_scales, H, W]
+            F_across: Competition features across scales 
+                      [B, num_orientations * num_scales, H, W]
         """
-        # Concatenate features from all scales
-        F_concat = torch.cat(features_list, dim=1)  # [B, num_orientations * num_scales, H, W]
+        # Equation 5: F_MSA = Concat(F_ls_MSA, F_ms_MSA, F_ts_MSA)
+        F_concat = torch.cat(features_list, dim=1)
         
-        # Apply convolution
-        F_concat = self.conv(F_concat)
-        F_concat = self.bn(F_concat)
-        
-        # Softmax competition across all scale-orientation combinations
+        # Equation 6: F_across = softmax(F_MSA)
         F_across = F.softmax(F_concat, dim=1)
         
         return F_across
 
 
 # ============================================================================
-# SAC-Net Model
+# SAC-Net Model (Section 2, Figure 1)
 # ============================================================================
 class SACNet(nn.Module):
     """
-    Scale-Aware Competition Network
-    - Three branches: Tiny, Middle, Large scale
+    Scale-Aware Competition Network (SAC-Net)
+    
+    Architecture (Figure 1):
+    - Three branches: Large-scale, Middle-scale, Tiny-scale
+      (Gabor filter sizes: 35, 17, 7)
     - Each branch has ISCM
     - ASCM combines features across scales
-    - Classification head
+    - Fully connected layer for classification
     """
     
     def __init__(self, num_classes: int, config: Config):
         super().__init__()
         self.num_orientations = config.num_orientations
-        self.scales = config.gabor_scales
+        self.scales = config.gabor_scales  # [7, 17, 35] for Tiny, Middle, Large
         self.num_scales = len(self.scales)
+        self.use_checkpoint = config.use_gradient_checkpointing
         
-        # ISCM for each scale branch (with spatial downsampling for attention)
-        self.iscm_tiny = ISCM(config.num_orientations, self.scales[0], config.num_heads, config.attn_spatial_size)
-        self.iscm_middle = ISCM(config.num_orientations, self.scales[1], config.num_heads, config.attn_spatial_size)
-        self.iscm_large = ISCM(config.num_orientations, self.scales[2], config.num_heads, config.attn_spatial_size)
+        # ISCM for each scale branch (Figure 1)
+        # Tiny scale (kernel_size = 7)
+        self.iscm_tiny = ISCM(config.num_orientations, self.scales[0], config.num_heads)
+        # Middle scale (kernel_size = 17)
+        self.iscm_middle = ISCM(config.num_orientations, self.scales[1], config.num_heads)
+        # Large scale (kernel_size = 35)
+        self.iscm_large = ISCM(config.num_orientations, self.scales[2], config.num_heads)
         
-        # ASCM
-        self.ascm = ASCM(config.num_orientations, self.num_scales)
+        # ASCM (Section 2.2.2)
+        self.ascm = ASCM()
         
-        # Feature dimension after ISCM and ASCM
-        total_channels = config.num_orientations * self.num_scales  # From ASCM
-        total_channels += config.num_orientations * self.num_scales  # From all ISCMs
+        # Feature dimension after concatenating ISCM outputs and ASCM output
+        # ISCM outputs: 3 branches × num_orientations
+        # ASCM output: num_orientations × 3
+        # Total: num_orientations × 3 (ISCM) + num_orientations × 3 (ASCM) = num_orientations × 6
+        total_channels = config.num_orientations * self.num_scales * 2
         
-        # Pooling and FC layers
+        # Global pooling + FC layers (Figure 1)
         self.pool = nn.AdaptiveAvgPool2d(1)
         
         self.fc = nn.Sequential(
@@ -518,29 +551,44 @@ class SACNet(nn.Module):
         # Classification head
         self.classifier = nn.Linear(config.feature_dim, num_classes)
     
+    def _forward_iscm(self, iscm, x):
+        """Helper for gradient checkpointing"""
+        return iscm(x)
+    
     def forward(self, x: torch.Tensor, return_features: bool = False):
         """
         Args:
             x: Input tensor [B, 1, H, W]
-            return_features: If True, return features instead of logits
+            return_features: If True, return normalized features instead of logits
         Returns:
             logits or features depending on return_features flag
         """
-        # ISCM for each scale
-        F_inner_tiny, F_msa_tiny = self.iscm_tiny(x)
-        F_inner_middle, F_msa_middle = self.iscm_middle(x)
-        F_inner_large, F_msa_large = self.iscm_large(x)
+        # Apply ISCM for each scale with optional gradient checkpointing
+        if self.use_checkpoint and self.training:
+            F_inner_tiny, F_msa_tiny = checkpoint(
+                self._forward_iscm, self.iscm_tiny, x, use_reentrant=False
+            )
+            F_inner_middle, F_msa_middle = checkpoint(
+                self._forward_iscm, self.iscm_middle, x, use_reentrant=False
+            )
+            F_inner_large, F_msa_large = checkpoint(
+                self._forward_iscm, self.iscm_large, x, use_reentrant=False
+            )
+        else:
+            F_inner_tiny, F_msa_tiny = self.iscm_tiny(x)
+            F_inner_middle, F_msa_middle = self.iscm_middle(x)
+            F_inner_large, F_msa_large = self.iscm_large(x)
         
-        # ASCM
+        # ASCM: competition across scales (Equations 5-6)
         F_across = self.ascm([F_msa_tiny, F_msa_middle, F_msa_large])
         
-        # Concatenate all features
+        # Concatenate all ISCM outputs and ASCM output
         F_all = torch.cat([
-            F_inner_tiny, F_inner_middle, F_inner_large,
-            F_across
+            F_inner_tiny, F_inner_middle, F_inner_large,  # Inner-scale competition
+            F_across  # Across-scale competition
         ], dim=1)
         
-        # Global pooling
+        # Global average pooling
         F_pooled = self.pool(F_all).flatten(1)
         
         # FC layer to get features
@@ -556,10 +604,14 @@ class SACNet(nn.Module):
 
 
 # ============================================================================
-# Losses
+# Losses (Section 3: "we construct the loss by combining cross-entropy 
+# and contrastive loss")
 # ============================================================================
 class ContrastiveLoss(nn.Module):
-    """Contrastive loss for feature learning"""
+    """
+    Contrastive loss for feature learning
+    As mentioned in Section 3, following [10] CO3Net
+    """
     
     def __init__(self, margin: float = 0.5):
         super().__init__()
@@ -574,6 +626,8 @@ class ContrastiveLoss(nn.Module):
             Contrastive loss value
         """
         batch_size = features.size(0)
+        if batch_size <= 1:
+            return torch.tensor(0.0, device=features.device)
         
         # Compute pairwise distances
         distances = torch.cdist(features, features, p=2)
@@ -588,10 +642,18 @@ class ContrastiveLoss(nn.Module):
         positive_mask = positive_mask - eye
         
         # Positive loss: minimize distance for same class
-        positive_loss = (positive_mask * distances).sum() / (positive_mask.sum() + 1e-8)
+        pos_count = positive_mask.sum()
+        if pos_count > 0:
+            positive_loss = (positive_mask * distances).sum() / pos_count
+        else:
+            positive_loss = torch.tensor(0.0, device=features.device)
         
         # Negative loss: push apart different classes (with margin)
-        negative_loss = (negative_mask * F.relu(self.margin - distances)).sum() / (negative_mask.sum() + 1e-8)
+        neg_count = negative_mask.sum()
+        if neg_count > 0:
+            negative_loss = (negative_mask * F.relu(self.margin - distances)).sum() / neg_count
+        else:
+            negative_loss = torch.tensor(0.0, device=features.device)
         
         return positive_loss + negative_loss
 
@@ -605,7 +667,6 @@ def extract_features(model: nn.Module, dataloader: DataLoader, device: torch.dev
     all_features = []
     all_labels = []
     
-    # Clear GPU memory
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     
@@ -624,6 +685,9 @@ def extract_features(model: nn.Module, dataloader: DataLoader, device: torch.dev
 
 def compute_eer(genuine_scores: np.ndarray, impostor_scores: np.ndarray) -> float:
     """Compute Equal Error Rate"""
+    if len(genuine_scores) == 0 or len(impostor_scores) == 0:
+        return 50.0
+    
     # Combine scores and labels
     scores = np.concatenate([genuine_scores, impostor_scores])
     labels = np.concatenate([np.ones(len(genuine_scores)), np.zeros(len(impostor_scores))])
@@ -662,6 +726,9 @@ def evaluate(model: nn.Module, gallery_loader: DataLoader, probe_loader: DataLoa
     Evaluate model on gallery and probe sets
     Returns: (EER, Rank-1 accuracy)
     """
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     # Extract features
     gallery_features, gallery_labels = extract_features(model, gallery_loader, device)
     probe_features, probe_labels = extract_features(model, probe_loader, device)
@@ -719,7 +786,7 @@ def train_epoch(model: nn.Module, dataloader: DataLoader, optimizer: torch.optim
         # Forward pass
         logits, features = model(images)
         
-        # Compute losses
+        # Compute losses (Section 3: CE + Contrastive)
         ce_loss = ce_criterion(logits, labels)
         features_normalized = F.normalize(features, p=2, dim=1)
         contrastive_loss = contrastive_criterion(features_normalized, labels)
@@ -751,7 +818,14 @@ def main():
     print("SAC-Net: Scale-Aware Competition Network")
     print("CASIA Multi-Spectral Palmprint Recognition")
     print("=" * 60)
-    print(f"\nDevice: {Config.device}")
+    print(f"\nConfiguration:")
+    print(f"  Image size: {Config.img_size}x{Config.img_size}")
+    print(f"  Gabor scales: {Config.gabor_scales}")
+    print(f"  Num orientations: {Config.num_orientations}")
+    print(f"  Batch size: {Config.batch_size}")
+    print(f"  Learning rate: {Config.learning_rate}")
+    print(f"  Gradient checkpointing: {Config.use_gradient_checkpointing}")
+    print(f"  Device: {Config.device}")
     
     # Prepare dataset
     train_dataset, gallery_dataset, probe_dataset, num_train_ids, num_test_ids = \
@@ -779,17 +853,12 @@ def main():
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\nModel parameters: {num_params:,}")
     
-    # Loss functions
+    # Loss functions (Section 3)
     ce_criterion = nn.CrossEntropyLoss()
     contrastive_criterion = ContrastiveLoss(margin=Config.contrastive_margin)
     
-    # Optimizer
+    # Optimizer (Section 3: "Adam optimizer with a fixed learning rate of 0.0003")
     optimizer = torch.optim.Adam(model.parameters(), lr=Config.learning_rate)
-    
-    # Learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=Config.num_epochs, eta_min=1e-6
-    )
     
     # Training loop
     print("\n" + "=" * 60)
@@ -806,12 +875,8 @@ def main():
             Config.device, Config.contrastive_weight
         )
         
-        # Update learning rate
-        scheduler.step()
-        
         # Evaluate every 10 epochs
         if epoch % 10 == 0 or epoch == 1:
-            # Clear CUDA cache before evaluation
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             
@@ -833,6 +898,9 @@ def main():
     print("\n" + "=" * 60)
     print("Final Evaluation")
     print("=" * 60)
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     eer, rank1 = evaluate(model, gallery_loader, probe_loader, Config.device)
     
