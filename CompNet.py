@@ -25,12 +25,12 @@ Architecture: CompNet (unchanged from original)
 #  CONFIG  — edit this block only
 # ==============================================================
 CONFIG = {
-    "protocol"        : "closed-set",   # "closed-set" | "open-set"
+    "protocol"        : "open-set",   # "closed-set" | "open-set"
     "data_root"       : "/home/pai-ng/Jamal/CASIA-MS-ROI",
     "results_dir"     : "./rst_casia_ms",
     "img_side"        : 128,            # input image size (128×128 keeps fc=9708)
     "batch_size"      : 32,
-    "num_epochs"      : 3000,
+    "num_epochs"      : 100,
     "lr"              : 0.001,
     "lr_step"         : 300,
     "lr_gamma"        : 0.8,
