@@ -45,7 +45,7 @@ class Config:
     # Training (following paper: Section 3)
     batch_size = 8  # Small batch for memory
     num_epochs = 100
-    learning_rate = 0.0003  # Paper: "fixed learning rate of 0.0003"
+    learning_rate = 0.001  # Paper: "fixed learning rate of 0.0003"
     contrastive_margin = 0.5
     contrastive_weight = 0.5  # Weight for contrastive loss
     
