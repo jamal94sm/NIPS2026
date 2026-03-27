@@ -538,29 +538,36 @@ def compute_rank1(probe_feats, probe_labels,
     return rank1, dist
 
 
-def compute_aggregated_eer(scores_flat, labels_flat,
-                           gallery_labels, train_num_per_class):
+def compute_aggregated_eer(dist_matrix, prb_labels, gal_labels):
     """
-    Aggregated EER: per probe, take the minimum distance to any
-    gallery sample of each gallery class (same as test.py).
-    """
-    n_gallery = len(gallery_labels)
-    class_ids = sorted(set(gallery_labels))
-    n_classes = len(class_ids)
-    class_map = {c: i for i, c in enumerate(class_ids)}
+    Aggregated EER (best-of-N per gallery class).
 
-    total_probe = len(scores_flat) // n_gallery
-    scores_arr  = np.array(scores_flat).reshape(total_probe, n_gallery)
-    labels_row  = np.array(labels_flat[:n_gallery])   # gallery labels (one row)
+    For every probe i and every gallery identity class c, take the MINIMUM
+    distance among all gallery samples that belong to class c.  This produces
+    one score per (probe, gallery-class) pair — a fairer metric when multiple
+    gallery samples per identity exist, matching the aggregation in test.py.
+
+    Parameters
+    ----------
+    dist_matrix : np.ndarray [n_probe, n_gallery]  — angular distances
+    prb_labels  : np.ndarray [n_probe]              — integer class labels
+    gal_labels  : np.ndarray [n_gallery]            — integer class labels
+
+    Returns
+    -------
+    aggr_s : list of float  — aggregated distances
+    aggr_l : list of int    — 1 (genuine) or -1 (impostor)
+    """
+    class_ids = sorted(set(gal_labels.tolist()))
+    n_probe   = dist_matrix.shape[0]
 
     aggr_s, aggr_l = [], []
-    for i in range(total_probe):
-        probe_label = labels_flat[i * n_gallery]   # genuine label for this probe
+    for i in range(n_probe):
         for cls in class_ids:
-            cls_mask  = (labels_row == cls)
-            min_score = scores_arr[i, cls_mask].min()
-            aggr_s.append(min_score)
-            aggr_l.append(1 if probe_label == cls else -1)
+            cls_mask = (gal_labels == cls)          # boolean over gallery axis
+            min_dist = dist_matrix[i, cls_mask].min()
+            aggr_s.append(min_dist)
+            aggr_l.append(1 if prb_labels[i] == cls else -1)
 
     return aggr_s, aggr_l
 
@@ -710,38 +717,6 @@ def run_one_epoch(epoch, model, loader, criterion, optimizer, device,
 #  EVALUATION PIPELINE
 # ══════════════════════════════════════════════════════════════
 
-def quick_evaluate(net, probe_loader, gallery_loader, device):
-    """
-    Lightweight EER + Rank-1 computation — no files or plots saved.
-    Used for per-epoch console logging during training.
-
-    Returns
-    -------
-    eer    : float  in [0, 1]
-    rank1  : float  percentage
-    """
-    net.eval()
-    gal_feats,  gal_labels  = extract_features(net, gallery_loader, device)
-    prb_feats,  prb_labels  = extract_features(net, probe_loader,   device)
-
-    n_probe   = prb_feats.shape[0]
-    n_gallery = gal_feats.shape[0]
-
-    s, l = [], []
-    dist_matrix = np.zeros((n_probe, n_gallery))
-    for i in range(n_probe):
-        for j in range(n_gallery):
-            d = angular_distance(prb_feats[i], gal_feats[j])
-            dist_matrix[i, j] = d
-            s.append(d)
-            l.append(1 if prb_labels[i] == gal_labels[j] else -1)
-
-    eer, _, _, _, _, _, _ = compute_eer(s, l)
-    rank1, _              = compute_rank1(prb_feats, prb_labels,
-                                          gal_feats, gal_labels,
-                                          scores_matrix=dist_matrix)
-    return eer, rank1
-
 
 
 def evaluate(net, train_loader, test_probe_loader, test_gallery_loader,
@@ -814,8 +789,7 @@ def evaluate(net, train_loader, test_probe_loader, test_gallery_loader,
     # --- aggregated EER (min-distance per gallery class per probe) ---
     if train_num_per_class is not None:
         print("  Computing aggregated EER …")
-        aggr_s, aggr_l = compute_aggregated_eer(
-            s, l, gal_labels.tolist(), train_num_per_class)
+        aggr_s, aggr_l = compute_aggregated_eer(dist_matrix, prb_labels, gal_labels)
         aggr_eer, aggr_thresh, aggr_auc, aggr_eer_half, *_ = compute_eer(aggr_s, aggr_l)
         print(f"  Aggregated EER: {aggr_eer*100:.4f}%  |  AUC: {aggr_auc:.6f}")
         with open(os.path.join(out_dir, f"rst_{tag}.txt"), "a") as f:
@@ -937,18 +911,8 @@ def main():
     best_eer     = 1.0
 
     # cached quick-eval metrics shown in every-10-epoch print
-    last_train_eer   = float("nan")
-    last_train_rank1 = float("nan")
-    last_test_eer    = float("nan")
-    last_test_rank1  = float("nan")
-
-    # loader used to compute train-side quick metrics
-    # closed-set: probe = test split vs gallery = train split (same as full eval)
-    # open-set  : probe = gallery = train split (self-identification on train IDs)
-    train_probe_loader   = val_loader      if protocol == "closed-set" else DataLoader(
-        CASIAMSDataset(train_samples, img_side=img_side),
-        batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
-    train_gallery_loader = gallery_loader  if protocol == "closed-set" else train_probe_loader
+    last_eer   = float("nan")
+    last_rank1 = float("nan")
 
     print(f"\nStarting training for {num_epochs} epochs …")
     print(f"  EER / Rank-1 computed every {eval_every} epochs and shown in every 10-epoch log.\n")
@@ -967,19 +931,12 @@ def main():
 
         _net = net.module if isinstance(net, DataParallel) else net
 
-        # ── periodic quick evaluation (updates cached EER / Rank-1) ──────────
-        if (epoch % eval_every == 0 and epoch > 0) or epoch == num_epochs - 1:
+        # ── periodic evaluation (EER / Rank-1) ───────────────────────────────
+        # runs at epoch 0 and every eval_every epochs thereafter
+        if epoch % eval_every == 0 or epoch == num_epochs - 1:
             eval_net = _net
-
-            # train-side quick metrics
-            tr_eer, tr_r1 = quick_evaluate(
-                eval_net, train_probe_loader, train_gallery_loader, device)
-            last_train_eer   = tr_eer
-            last_train_rank1 = tr_r1
-
-            # test-side quick metrics + full plots/files
             tag = f"ep{epoch:04d}_{protocol.replace('-','')}"
-            te_eer, te_r1 = evaluate(
+            cur_eer, cur_rank1 = evaluate(
                 eval_net,
                 train_loader,
                 probe_loader,
@@ -989,30 +946,25 @@ def main():
                 tag=tag,
                 train_num_per_class=train_num_per_class,
             )
-            last_test_eer    = te_eer
-            last_test_rank1  = te_r1
+            last_eer   = cur_eer
+            last_rank1 = cur_rank1
 
-            if te_eer < best_eer:
-                best_eer = te_eer
+            if cur_eer < best_eer:
+                best_eer = cur_eer
                 torch.save(_net.state_dict(),
                            os.path.join(results_dir, "net_params_best_eer.pth"))
-                print(f"  *** New best test EER: {best_eer*100:.4f}% ***")
+                print(f"  *** New best EER: {best_eer*100:.4f}% ***")
 
-        # ── every-10-epoch console print (loss + classification acc + EER/Rank-1) ─
+        # ── every-10-epoch console print ──────────────────────────────────────
         if epoch % 10 == 0 or epoch == num_epochs - 1:
             ts = time.strftime("%H:%M:%S")
-            eer_str = (f"{last_train_eer*100:.3f}% / {last_test_eer*100:.3f}%"
-                       if not math.isnan(last_train_eer)
-                       else "  N/A   /   N/A  ")
-            r1_str  = (f"{last_train_rank1:.2f}% / {last_test_rank1:.2f}%"
-                       if not math.isnan(last_train_rank1)
-                       else "  N/A   /   N/A  ")
+            eer_str   = f"{last_eer*100:.4f}%"   if not math.isnan(last_eer)   else "N/A"
+            rank1_str = f"{last_rank1:.2f}%"      if not math.isnan(last_rank1) else "N/A"
             print(
                 f"[{ts}] ep {epoch:04d} | "
                 f"loss  train={t_loss:.5f}  val={v_loss:.5f} | "
                 f"cls-acc  train={t_acc:.2f}%  val={v_acc:.2f}% | "
-                f"EER  train/test={eer_str} | "
-                f"Rank-1  train/test={r1_str}"
+                f"EER={eer_str}  Rank-1={rank1_str}"
             )
 
         # ── save best classification model ────────────────────────────────────
