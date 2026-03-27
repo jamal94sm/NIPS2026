@@ -38,8 +38,8 @@ CONFIG = {
     "arcface_s"       : 30.0,
     "arcface_m"       : 0.50,
     "embedding_dim"   : 512,
-    "train_ratio"     : 0.60,           # fraction of samples (closed) or IDs (open) for training
-    "gallery_ratio"   : 0.20,           # open-set only: fraction of test-ID samples → gallery
+    "train_ratio"     : 0.50,           # fraction of samples (closed) or IDs (open) for training
+    "gallery_ratio"   : 0.10,           # open-set only: fraction of test-ID samples → gallery
     "val_ratio"       : 0.10,           # fraction of train samples held out for validation
     "random_seed"     : 42,
     "save_every"      : 10,             # save model every N epochs
