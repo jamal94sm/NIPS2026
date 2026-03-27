@@ -33,7 +33,7 @@ CONFIG = {
     "results_dir"     : "./rst_ccnet_casia_ms",
     "img_side"        : 128,            # input image size (128×128 → fc=13152)
     "batch_size"      : 1024,           # CCNet default
-    "num_epochs"      : 500,            # CCNet default is 3000; adjust as needed
+    "num_epochs"      : 100,            # CCNet default is 3000; adjust as needed
     "lr"              : 0.001,          # CCNet default
     "lr_step"         : 500,            # CCNet default (redstep)
     "lr_gamma"        : 0.8,            # CCNet default
@@ -45,8 +45,8 @@ CONFIG = {
     "con_weight"      : 0.2,            # contrastive loss weight (weight2)
     "temperature"     : 0.07,           # SupConLoss temperature (CCNet default)
     "embedding_dim"   : 2048,           # CCNet fc1 output
-    "train_ratio"     : 0.80,
-    "gallery_ratio"   : 0.50,
+    "train_ratio"     : 0.60,
+    "gallery_ratio"   : 0.10,
     "val_ratio"       : 0.10,
     "random_seed"     : 42,
     "save_every"      : 10,
