@@ -12,7 +12,7 @@ from skimage.measure import label as sklabel
 
 import cv2
 
-from .utils import (
+from utils import (
     smooth_ma, poly2mask, pdist_max, find_most_dist_points,
     triangle_angles, est_orient, find_neigh, num_cons_els,
     imrotate,
