@@ -11,7 +11,7 @@ from skimage.filters import sobel_h as _sobel_h, sobel_v as _sobel_v
 
 import cv2
 
-from .utils import (
+from utils import (
     convert_image_single_channel, normalize_img, rescale_img,
     imadjust, zero_border, poly2mask, resizem, smooth_ma,
     big_conn_comp, remove_cc_area, imfill_holes,
