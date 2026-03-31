@@ -24,7 +24,7 @@ from palmnet_roi.find_roi import find_roi_from_shape
 # =============================================================================
 
 DATABASE   = 'MPDv2'       # CASIA | IITD | REST | Tongji | MPDv2
-INPUT_DIR  = '/home/pai-ng/Jamal/MPDv2/'   # folder containing input palm images
+INPUT_DIR  = '/home/pai-ng/Jamal/MPDv2'   # folder containing input palm images
 OUTPUT_DIR = '/home/pai-ng/Jamal/MPDv2_ROI_PalmSeg/'    # folder where extracted ROIs will be saved
 
 # =============================================================================
