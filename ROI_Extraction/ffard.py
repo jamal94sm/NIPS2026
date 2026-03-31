@@ -31,9 +31,9 @@ Output
 MPD_RAW_DIR = "/home/pai-ng/Jamal/MPDv2"
 CHSST_CKPT  = "EP7-iou0.951562-pacc0.977916.pth"
 LANET_CKPT  = "LANet_v1.pkl"
-SEG_TMP_DIR = "/tmp/MPD_segmented"        # intermediate; can be /tmp
+SEG_TMP_DIR = "tmp/MPD_segmented"        # intermediate; can be /tmp
 ROI_OUT_DIR = "/home/pai-ng/Jamal/MPDv2_ROI_FFARD"         # ← main output
-VIS_OUT_DIR = "/MPD_vis/"     # circle debug visualisations
+VIS_OUT_DIR = "MPD_vis/"     # circle debug visualisations
 SAVE_VIS    = False                        # set True to write debug images
 DEVICE      = "cuda"                       # "cuda" or "cpu"
 # ─────────────────────────────────────────────────────────────────
