@@ -7,7 +7,7 @@ import numpy as np
 from scipy.ndimage import gaussian_filter, convolve
 from skimage.exposure import equalize_adapthist
 
-from .utils import convert_image_single_channel, rgb2hsv, hsv2rgb
+from utils import convert_image_single_channel, rgb2hsv, hsv2rgb
 
 
 # ---------------------------------------------------------------------------
