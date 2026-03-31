@@ -5,7 +5,7 @@ Translated from MATLAB segmentPalms.m and findOrientBasedonEdge.m.
 """
 
 import numpy as np
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, rotate as ndrotate
 from skimage.measure import find_contours, label as sklabel, regionprops
 from skimage.filters import sobel_h as _sobel_h, sobel_v as _sobel_v
 
@@ -58,32 +58,29 @@ def find_orient_based_on_edge(C, C_uint8, thVessF, param):
     p = param['segm']
 
     # -------- Step 1: find orientation that minimises ho/ve edge ratio --------
-    # Two-pass coarse→fine: 13 + 7 = 20 iterations instead of 37
-    def _score_angles(angles):
-        best_angle, best_cond = 0, 1e9
-        for angle in angles:
-            C_rot = imrotate(C, angle, crop=True)
-            th_e  = _auto_sobel_threshold(C_rot)
-            if th_e == 0:
-                continue
-            e_ho = _sobel_edges(C_rot, 'horizontal', th_e)
-            e_ve = _sobel_edges(C_rot, 'vertical',   th_e)
-            e_ho_back = compensate_crop_bb(
-                imrotate(e_ho.astype(float), -angle, crop=False), h_orig, w_orig)
-            e_ve_back = compensate_crop_bb(
-                imrotate(e_ve.astype(float), -angle, crop=False), h_orig, w_orig)
-            area_ve = float(e_ve_back.sum())
-            if area_ve == 0:
-                continue
-            cond = float(e_ho_back.sum()) / area_ve
-            if cond < best_cond:
-                best_cond, best_angle = cond, angle
-        return best_angle
+    area_min = 1e9
+    orient_m = 0
 
-    coarse   = _score_angles(range(-90, 91, 15))          # step 15° → 13 iters
-    orient_m = _score_angles(                              # step  5° →  7 iters
-        range(max(-90, coarse - 15), min(90, coarse + 15) + 1, 5)
-    )
+    for angle in range(-90, 91, 5):
+        C_rot = imrotate(C, angle, crop=True)
+        th_e  = _auto_sobel_threshold(C_rot)
+        if th_e == 0:
+            continue
+        e_ho = _sobel_edges(C_rot, 'horizontal', th_e)
+        e_ve = _sobel_edges(C_rot, 'vertical',   th_e)
+        # Rotate back and crop to original size
+        e_ho_back = compensate_crop_bb(
+            imrotate(e_ho.astype(float), -angle, crop=False), h_orig, w_orig)
+        e_ve_back = compensate_crop_bb(
+            imrotate(e_ve.astype(float), -angle, crop=False), h_orig, w_orig)
+        area_ho = float(e_ho_back.sum())
+        area_ve = float(e_ve_back.sum())
+        if area_ve == 0:
+            continue
+        cond = area_ho / area_ve
+        if cond < area_min:
+            area_min = cond
+            orient_m = angle
 
     # -------- Step 2: build vessel-edge maps at optimum orientation -----------
     ind_ver = p['indKirschVer']
