@@ -18,8 +18,8 @@ from utils import (
     imclose_bin, imopen_bin, imdilate_bin,
     imrotate, compensate_crop_bb, _make_se,
 )
-from .vessel_extract import vessel_extract
-from .threshold_palm import graythresh, threshold_palm
+from vessel_extract import vessel_extract
+from threshold_palm import graythresh, threshold_palm
 
 
 # ---------------------------------------------------------------------------
