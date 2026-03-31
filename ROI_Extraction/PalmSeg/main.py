@@ -15,9 +15,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from palmnet_roi.params import get_params
-from palmnet_roi.segment_palms import segment_palms
-from palmnet_roi.find_roi import find_roi_from_shape
+from params import get_params
+from segment_palms import segment_palms
+from find_roi import find_roi_from_shape
 
 # =============================================================================
 # USER SETTINGS  –  only edit these three lines
