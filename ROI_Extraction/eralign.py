@@ -384,14 +384,30 @@ class GetROI(PalmBasic):
         img_blurred = self.gaussian_blur(img, sigma=BLUR_SIGMA, blur=BLUR)
         rough_binary = self.threshold_image(img_blurred, threshold_val=THRESHOLD_SEG, bi_threshold=BI_THRESHOLD_SEG)
         max_comp_img, max_comp_contour_coord, max_comp_contour_img = self.find_largest_component(rough_binary)
+        '''
         max_comp_img_small = self.erode_binary_image(max_comp_img, kernel_size=KERNEL_SIZE)
         max_comp_contour_coord_small = self.find_contour(max_comp_img_small)
         max_comp_contour_img_small = self.fill_contour(img, max_comp_contour_coord_small)
+        '''
+        max_comp_img_small = self.erode_binary_image(max_comp_img, kernel_size=KERNEL_SIZE)
+        if cv2.countNonZero(max_comp_img_small) == 0:
+            max_comp_img_small = self.erode_binary_image(max_comp_img, kernel_size=(15, 15))
+        if cv2.countNonZero(max_comp_img_small) == 0:
+            return False
+        max_comp_contour_coord_small = self.find_contour(max_comp_img_small)
+        max_comp_contour_img_small = self.fill_contour(img, max_comp_contour_coord_small)
 
+        
         hull_coord, hull_img = self.hull_image(img, max_comp_contour_coord)
         rough_edges_img = self._detect_rough_edges(img_blurred & max_comp_img)
 
+        #hull_img_small = self.erode_binary_image(hull_img, kernel_size=KERNEL_SIZE)
         hull_img_small = self.erode_binary_image(hull_img, kernel_size=KERNEL_SIZE)
+        if cv2.countNonZero(hull_img_small) == 0:
+            hull_img_small = self.erode_binary_image(hull_img, kernel_size=(15, 15))
+        if cv2.countNonZero(hull_img_small) == 0:
+            return False
+    
         hull_contour_coord_small = self.find_contour(hull_img_small)
         hull_contour_img_small = self.fill_contour(img, hull_contour_coord_small)
         concave_contour_img = max_comp_contour_img & hull_img_small
