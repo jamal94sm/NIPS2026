@@ -720,6 +720,6 @@ def run_extraction(dir_source, dir_output):
 
 
 if __name__ == '__main__':
-    dir_source = '/path/to/your/input/images'
-    dir_output = '/path/to/your/output/rois'
+    dir_source = '/mnt/data/FingerprintDatasets/Combined/combineddataset/CASIA_Multi_Spectral_Palmprint_V1'
+    dir_output = '/home/pai-ng/Jamal/NIPS2026/ROI_Extraction/CASIA-MS_ROI_ERAlign'
     run_extraction(dir_source, dir_output)
