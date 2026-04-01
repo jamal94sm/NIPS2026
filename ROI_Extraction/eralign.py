@@ -514,7 +514,8 @@ class GetROI(PalmBasic):
 
     def find_concave_finger(self, hull_contour_coord_small, hull_contour_img_small, palm_len, hull_coord_right, palm_contour):
         finger_lines = []
-        mask = np.array([cv2.pointPolygonTest(hull_contour_coord_small[:,0,:], tuple(pt), measureDist=True) > 0.5 for pt in palm_contour])
+        #mask = np.array([cv2.pointPolygonTest(hull_contour_coord_small[:,0,:], tuple(pt), measureDist=True) > 0.5 for pt in palm_contour])
+        mask = np.array([cv2.pointPolygonTest(hull_contour_coord_small[:,0,:].astype(np.float32), (float(pt[0]), float(pt[1])), measureDist=True) > 0.5 for pt in palm_contour])
         transitions = np.where(mask[:-1] != mask[1:])[0] + 1
 
         if mask[0]:
