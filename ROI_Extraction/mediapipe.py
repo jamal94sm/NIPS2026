@@ -66,8 +66,6 @@ def _calculate_point_c(m1, m2, thumb):
     return int(C[0]), int(C[1])
 
 def _extract_roi(img, mid1, mid2, C, thumb, hand_type):
-    """Extract palm ROI and return it along with the affine matrix M and center C
-    so that _make_upright can compute the finger direction in ROI space."""
     vec = np.array(mid2) - np.array(mid1)
     angle = np.degrees(np.arctan2(vec[1], vec[0]))
     C = (int(C[0]), int(C[1]))
@@ -81,43 +79,7 @@ def _extract_roi(img, mid1, mid2, C, thumb, hand_type):
     rot = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]))
     roi = cv2.getRectSubPix(rot, (int(side), int(side)), C)
     box = cv2.boxPoints(rect).astype(int)
-    return roi, box, M, C
-
-def _make_upright(roi, M, C, wrist, mid_mcp):
-    """Rotate the ROI patch so fingers point upward.
-
-    Strategy:
-      1. Project wrist (lm[0]) and middle-finger MCP (lm[9]) through the same
-         affine M used in _extract_roi, then shift into ROI pixel coords.
-      2. Compute the angle the wrist→MCP vector makes with 'up' (−Y axis).
-      3. Apply a corrective rotation around the ROI center.
-    """
-    h, w = roi.shape[:2]
-
-    def to_roi_coords(pt):
-        x, y = float(pt[0]), float(pt[1])
-        # Apply the affine rotation used in _extract_roi
-        nx = M[0, 0] * x + M[0, 1] * y + M[0, 2]
-        ny = M[1, 0] * x + M[1, 1] * y + M[1, 2]
-        # getRectSubPix crops a window centered at C, so shift accordingly
-        rx = nx - C[0] + w / 2.0
-        ry = ny - C[1] + h / 2.0
-        return np.array([rx, ry])
-
-    wrist_roi  = to_roi_coords(wrist)
-    mcp_roi    = to_roi_coords(mid_mcp)
-
-    finger_vec  = mcp_roi - wrist_roi
-    finger_angle = np.degrees(np.arctan2(finger_vec[1], finger_vec[0]))
-
-    # 'Up' in image coords is the −Y direction = −90° from +X axis.
-    # correction rotates the ROI so finger_angle maps to −90°.
-    correction = -(finger_angle + 90.0)
-
-    center = (w / 2.0, h / 2.0)
-    R = cv2.getRotationMatrix2D(center, correction, 1.0)
-    upright = cv2.warpAffine(roi, R, (w, h))
-    return upright
+    return roi, box
 
 def extract_palm_roi(image_bgr):
     lms, hand_type = _run_mp_hands_new(image_bgr)
@@ -132,12 +94,10 @@ def extract_palm_roi(image_bgr):
 
     thumb = idx(2)
     C = _calculate_point_c(roi_mid1, roi_mid2, thumb)
+    roi, box = _extract_roi(image_bgr, roi_mid1, roi_mid2, C, thumb, hand_type)
 
-    # Extract the initial ROI (knuckle line aligned horizontally)
-    roi, box, M, C = _extract_roi(image_bgr, roi_mid1, roi_mid2, C, thumb, hand_type)
-
-    # Rotate so fingers point up using wrist (lm[0]) → middle MCP (lm[9])
-    roi = _make_upright(roi, M, C, wrist=idx(0), mid_mcp=idx(9))
+    # ← Rotate 180° so fingers point up
+    roi = cv2.rotate(roi, cv2.ROTATE_180)
 
     ann = image_bgr.copy()
     for x, y in lms: cv2.circle(ann, (x, y), 3, (0, 255, 0), -1)
