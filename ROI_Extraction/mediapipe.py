@@ -12,8 +12,8 @@ from tqdm import tqdm
 # ============================================================
 # PATHS  — edit these lines
 # ============================================================
-SRC_ROOT = "/home/pai-ng/Jamal/MPDv2"
-DST_ROOT = "/home/pai-ng/Jamal/MPDv2-ROI"
+SRC_ROOT = "/home/pai-ng/Jamal/scanner_data"
+DST_ROOT = "/home/pai-ng/Jamal/scanner_data_mediapipe_roi"
 MODEL_PATH = "hand_landmarker.task"  # Ensure this file is in the same folder
 ROI_SIZE = 160
 SAVE_FAILED = False  # ← Set to True to save fallback ROIs, False to skip them
