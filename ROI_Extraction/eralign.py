@@ -122,6 +122,8 @@ class PalmBasic:
 
     def find_largest_component(self, img):
         _, labels, stats, _ = cv2.connectedComponentsWithStats(img)
+        if len(stats) <= 1:  # only background, no foreground components
+            return np.zeros_like(img), None, np.zeros_like(img)
         largest_component_label = np.argmax(stats[1:, -1]) + 1
         max_comp_img = np.zeros_like(img)
         max_comp_img[labels == largest_component_label] = 255
@@ -384,11 +386,10 @@ class GetROI(PalmBasic):
         img_blurred = self.gaussian_blur(img, sigma=BLUR_SIGMA, blur=BLUR)
         rough_binary = self.threshold_image(img_blurred, threshold_val=THRESHOLD_SEG, bi_threshold=BI_THRESHOLD_SEG)
         max_comp_img, max_comp_contour_coord, max_comp_contour_img = self.find_largest_component(rough_binary)
-        '''
-        max_comp_img_small = self.erode_binary_image(max_comp_img, kernel_size=KERNEL_SIZE)
-        max_comp_contour_coord_small = self.find_contour(max_comp_img_small)
-        max_comp_contour_img_small = self.fill_contour(img, max_comp_contour_coord_small)
-        '''
+
+        if max_comp_contour_coord is None:
+            return False
+
         max_comp_img_small = self.erode_binary_image(max_comp_img, kernel_size=KERNEL_SIZE)
         if cv2.countNonZero(max_comp_img_small) == 0:
             max_comp_img_small = self.erode_binary_image(max_comp_img, kernel_size=(15, 15))
@@ -397,17 +398,15 @@ class GetROI(PalmBasic):
         max_comp_contour_coord_small = self.find_contour(max_comp_img_small)
         max_comp_contour_img_small = self.fill_contour(img, max_comp_contour_coord_small)
 
-        
         hull_coord, hull_img = self.hull_image(img, max_comp_contour_coord)
         rough_edges_img = self._detect_rough_edges(img_blurred & max_comp_img)
 
-        #hull_img_small = self.erode_binary_image(hull_img, kernel_size=KERNEL_SIZE)
         hull_img_small = self.erode_binary_image(hull_img, kernel_size=KERNEL_SIZE)
         if cv2.countNonZero(hull_img_small) == 0:
             hull_img_small = self.erode_binary_image(hull_img, kernel_size=(15, 15))
         if cv2.countNonZero(hull_img_small) == 0:
             return False
-    
+
         hull_contour_coord_small = self.find_contour(hull_img_small)
         hull_contour_img_small = self.fill_contour(img, hull_contour_coord_small)
         concave_contour_img = max_comp_contour_img & hull_img_small
@@ -514,7 +513,6 @@ class GetROI(PalmBasic):
 
     def find_concave_finger(self, hull_contour_coord_small, hull_contour_img_small, palm_len, hull_coord_right, palm_contour):
         finger_lines = []
-        #mask = np.array([cv2.pointPolygonTest(hull_contour_coord_small[:,0,:], tuple(pt), measureDist=True) > 0.5 for pt in palm_contour])
         mask = np.array([cv2.pointPolygonTest(hull_contour_coord_small[:,0,:].astype(np.float32), (float(pt[0]), float(pt[1])), measureDist=True) > 0.5 for pt in palm_contour])
         transitions = np.where(mask[:-1] != mask[1:])[0] + 1
 
@@ -710,28 +708,35 @@ def run_extraction(dir_source, dir_output):
 
     print(f"Found {len(all_images)} images.")
 
+    num_success = 0
+    num_failed = 0
+
     for idx, (root, filename) in enumerate(all_images):
         img_path = os.path.join(root, filename)
 
-        # Mirror the subfolder structure in the output directory
         rel_path = os.path.relpath(root, dir_source)
         out_dir = os.path.join(dir_output, rel_path)
         os.makedirs(out_dir, exist_ok=True)
 
         gray_img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-
         if gray_img is None:
             print(f"{idx}: Skipped {filename} (not a readable image)")
+            num_failed += 1
             continue
 
-        get_roi = GetROI(gray_img, ratio_rotate=1, ratio=1)
-        get_roi.run_rotate()
+        try:
+            get_roi = GetROI(gray_img, ratio_rotate=1, ratio=1)
+            get_roi.run_rotate()
 
-        get_roi.norm_img = get_roi.rotate_image(get_roi.ori_img, get_roi.rotation_angle)
-        height, width = get_roi.norm_img.shape[:2]
-        get_roi.cut_norm_img = get_roi.norm_img[0:height, 0:int(width/4*3)]
+            get_roi.norm_img = get_roi.rotate_image(get_roi.ori_img, get_roi.rotation_angle)
+            height, width = get_roi.norm_img.shape[:2]
+            get_roi.cut_norm_img = get_roi.norm_img[0:height, 0:int(width/4*3)]
 
-        bool_result = get_roi.run_localization()
+            bool_result = get_roi.run_localization()
+        except Exception as e:
+            print(f"{idx}: Error processing {filename}: {e}")
+            num_failed += 1
+            continue
 
         if bool_result:
             kk_pred = np.array(get_roi.keypoints_localization)
@@ -745,8 +750,12 @@ def run_extraction(dir_source, dir_output):
             out_path = os.path.join(out_dir, filename)
             cv2.imwrite(out_path, roi_pred)
             print(f"{idx}: Saved ROI -> {out_path}")
+            num_success += 1
         else:
             print(f"{idx}: Failed to extract ROI for {filename}")
+            num_failed += 1
+
+    print(f"\nDone. Success: {num_success}, Failed: {num_failed}")
 
 
 if __name__ == '__main__':
