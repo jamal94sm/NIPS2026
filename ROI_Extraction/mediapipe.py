@@ -5,6 +5,7 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import os
 import csv
+import json
 from PIL import Image
 from tqdm import tqdm
 
@@ -16,6 +17,7 @@ DST_ROOT = "/home/pai-ng/Jamal/MPDv2-ROI"
 MODEL_PATH = "hand_landmarker.task"  # Ensure this file is in the same folder
 ROI_SIZE = 160
 SAVE_FAILED = False  # ← Set to True to save fallback ROIs, False to skip them
+FAILED_JSON_PATH = os.path.join(DST_ROOT, "failed_samples.json")  # ← Output path for failed samples
 
 # ============================================================
 # NEW: Initialize MediaPipe Tasks Detector
@@ -139,6 +141,7 @@ def main():
     num_success = 0
     num_fallback = 0
     report_rows = []
+    failed_samples = []  # ← Accumulates failed sample paths
 
     pbar = tqdm(all_images, desc="Processing MPDv2")
     for src_path, meta in pbar:
@@ -151,6 +154,7 @@ def main():
             img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
         except Exception:
             num_fallback += 1
+            failed_samples.append(src_path)  # ← Record load failure
             pbar.set_postfix(success=num_success, failed=num_fallback)
             continue
 
@@ -159,6 +163,7 @@ def main():
         if roi_bgr is None or roi_bgr.size == 0:
             status = "failed"
             num_fallback += 1
+            failed_samples.append(src_path)  # ← Record detection failure
             if SAVE_FAILED:
                 roi_bgr = cv2.resize(img_bgr, (ROI_SIZE, ROI_SIZE))
                 cv2.imwrite(dst_path, roi_bgr)
@@ -172,7 +177,12 @@ def main():
 
         pbar.set_postfix(success=num_success, failed=num_fallback)
 
+    # ← Write failed samples to JSON
+    with open(FAILED_JSON_PATH, "w") as f:
+        json.dump(failed_samples, f, indent=2)
+
     print(f"\nDone. Success: {num_success}, Fallback: {num_fallback}")
+    print(f"Failed samples saved to: {FAILED_JSON_PATH}")
 
 if __name__ == "__main__":
     main()
