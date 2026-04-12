@@ -737,6 +737,6 @@ def run_extraction(dir_source, dir_output):
 
 
 if __name__ == '__main__':
-    dir_source = '/mnt/data/FingerprintDatasets/Combined/combineddataset/CASIA_Multi_Spectral_Palmprint_V1'
-    dir_output = '/home/pai-ng/Jamal/NIPS2026/ROI_Extraction/CASIA-MS_ROI_ERAlign'
+    dir_source = "/home/pai-ng/Jamal/scanner_data"
+    dir_output = "/home/pai-ng/Jamal/scanner_data_eralign_roi"
     run_extraction(dir_source, dir_output)
