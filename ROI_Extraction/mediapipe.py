@@ -4,7 +4,6 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import os
-import csv
 import json
 from PIL import Image
 from tqdm import tqdm
@@ -14,13 +13,13 @@ from tqdm import tqdm
 # ============================================================
 SRC_ROOT = "/home/pai-ng/Jamal/scanner_data"
 DST_ROOT = "/home/pai-ng/Jamal/scanner_data_mediapipe_roi"
-MODEL_PATH = "/home/pai-ng/Jamal/NIPS2026/ROI_Extraction/hand_landmarker.task"  # Ensure this file is in the same folder
+MODEL_PATH = "/home/pai-ng/Jamal/NIPS2026/ROI_Extraction/hand_landmarker.task"
 ROI_SIZE = 160
 SAVE_FAILED = False  # ← Set to True to save fallback ROIs, False to skip them
-FAILED_JSON_PATH = os.path.join(DST_ROOT, "failed_samples.json")  # ← Output path for failed samples
+FAILED_JSON_PATH = os.path.join(DST_ROOT, "failed_samples.json")
 
 # ============================================================
-# NEW: Initialize MediaPipe Tasks Detector
+# Initialize MediaPipe Tasks Detector
 # ============================================================
 base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
 options = vision.HandLandmarkerOptions(
@@ -29,34 +28,25 @@ options = vision.HandLandmarkerOptions(
     min_hand_detection_confidence=0.2,
     running_mode=vision.RunningMode.IMAGE
 )
-# Create detector once to reuse in the loop
 detector = vision.HandLandmarker.create_from_options(options)
 
 def _run_mp_hands_new(image_bgr):
-    """
-    Updated for MediaPipe 0.10.30+ using Tasks API
-    """
-    # Convert BGR to MediaPipe Image object
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
-    
-    # Run detection
     detection_result = detector.detect(mp_image)
-    
+
     if not detection_result.hand_landmarks:
         return None, None
 
-    # Extract landmarks for the first hand detected
     lm_list = detection_result.hand_landmarks[0]
-    handedness = detection_result.handedness[0][0].category_name # 'Left' or 'Right'
+    handedness = detection_result.handedness[0][0].category_name  # 'Left' or 'Right'
 
     h, w = image_bgr.shape[:2]
-    # Tasks API uses normalized coordinates (0.0 to 1.0) just like legacy
     pts = [(int(p.x * w), int(p.y * h)) for p in lm_list]
-    
+
     return pts, handedness
 
 # ============================================================
-# ROI MATH HELPERS (Unchanged logic, just updated call)
+# ROI MATH HELPERS
 # ============================================================
 
 def _midpoints(pairs):
@@ -92,7 +82,6 @@ def _extract_roi(img, mid1, mid2, C, thumb, hand_type):
     return roi, box
 
 def extract_palm_roi(image_bgr):
-    # Updated call to the new detection function
     lms, hand_type = _run_mp_hands_new(image_bgr)
     if lms is None:
         return None, None, None
@@ -115,19 +104,22 @@ def extract_palm_roi(image_bgr):
     return roi, ann, hand_type
 
 # ============================================================
-# Filename Parser & Main Loop (Remains largely the same)
+# Filename Parser
 # ============================================================
 
-def parse_mpd_filename(fname):
+def parse_scanner_filename(fname):
+    """Parses filenames like: 065_S2_Left_magenta.jpg"""
     stem = os.path.splitext(fname)[0]
     parts = stem.split("_")
-    if len(parts) != 5: return None
-    subj_id, session, device, hand, iteration = parts
-    if (len(subj_id) == 3 and subj_id.isdigit() and session in ("1", "2")
-            and device in ("h", "m") and hand in ("l", "r")
-            and len(iteration) == 2 and iteration.isdigit()):
-        return dict(id=subj_id, session=session, device=device, hand=hand, iteration=iteration)
+    if len(parts) != 4: return None
+    subj_id, session, hand, color = parts
+    if subj_id.isdigit() and session.startswith("S") and hand in ("Left", "Right"):
+        return dict(id=subj_id, session=session, hand=hand, color=color)
     return None
+
+# ============================================================
+# Main Loop
+# ============================================================
 
 def main():
     os.makedirs(DST_ROOT, exist_ok=True)
@@ -135,14 +127,18 @@ def main():
     for root, _, files in os.walk(SRC_ROOT):
         for f in sorted(files):
             if not f.lower().endswith(".jpg"): continue
-            all_images.append((os.path.join(root, f), {}))  # empty meta, no parsing
+            parsed = parse_scanner_filename(f)
+            if parsed:
+                all_images.append((os.path.join(root, f), parsed))
+
+    print(f"Found {len(all_images)} images.")
 
     num_success = 0
     num_fallback = 0
     report_rows = []
-    failed_samples = []  # ← Accumulates failed sample paths
+    failed_samples = []
 
-    pbar = tqdm(all_images, desc="Processing MPDv2")
+    pbar = tqdm(all_images, desc="Processing scanner data")
     for src_path, meta in pbar:
         rel_path = os.path.relpath(src_path, SRC_ROOT)
         dst_path = os.path.join(DST_ROOT, rel_path)
@@ -153,7 +149,7 @@ def main():
             img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
         except Exception:
             num_fallback += 1
-            failed_samples.append(src_path)  # ← Record load failure
+            failed_samples.append(src_path)
             pbar.set_postfix(success=num_success, failed=num_fallback)
             continue
 
@@ -162,7 +158,7 @@ def main():
         if roi_bgr is None or roi_bgr.size == 0:
             status = "failed"
             num_fallback += 1
-            failed_samples.append(src_path)  # ← Record detection failure
+            failed_samples.append(src_path)
             if SAVE_FAILED:
                 roi_bgr = cv2.resize(img_bgr, (ROI_SIZE, ROI_SIZE))
                 cv2.imwrite(dst_path, roi_bgr)
@@ -176,7 +172,6 @@ def main():
 
         pbar.set_postfix(success=num_success, failed=num_fallback)
 
-    # ← Write failed samples to JSON
     with open(FAILED_JSON_PATH, "w") as f:
         json.dump(failed_samples, f, indent=2)
 
