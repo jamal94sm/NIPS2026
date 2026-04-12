@@ -135,8 +135,7 @@ def main():
     for root, _, files in os.walk(SRC_ROOT):
         for f in sorted(files):
             if not f.lower().endswith(".jpg"): continue
-            parsed = parse_mpd_filename(f)
-            if parsed: all_images.append((os.path.join(root, f), parsed))
+            all_images.append((os.path.join(root, f), {}))  # empty meta, no parsing
 
     num_success = 0
     num_fallback = 0
