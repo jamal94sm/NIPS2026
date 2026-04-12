@@ -14,7 +14,7 @@ from tqdm import tqdm
 # ============================================================
 SRC_ROOT = "/home/pai-ng/Jamal/scanner_data"
 DST_ROOT = "/home/pai-ng/Jamal/scanner_data_mediapipe_roi"
-MODEL_PATH = "hand_landmarker.task"  # Ensure this file is in the same folder
+MODEL_PATH = "/home/pai-ng/Jamal/NIPS2026/ROI_Extraction/hand_landmarker.task"  # Ensure this file is in the same folder
 ROI_SIZE = 160
 SAVE_FAILED = False  # ← Set to True to save fallback ROIs, False to skip them
 FAILED_JSON_PATH = os.path.join(DST_ROOT, "failed_samples.json")  # ← Output path for failed samples
