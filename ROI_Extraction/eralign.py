@@ -701,10 +701,23 @@ class GetROI(PalmBasic):
 
 def run_extraction(dir_source, dir_output):
     os.makedirs(dir_output, exist_ok=True)
-    filenames = sorted(os.listdir(dir_source))
 
-    for idx, filename in enumerate(filenames):
-        img_path = os.path.join(dir_source, filename)
+    all_images = []
+    for root, _, files in os.walk(dir_source):
+        for filename in sorted(files):
+            if filename.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                all_images.append((root, filename))
+
+    print(f"Found {len(all_images)} images.")
+
+    for idx, (root, filename) in enumerate(all_images):
+        img_path = os.path.join(root, filename)
+
+        # Mirror the subfolder structure in the output directory
+        rel_path = os.path.relpath(root, dir_source)
+        out_dir = os.path.join(dir_output, rel_path)
+        os.makedirs(out_dir, exist_ok=True)
+
         gray_img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
 
         if gray_img is None:
@@ -729,7 +742,7 @@ def run_extraction(dir_source, dir_output):
                 gray_img, color=[0, 0, 255], thickness=2
             )
 
-            out_path = os.path.join(dir_output, filename)
+            out_path = os.path.join(out_dir, filename)
             cv2.imwrite(out_path, roi_pred)
             print(f"{idx}: Saved ROI -> {out_path}")
         else:
