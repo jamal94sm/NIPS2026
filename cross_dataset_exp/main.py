@@ -72,9 +72,6 @@ def main():
     eval_every          = CONFIG["eval_every"]
     nw                  = CONFIG["num_workers"]
     augment_factor      = CONFIG["augment_factor"]
-    use_triplet         = CONFIG.get("use_triplet",     False)
-    triplet_weight      = CONFIG.get("triplet_weight",  0.10)
-    triplet_margin      = CONFIG.get("triplet_margin",  0.25)
 
     same_dataset = (train_data.strip().lower().replace("-", "") ==
                     test_data.strip().lower().replace("-", ""))
@@ -183,6 +180,19 @@ def main():
         print(f"  Using {torch.cuda.device_count()} GPUs")
         net = DataParallel(net)
 
+    # ── resume checkpoint ─────────────────────────────────────
+    for ckpt in ["net_params_best_eer.pth",
+                 "net_params_best.pth",
+                 "net_params.pth"]:
+        path = os.path.join(results_dir, ckpt)
+        if os.path.exists(path):
+            _net = net.module if isinstance(net, DataParallel) else net
+            _net.load_state_dict(torch.load(path, map_location=device))
+            print(f"  Resumed from : {path}")
+            break
+    else:
+        print("  No checkpoint found — training from scratch.")
+
     criterion     = nn.CrossEntropyLoss()
     con_criterion = SupConLoss(temperature=temperature,
                                base_temperature=temperature)
@@ -205,10 +215,8 @@ def main():
             t_loss, t_acc = run_one_epoch(
                 net, train_loader, criterion, con_criterion,
                 optimizer, device, "training",
-                ce_weight=ce_weight, con_weight=con_weight,
-                use_triplet=use_triplet,
-                triplet_weight=triplet_weight,
-                triplet_margin=triplet_margin)
+                ce_weight=ce_weight, con_weight=con_weight)
+            scheduler.step()
 
             train_losses.append(t_loss)
             train_accs.append(t_acc)
