@@ -1250,7 +1250,8 @@ def main():
     if torch.cuda.device_count() > 1:
         print(f"  Using {torch.cuda.device_count()} GPUs (DataParallel)")
         net = DataParallel(net)
-
+      
+    '''
     # ── resume from checkpoint if one exists ──────────────────────────────
     for ckpt_path in [
         os.path.join(results_dir, "net_params_best_eer.pth"),
@@ -1264,7 +1265,8 @@ def main():
             break
     else:
         print(f"  No checkpoint found — training from scratch.\n")
-
+    '''
+  
     criterion     = nn.CrossEntropyLoss()
     con_criterion = SupConLoss(temperature=temperature, base_temperature=temperature)
     optimizer     = optim.Adam(net.parameters(), lr=lr)
