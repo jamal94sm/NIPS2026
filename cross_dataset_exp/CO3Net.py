@@ -33,8 +33,8 @@ CONFIG = {
     "test_data"            : "Smartphone",     # "Smartphone" | "CASIA-MS"
     "data_root"            : "/home/pai-ng/Jamal/CASIA-MS-ROI",
     "test_data_root"       : "/home/pai-ng/Jamal/smartphone_data",
-    "train_subject_ratio"  : 0.70,   # 70% of subjects → train
-    "test_gallery_ratio"   : 0.30,   # 30% of test-subject images → gallery
+    "train_subject_ratio"  : 0.80,   # 70% of subjects → train
+    "test_gallery_ratio"   : 0.50,   # 30% of test-subject images → gallery
     "results_dir"          : "./rst_co3net_casia_ms",
     "img_side"             : 128,
     "batch_size"           : 256,    # ← was 1024
@@ -50,7 +50,7 @@ CONFIG = {
     "temperature"          : 0.07,
     "n_casia_subjects"     : 190,
     "n_casia_samples"      : 2776,
-    "augment_factor"       : 3,      # ← increase to 3 to compensate small dataset
+    "augment_factor"       : 4,      # ← increase to 3 to compensate small dataset
     "random_seed"          : 42,
     "save_every"           : 50,
     "eval_every"           : 50,
