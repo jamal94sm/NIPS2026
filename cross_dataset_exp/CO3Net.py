@@ -494,22 +494,40 @@ class NormSingleROI(object):
 #  DATASET  — paired & single, for CASIA-MS-ROI
 # ══════════════════════════════════════════════════════════════
 
-def parse_casia_ms(data_root):
+def parse_casia_ms(data_root, iterations_per_spectrum=3, seed=42):
     """
     Scan CASIA-MS-ROI folder.  Filename format:
         {subjectID}_{handSide}_{spectrum}_{iteration}.jpg
-    Identity key = subjectID + "_" + handSide  (e.g. "001_L").
+    Identity key = subjectID + "_" + handSide  (e.g. "025_l").
+
+    For every (identity, spectrum) group, keeps exactly
+    `iterations_per_spectrum` randomly chosen iterations.
+    With 6 spectra this yields 6 × 3 = 18 samples per identity.
+
     Returns dict  {identity_key: [path1, path2, …]}
     """
-    id2paths = defaultdict(list)
+    rng = random.Random(seed)
+
+    # group files by (identity, spectrum)
+    id_spectrum_paths = defaultdict(list)
     for fname in sorted(os.listdir(data_root)):
         if not fname.lower().endswith((".jpg", ".jpeg", ".bmp", ".png")):
             continue
-        parts = fname.split("_")
+        stem  = os.path.splitext(fname)[0]      # "025_l_940_04"
+        parts = stem.split("_")
         if len(parts) < 4:
             continue
-        identity = parts[0] + "_" + parts[1]        # e.g. "001_L"
-        id2paths[identity].append(os.path.join(data_root, fname))
+        identity = parts[0] + "_" + parts[1]    # "025_l"
+        spectrum = parts[2]                      # "940"
+        id_spectrum_paths[(identity, spectrum)].append(
+            os.path.join(data_root, fname))
+
+    # sample up to `iterations_per_spectrum` per (identity, spectrum) group
+    id2paths = defaultdict(list)
+    for (identity, spectrum), paths in id_spectrum_paths.items():
+        chosen = rng.sample(paths, min(iterations_per_spectrum, len(paths)))
+        id2paths[identity].extend(chosen)
+
     return dict(id2paths)
 
 
@@ -958,7 +976,7 @@ def main():
 
     # ---------- parse dataset ----------
     print("Scanning dataset …")
-    id2paths = parse_casia_ms(data_root)
+    id2paths = parse_casia_ms(data_root, iterations_per_spectrum=3, seed=seed)
     n_total_ids  = len(id2paths)
     n_total_imgs = sum(len(v) for v in id2paths.values())
     print(f"  Found {n_total_ids} identities, {n_total_imgs} images total.\n")
@@ -1096,6 +1114,12 @@ def main():
 
     eval_net = net.module if isinstance(net, DataParallel) else net
     eval_net.load_state_dict(torch.load(best_model_path, map_location=device))
+
+    # ── save final model with custom name ──────────────────────────────────
+    torch.save(eval_net.state_dict(),
+               os.path.join(results_dir, "CO3Net_CASIA-MS.pth"))
+    print("  Model saved as CO3Net_CASIA-MS.pth")
+    # ───────────────────────────────────────────────────────────────────────
 
     final_eer, final_aggr_eer, final_rank1 = evaluate(
         eval_net, probe_loader, gallery_loader,
