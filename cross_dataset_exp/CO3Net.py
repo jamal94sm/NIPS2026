@@ -31,6 +31,7 @@ Architecture: CO3Net (unchanged from official repo)
 CONFIG = {
     "protocol"        : "open-set",   # "closed-set" | "open-set"
     "data_root"       : "/home/pai-ng/Jamal/CASIA-MS-ROI",
+    "augment_factor"  : 3,   # K — each training sample appears K times per epoch
     "results_dir"     : "./rst_co3net_casia_ms",
     "img_side"        : 128,            # input image size (128×128 → fc=17328)
     "batch_size"      : 1024,           # CO3Net default
@@ -594,66 +595,69 @@ def split_open_set(id2paths, train_ratio=0.8, gallery_ratio=0.5,
 
 # ────────── paired dataset (for training / val) ──────────
 class CASIAMSDataset(Dataset):
-    """
-    Returns (img1, img2), label.
-    Training: img2 is a DIFFERENT sample of the same identity.
-    Testing:  img2 = img1 (duplicate).
-    Mirrors the official CO3Net MyDataset behaviour.
-    """
-    def __init__(self, samples, img_side=128, train=True):
+    def __init__(self, samples, img_side=128, train=True, augment_factor=1):
         super().__init__()
-        self.samples  = samples          # [(path, label), …]
-        self.train    = train
-        self.img_side = img_side
+        self.samples        = samples
+        self.train          = train
+        self.img_side       = img_side
+        self.augment_factor = augment_factor if train else 1  # never augment val/test
 
-        # build label → indices map for positive pairing
         self.label2idxs = defaultdict(list)
         for i, (_, lab) in enumerate(samples):
             self.label2idxs[lab].append(i)
 
-        if train:
-            self.transform = T.Compose([
-                T.Resize(img_side),
+        # augmentation transform (used for all K copies during training)
+        self.aug_transform = T.Compose([
+            T.Resize(img_side),
+            T.RandomChoice(transforms=[
+                T.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
+                T.RandomResizedCrop(size=img_side, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
+                T.RandomPerspective(distortion_scale=0.15, p=1),
                 T.RandomChoice(transforms=[
-                    T.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
-                    T.RandomResizedCrop(size=img_side, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
-                    T.RandomPerspective(distortion_scale=0.15, p=1),
-                    T.RandomChoice(transforms=[
-                        T.RandomRotation(degrees=10, interpolation=Image.BICUBIC,
-                                         expand=False, center=(0.5 * img_side, 0.0)),
-                        T.RandomRotation(degrees=10, interpolation=Image.BICUBIC,
-                                         expand=False, center=(0.0, 0.5 * img_side)),
-                    ]),
+                    T.RandomRotation(degrees=10, interpolation=Image.BICUBIC,
+                                     expand=False, center=(0.5 * img_side, 0.0)),
+                    T.RandomRotation(degrees=10, interpolation=Image.BICUBIC,
+                                     expand=False, center=(0.0, 0.5 * img_side)),
                 ]),
-                T.ToTensor(),
-                NormSingleROI(outchannels=1),
-            ])
-        else:
-            self.transform = T.Compose([
-                T.Resize(img_side),
-                T.ToTensor(),
-                NormSingleROI(outchannels=1),
-            ])
+            ]),
+            T.ToTensor(),
+            NormSingleROI(outchannels=1),
+        ])
+
+        # clean transform (no augmentation — used for val/test)
+        self.clean_transform = T.Compose([
+            T.Resize(img_side),
+            T.ToTensor(),
+            NormSingleROI(outchannels=1),
+        ])
 
     def __len__(self):
-        return len(self.samples)
+        # effective dataset is K × larger than the original
+        return len(self.samples) * self.augment_factor
 
     def __getitem__(self, index):
-        path1, label = self.samples[index]
+        # map the virtual index back to a real sample
+        real_idx   = index % len(self.samples)
+        path1, label = self.samples[real_idx]
 
         if self.train:
+            # pair with a different sample of the same identity
             idxs = self.label2idxs[label]
-            idx2 = index
-            while idx2 == index and len(idxs) > 1:
+            idx2 = real_idx
+            while idx2 == real_idx and len(idxs) > 1:
                 idx2 = random.choice(idxs)
             path2 = self.samples[idx2][0]
-        else:
-            path2 = path1
 
-        img1 = Image.open(path1).convert("L")
-        img2 = Image.open(path2).convert("L")
-        img1 = self.transform(img1)
-        img2 = self.transform(img2)
+            img1 = Image.open(path1).convert("L")
+            img2 = Image.open(path2).convert("L")
+            # every copy — including the first — gets its own random augmentation
+            img1 = self.aug_transform(img1)
+            img2 = self.aug_transform(img2)
+        else:
+            img1 = Image.open(path1).convert("L")
+            img2 = img1.copy()
+            img1 = self.clean_transform(img1)
+            img2 = self.clean_transform(img2)
 
         return [img1, img2], label
 
@@ -953,11 +957,11 @@ def main():
     temperature    = CONFIG["temperature"]
     train_ratio    = CONFIG["train_ratio"]
     gallery_ratio  = CONFIG["gallery_ratio"]
-    val_ratio      = CONFIG["val_ratio"]
     seed           = CONFIG["random_seed"]
     save_every     = CONFIG["save_every"]
     eval_every     = CONFIG["eval_every"]
     nw             = CONFIG["num_workers"]
+    augment_factor = CONFIG["augment_factor"]
 
     assert protocol in ("closed-set", "open-set")
 
@@ -968,10 +972,11 @@ def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"\n{'='*60}")
     print(f"  CO3Net on CASIA-MS")
-    print(f"  Protocol : {protocol}")
-    print(f"  Device   : {device}")
-    print(f"  Data     : {data_root}")
-    print(f"  Loss     : {ce_weight}*CE + {con_weight}*SupCon(τ={temperature})")
+    print(f"  Protocol       : {protocol}")
+    print(f"  Device         : {device}")
+    print(f"  Data           : {data_root}")
+    print(f"  Loss           : {ce_weight}*CE + {con_weight}*SupCon(τ={temperature})")
+    print(f"  Augment factor : {augment_factor}x")
     print(f"{'='*60}\n")
 
     # ---------- parse dataset ----------
@@ -987,42 +992,41 @@ def main():
             id2paths, train_ratio=train_ratio, seed=seed)
         num_classes = len(label_map)
 
-        # Paired datasets for training/val
-        train_dataset = CASIAMSDataset(train_samples, img_side=img_side, train=True)
-        val_dataset   = CASIAMSDataset(test_samples,  img_side=img_side, train=False)
+        train_dataset  = CASIAMSDataset(train_samples, img_side=img_side,
+                                        train=True, augment_factor=augment_factor)
+        gallery_loader = DataLoader(
+            CASIAMSDatasetSingle(train_samples, img_side=img_side),
+            batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
+        probe_loader   = DataLoader(
+            CASIAMSDatasetSingle(test_samples,  img_side=img_side),
+            batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
 
-        # Single-image datasets for evaluation
-        gallery_eval  = CASIAMSDatasetSingle(train_samples, img_side=img_side)
-        probe_eval    = CASIAMSDatasetSingle(test_samples,  img_side=img_side)
-
-        train_loader   = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,  num_workers=nw, pin_memory=True)
-        val_loader     = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
-        gallery_loader = DataLoader(gallery_eval,  batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
-        probe_loader   = DataLoader(probe_eval,    batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
-
-        print(f"  [closed-set] #classes={num_classes}\n")
+        print(f"  [closed-set] #classes={num_classes} | "
+              f"train={len(train_samples)} (+aug→{len(train_samples)*augment_factor}) | "
+              f"test={len(test_samples)}\n")
 
     else:  # open-set
-        (train_samples, val_samples, gallery_samples, probe_samples,
+        (train_samples, _, gallery_samples, probe_samples,
          train_label_map, test_label_map) = split_open_set(
             id2paths, train_ratio=train_ratio,
-            gallery_ratio=gallery_ratio, val_ratio=val_ratio, seed=seed)
+            gallery_ratio=gallery_ratio, val_ratio=0.0, seed=seed)
         num_classes = len(train_label_map)
 
-        # Paired datasets for training/val
-        train_dataset = CASIAMSDataset(train_samples, img_side=img_side, train=True)
-        val_dataset   = CASIAMSDataset(val_samples,   img_side=img_side, train=False)
+        train_dataset  = CASIAMSDataset(train_samples, img_side=img_side,
+                                        train=True, augment_factor=augment_factor)
+        gallery_loader = DataLoader(
+            CASIAMSDatasetSingle(gallery_samples, img_side=img_side),
+            batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
+        probe_loader   = DataLoader(
+            CASIAMSDatasetSingle(probe_samples,   img_side=img_side),
+            batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
 
-        # Single-image datasets for evaluation
-        gallery_eval  = CASIAMSDatasetSingle(gallery_samples, img_side=img_side)
-        probe_eval    = CASIAMSDatasetSingle(probe_samples,   img_side=img_side)
+        print(f"  [open-set] #train_classes={num_classes} | "
+              f"train={len(train_samples)} (+aug→{len(train_samples)*augment_factor}) | "
+              f"gallery={len(gallery_samples)} | probe={len(probe_samples)}\n")
 
-        train_loader   = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,  num_workers=nw, pin_memory=True)
-        val_loader     = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
-        gallery_loader = DataLoader(gallery_eval,  batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
-        probe_loader   = DataLoader(probe_eval,    batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
-
-        print(f"  [open-set] #train_classes={num_classes}\n")
+    train_loader = DataLoader(train_dataset, batch_size=batch_size,
+                              shuffle=True, num_workers=nw, pin_memory=True)
 
     # ---------- model ----------
     print(f"Building CO3Net — num_classes={num_classes} …")
@@ -1039,13 +1043,11 @@ def main():
     scheduler     = lr_scheduler.StepLR(optimizer, step_size=lr_step, gamma=lr_gamma)
 
     # ---------- training loop ----------
-    train_losses, val_losses = [], []
-    train_accs,   val_accs   = [], []
-    best_val_acc = 0.0
+    train_losses = []
+    train_accs   = []
     best_eer     = 1.0
-
-    last_eer   = float("nan")
-    last_rank1 = float("nan")
+    last_eer     = float("nan")
+    last_rank1   = float("nan")
 
     print(f"\nStarting training for {num_epochs} epochs …")
     print(f"  EER / Rank-1 computed every {eval_every} epochs.\n")
@@ -1055,16 +1057,10 @@ def main():
             epoch, net, train_loader, criterion, con_criterion,
             optimizer, device, "training",
             ce_weight=ce_weight, con_weight=con_weight)
-        v_loss, v_acc = run_one_epoch(
-            epoch, net, val_loader, criterion, con_criterion,
-            optimizer, device, "testing",
-            ce_weight=ce_weight, con_weight=con_weight)
         scheduler.step()
 
         train_losses.append(t_loss)
-        val_losses.append(v_loss)
         train_accs.append(t_acc)
-        val_accs.append(v_acc)
 
         _net = net.module if isinstance(net, DataParallel) else net
 
@@ -1083,43 +1079,47 @@ def main():
                            os.path.join(results_dir, "net_params_best_eer.pth"))
                 print(f"  *** New best EER: {best_eer*100:.4f}% ***")
 
-        # ── every-10-epoch console print ──────────────────────────────────────
+        # ── periodic console print ────────────────────────────────────────────
         if epoch % 10 == 0 or epoch == num_epochs - 1:
-            ts = time.strftime("%H:%M:%S")
-            eer_str   = f"{last_eer*100:.4f}%"   if not math.isnan(last_eer)   else "N/A"
-            rank1_str = f"{last_rank1:.2f}%"      if not math.isnan(last_rank1) else "N/A"
+            ts        = time.strftime("%H:%M:%S")
+            eer_str   = f"{last_eer*100:.4f}%"  if not math.isnan(last_eer)   else "N/A"
+            rank1_str = f"{last_rank1:.2f}%"     if not math.isnan(last_rank1) else "N/A"
             print(
                 f"[{ts}] ep {epoch:04d} | "
-                f"loss  train={t_loss:.5f}  val={v_loss:.5f} | "
-                f"cls-acc  train={t_acc:.2f}%  val={v_acc:.2f}% | "
+                f"loss={t_loss:.5f} | cls-acc={t_acc:.2f}% | "
                 f"EER={eer_str}  Rank-1={rank1_str}")
-
-        # ── save best classification model ────────────────────────────────────
-        if v_acc > best_val_acc:
-            best_val_acc = v_acc
-            torch.save(_net.state_dict(),
-                       os.path.join(results_dir, "net_params_best.pth"))
 
         # ── periodic checkpoint ───────────────────────────────────────────────
         if epoch % save_every == 0 or epoch == num_epochs - 1:
             torch.save(_net.state_dict(),
                        os.path.join(results_dir, "net_params.pth"))
-            plot_loss_acc(train_losses, val_losses, train_accs, val_accs, results_dir)
+            # loss / acc plot (train only)
+            try:
+                fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+                axes[0].plot(train_losses, 'b', label='train loss')
+                axes[0].set_xlabel('epoch'); axes[0].set_ylabel('loss')
+                axes[0].legend(); axes[0].grid(True)
+                axes[1].plot(train_accs, 'b', label='train acc')
+                axes[1].set_xlabel('epoch'); axes[1].set_ylabel('accuracy (%)')
+                axes[1].legend(); axes[1].grid(True)
+                fig.tight_layout()
+                fig.savefig(os.path.join(results_dir, "train_curves.png"))
+                plt.close(fig)
+            except Exception:
+                pass
 
     # ---------- final evaluation ----------
     print("\n=== Final evaluation with best EER model ===")
     best_model_path = os.path.join(results_dir, "net_params_best_eer.pth")
     if not os.path.exists(best_model_path):
-        best_model_path = os.path.join(results_dir, "net_params_best.pth")
+        best_model_path = os.path.join(results_dir, "net_params.pth")
 
     eval_net = net.module if isinstance(net, DataParallel) else net
     eval_net.load_state_dict(torch.load(best_model_path, map_location=device))
 
-    # ── save final model with custom name ──────────────────────────────────
     torch.save(eval_net.state_dict(),
                os.path.join(results_dir, "CO3Net_CASIA-MS.pth"))
     print("  Model saved as CO3Net_CASIA-MS.pth")
-    # ───────────────────────────────────────────────────────────────────────
 
     final_eer, final_aggr_eer, final_rank1 = evaluate(
         eval_net, probe_loader, gallery_loader,
@@ -1131,16 +1131,16 @@ def main():
     print(f"  FINAL Pairwise EER   : {final_eer*100:.4f}%")
     print(f"  FINAL Aggregated EER : {final_aggr_eer*100:.4f}%")
     print(f"  FINAL Rank-1         : {final_rank1:.3f}%")
-    print(f"  Results saved to: {results_dir}")
+    print(f"  Results saved to     : {results_dir}")
     print(f"{'='*60}\n")
 
     with open(os.path.join(results_dir, "summary.txt"), "w") as f:
-        f.write(f"Protocol  : {protocol}\n")
-        f.write(f"Data root : {data_root}\n")
-        f.write(f"Identities: {n_total_ids}\n")
-        f.write(f"Images    : {n_total_imgs}\n")
-        f.write(f"Classes (train): {num_classes}\n")
-        f.write(f"Best val acc       : {best_val_acc:.3f}%\n")
+        f.write(f"Protocol        : {protocol}\n")
+        f.write(f"Data root       : {data_root}\n")
+        f.write(f"Identities      : {n_total_ids}\n")
+        f.write(f"Images          : {n_total_imgs}\n")
+        f.write(f"Classes (train) : {num_classes}\n")
+        f.write(f"Augment factor  : {augment_factor}x\n")
         f.write(f"Final Pairwise EER : {final_eer*100:.6f}%\n")
         f.write(f"Final Aggreg. EER  : {final_aggr_eer*100:.6f}%\n")
         f.write(f"Final Rank-1       : {final_rank1:.3f}%\n")
