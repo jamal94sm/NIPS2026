@@ -6,41 +6,6 @@ import torch
 import torch.nn as nn
 
 
-def batch_hard_triplet_loss(embeddings, labels, margin=0.25):
-    """
-    Online batch-hard triplet loss on L2-normalised embeddings.
-    For each anchor, selects:
-      - hardest positive  : same class,      largest  arc-distance
-      - hardest negative  : different class, smallest arc-distance
-
-    embeddings : (N, D) — must be L2-normalised
-    labels     : (N,)   — class indices
-    margin     : float  — triplet margin
-    Returns    : scalar loss
-    """
-    # pairwise arc-distances  (N, N)
-    cos_sim = torch.clamp(embeddings @ embeddings.T, -1 + 1e-6, 1 - 1e-6)
-    dist    = torch.acos(cos_sim) / torch.pi          # in [0, 1]
-
-    labels  = labels.view(-1)
-    mask_pos = labels.unsqueeze(0) == labels.unsqueeze(1)   # (N, N) bool
-    mask_neg = ~mask_pos
-
-    # mask out self-pairs from positives
-    eye      = torch.eye(len(labels), dtype=torch.bool, device=labels.device)
-    mask_pos = mask_pos & ~eye
-
-    # hardest positive per anchor
-    pos_dist = (dist * mask_pos.float()).max(dim=1)[0]
-
-    # hardest negative per anchor (fill positives with inf first)
-    neg_dist = dist.masked_fill(~mask_neg, float("inf")).min(dim=1)[0]
-
-    loss = torch.relu(pos_dist - neg_dist + margin).mean()
-    return loss
-
-
-
 class SupConLoss(nn.Module):
     """
     Supervised Contrastive Learning: https://arxiv.org/pdf/2004.11362.pdf
