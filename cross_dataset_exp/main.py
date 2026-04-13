@@ -180,18 +180,6 @@ def main():
         print(f"  Using {torch.cuda.device_count()} GPUs")
         net = DataParallel(net)
 
-    # ── resume checkpoint ─────────────────────────────────────
-    for ckpt in ["net_params_best_eer.pth",
-                 "net_params_best.pth",
-                 "net_params.pth"]:
-        path = os.path.join(results_dir, ckpt)
-        if os.path.exists(path):
-            _net = net.module if isinstance(net, DataParallel) else net
-            _net.load_state_dict(torch.load(path, map_location=device))
-            print(f"  Resumed from : {path}")
-            break
-    else:
-        print("  No checkpoint found — training from scratch.")
 
     criterion     = nn.CrossEntropyLoss()
     con_criterion = SupConLoss(temperature=temperature,
