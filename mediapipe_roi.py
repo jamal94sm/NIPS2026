@@ -1,16 +1,23 @@
 """
 MediaPipe Palm ROI Extraction
 ==============================
-Supports multiple filename formats (MPDv2, Scanner, generic).
-Robust against high-resolution, complex-background smartphone images.
+Improved keypoint detection pipeline for high-resolution,
+complex-background smartphone images (MPDv2, Scanner, generic).
 
-Improvements:
-  1. Multi-scale detection — tries multiple downscale sizes
-  2. CLAHE contrast enhancement — second pass on difficult images
-  3. Landmark geometric validation — rejects hallucinated detections
-  4. num_hands=2 — picks highest-confidence hand
-  5. Coordinate remapping — landmarks always in original resolution
-  6. Flexible filename parser — handles MPDv2, Scanner, and generic formats
+Detection strategy:
+  Stage 1 — Skin-guided pre-crop
+             Detect the skin region using HSV colour,
+             crop tightly around it, run MediaPipe on the crop.
+             This dramatically helps on large images where
+             the hand occupies a small fraction of the frame.
+
+  Stage 2 — Multi-scale full-image fallback
+             If Stage 1 fails, try the full image at multiple
+             downscale levels.
+
+  Stage 3 — Preprocessing variants
+             Each scale attempt is also tried with CLAHE,
+             gamma correction, and unsharp-mask sharpening.
 """
 
 import cv2
@@ -36,13 +43,14 @@ SAVE_FAILED = False   # True → save resized full image when extraction fails
 
 FAILED_JSON_PATH = os.path.join(DST_ROOT, "failed_samples.json")
 
-# Detection scales tried in order (longest edge in pixels).
-# More scales = higher recall, slower speed.
+# Downscale sizes tried for full-image fallback (longest edge in pixels)
 DETECTION_SCALES = [1024, 640, 1280, 512, 384]
 
-# Palm must span at least this fraction of max(image_w, image_h).
-# Raise to reject distant/tiny hands; lower if hands are far from camera.
-MIN_PALM_WIDTH_RATIO = 0.05
+# Skin-crop padding — fraction of crop size added on each side
+SKIN_CROP_PADDING = 0.25
+
+# Minimum palm span as fraction of max(H, W) — only rejects truly tiny detections
+MIN_PALM_RATIO = 0.02
 
 # ============================================================
 #  MEDIAPIPE INIT
@@ -51,85 +59,207 @@ MIN_PALM_WIDTH_RATIO = 0.05
 base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
 options = vision.HandLandmarkerOptions(
     base_options=base_options,
-    num_hands=2,                           # detect up to 2; pick best score
-    min_hand_detection_confidence=0.15,
-    min_hand_presence_confidence=0.15,
-    min_tracking_confidence=0.15,
+    num_hands=2,
+    min_hand_detection_confidence=0.10,   # low — preprocessing handles quality
+    min_hand_presence_confidence=0.10,
+    min_tracking_confidence=0.10,
     running_mode=vision.RunningMode.IMAGE,
 )
 detector = vision.HandLandmarker.create_from_options(options)
 
 
 # ============================================================
-#  DETECTION HELPERS
+#  IMAGE PREPROCESSING VARIANTS
 # ============================================================
 
-def _enhance_for_detection(bgr):
-    """
-    CLAHE contrast enhancement in LAB space.
-    Helps MediaPipe on low-contrast, shadowed, or overexposed images.
-    """
-    lab      = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
-    l, a, b  = cv2.split(lab)
-    clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l        = clahe.apply(l)
-    enhanced = cv2.merge([l, a, b])
-    return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+def _clahe(bgr):
+    """CLAHE contrast enhancement in LAB space."""
+    lab     = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l       = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l)
+    return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
 
-def _detect_at_scale(image_bgr, max_dim):
-    """
-    Downscale so the longest edge = max_dim, run detector,
-    map landmark coordinates back to original resolution.
-    Returns (pts, handedness_str) or (None, None).
-    """
-    h, w  = image_bgr.shape[:2]
-    scale = min(1.0, max_dim / max(h, w))
+def _gamma(bgr, g=1.5):
+    """Gamma correction — brightens underexposed images."""
+    lut = (np.arange(256, dtype=np.float32) / 255.0) ** (1.0 / g)
+    lut = (lut * 255).clip(0, 255).astype(np.uint8)
+    return cv2.LUT(bgr, lut)
 
-    if scale < 1.0:
-        dw, dh   = int(w * scale), int(h * scale)
-        det_img  = cv2.resize(image_bgr, (dw, dh),
-                              interpolation=cv2.INTER_AREA)
-    else:
-        det_img  = image_bgr
 
+def _sharpen(bgr):
+    """Unsharp mask — enhances edges to help landmark localisation."""
+    blur    = cv2.GaussianBlur(bgr, (0, 0), sigmaX=3)
+    sharp   = cv2.addWeighted(bgr, 1.5, blur, -0.5, 0)
+    return sharp
+
+
+def _get_variants(bgr):
+    """
+    Return a list of preprocessed versions of the image.
+    Tried in order — first successful detection wins.
+    """
+    return [
+        bgr,                   # 1. original
+        _clahe(bgr),           # 2. contrast enhanced
+        _gamma(bgr, 1.5),      # 3. brightened
+        _gamma(bgr, 0.7),      # 4. darkened  (overexposed images)
+        _sharpen(bgr),         # 5. sharpened
+        _clahe(_sharpen(bgr)), # 6. sharpen then enhance
+    ]
+
+
+# ============================================================
+#  SKIN-GUIDED PRE-CROP
+# ============================================================
+
+def _skin_bbox(bgr, padding=SKIN_CROP_PADDING):
+    """
+    Detect the largest skin-coloured region and return a padded
+    bounding box (x0, y0, x1, y1) in original image coordinates.
+    Returns None if no skin region is found.
+
+    Works across a wide range of skin tones using a union of
+    HSV ranges and a YCrCb range.
+    """
+    h, w = bgr.shape[:2]
+
+    # HSV skin ranges (light to dark tones)
+    hsv  = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    m1   = cv2.inRange(hsv, np.array([0,  15,  40], np.uint8),
+                            np.array([25, 255, 255], np.uint8))
+    m2   = cv2.inRange(hsv, np.array([155, 15,  40], np.uint8),
+                            np.array([180, 255, 255], np.uint8))
+
+    # YCrCb skin range
+    ycr  = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+    m3   = cv2.inRange(ycr, np.array([0,  133, 77], np.uint8),
+                            np.array([255, 173, 127], np.uint8))
+
+    mask = cv2.bitwise_or(cv2.bitwise_or(m1, m2), m3)
+
+    # Clean up noise
+    k    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k, iterations=1)
+
+    # Find the largest connected skin blob
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if n <= 1:
+        return None
+
+    # Ignore background (label 0), pick largest foreground blob
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    best  = int(np.argmax(areas)) + 1
+
+    # Must cover at least 1% of the image — avoids tiny false positives
+    if float(areas[best - 1]) < 0.01 * h * w:
+        return None
+
+    bx = int(stats[best, cv2.CC_STAT_LEFT])
+    by = int(stats[best, cv2.CC_STAT_TOP])
+    bw = int(stats[best, cv2.CC_STAT_WIDTH])
+    bh = int(stats[best, cv2.CC_STAT_HEIGHT])
+
+    # Add padding
+    pad_x = int(bw * padding)
+    pad_y = int(bh * padding)
+    x0 = max(0,     bx - pad_x)
+    y0 = max(0,     by - pad_y)
+    x1 = min(w - 1, bx + bw + pad_x)
+    y1 = min(h - 1, by + bh + pad_y)
+
+    return x0, y0, x1, y1
+
+
+# ============================================================
+#  CORE DETECTION
+# ============================================================
+
+def _run_detector(image_bgr):
+    """Run MediaPipe on a single BGR image. Returns (pts, hand) or (None, None)."""
     mp_image = mp.Image(
         image_format=mp.ImageFormat.SRGB,
-        data=cv2.cvtColor(det_img, cv2.COLOR_BGR2RGB))
-    result   = detector.detect(mp_image)
-
+        data=cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
+    result = detector.detect(mp_image)
     if not result.hand_landmarks:
         return None, None
-
-    # Pick the hand with the highest detection confidence
     scores     = [result.handedness[i][0].score
                   for i in range(len(result.hand_landmarks))]
     best       = int(np.argmax(scores))
     lm_list    = result.hand_landmarks[best]
-    handedness = result.handedness[best][0].category_name  # 'Left' | 'Right'
-
-    # Map back to ORIGINAL resolution
-    pts = [(int(p.x * w), int(p.y * h)) for p in lm_list]
+    handedness = result.handedness[best][0].category_name
+    dh, dw     = image_bgr.shape[:2]
+    pts        = [(int(p.x * dw), int(p.y * dh)) for p in lm_list]
     return pts, handedness
+
+
+def _detect_on_image(image_bgr):
+    """
+    Try all preprocessing variants on a given image.
+    Returns (pts, hand) in image_bgr coordinate space, or (None, None).
+    """
+    for variant in _get_variants(image_bgr):
+        pts, hand = _run_detector(variant)
+        if pts is not None:
+            return pts, hand
+    return None, None
+
+
+def _detect_at_scale(image_bgr, max_dim, offset_xy=(0, 0)):
+    """
+    Downscale to max_dim, run all variants, remap to original coords.
+    offset_xy: (ox, oy) shift to add when remapping (for crops).
+    """
+    h, w  = image_bgr.shape[:2]
+    scale = min(1.0, max_dim / max(h, w))
+    if scale < 1.0:
+        dw, dh   = int(w * scale), int(h * scale)
+        small    = cv2.resize(image_bgr, (dw, dh), interpolation=cv2.INTER_AREA)
+    else:
+        small    = image_bgr
+        scale    = 1.0
+
+    pts, hand = _detect_on_image(small)
+    if pts is None:
+        return None, None
+
+    # Remap to original (or full-image) coordinates
+    ox, oy = offset_xy
+    pts = [(int(x / scale) + ox, int(y / scale) + oy) for x, y in pts]
+    return pts, hand
 
 
 def _run_mp_hands_robust(image_bgr):
     """
-    Two-pass cascade:
-      Pass 1 — original image at each scale in DETECTION_SCALES
-      Pass 2 — CLAHE-enhanced image at each scale
-    Returns (pts, handedness) or (None, None).
+    Full detection cascade:
+
+    Stage 1 — skin-guided pre-crop (best for high-res images with small hands)
+      a) detect skin bbox
+      b) crop + run all preprocessing variants at multiple scales
+
+    Stage 2 — full-image multi-scale fallback
+      Try each scale in DETECTION_SCALES with all preprocessing variants.
+
+    Returns (pts, handedness) in ORIGINAL image coordinates, or (None, None).
     """
-    # Pass 1 — original
+    h, w = image_bgr.shape[:2]
+
+    # ── Stage 1: skin-guided crop ─────────────────────────────
+    bbox = _skin_bbox(image_bgr)
+    if bbox is not None:
+        x0, y0, x1, y1 = bbox
+        crop = image_bgr[y0:y1, x0:x1]
+        if crop.size > 0:
+            for max_dim in [640, 1024, 512, 384]:
+                pts, hand = _detect_at_scale(crop, max_dim,
+                                             offset_xy=(x0, y0))
+                if pts is not None:
+                    return pts, hand
+
+    # ── Stage 2: full-image multi-scale ───────────────────────
     for max_dim in DETECTION_SCALES:
         pts, hand = _detect_at_scale(image_bgr, max_dim)
-        if pts is not None:
-            return pts, hand
-
-    # Pass 2 — contrast enhanced
-    enhanced = _enhance_for_detection(image_bgr)
-    for max_dim in DETECTION_SCALES:
-        pts, hand = _detect_at_scale(enhanced, max_dim)
         if pts is not None:
             return pts, hand
 
@@ -137,47 +267,32 @@ def _run_mp_hands_robust(image_bgr):
 
 
 # ============================================================
-#  LANDMARK VALIDATION
+#  LANDMARK VALIDATION  (minimal — avoids rejecting real palms)
 # ============================================================
 
 def _validate_landmarks(pts, img_shape):
     """
-    Geometric sanity checks — returns False for likely false positives.
+    Only rejects clearly impossible detections.
+    Avoids orientation/pose assumptions that break on MPDv2.
     """
-    h, w  = img_shape[:2]
-    arr   = np.array(pts, dtype=float)
+    h, w = img_shape[:2]
+    arr  = np.array(pts, dtype=float)
 
-    # 1. All 21 landmarks must be inside the image
+    # All 21 landmarks inside the image
     if (np.any(arr[:, 0] < 0) or np.any(arr[:, 0] >= w) or
             np.any(arr[:, 1] < 0) or np.any(arr[:, 1] >= h)):
         return False
 
-    # 2. Palm span (wrist→pinky base) must exceed MIN_PALM_WIDTH_RATIO
+    # Palm span must be at least MIN_PALM_RATIO of image size
     palm_span = float(np.linalg.norm(arr[0] - arr[17]))
-    if palm_span < MIN_PALM_WIDTH_RATIO * max(h, w):
-        return False
-
-    # 3. Wrist (0) should be below middle fingertip (12) — y increases downward
-    #    Allow ±20% tolerance for tilted hands
-    if float(arr[0, 1]) < float(arr[12, 1]) - 0.20 * h:
-        return False
-
-    # 4. Fingertips must be spatially spread (not all collapsed to one point)
-    tips   = arr[[4, 8, 12, 16, 20]]
-    spread = float(np.std(tips[:, 0]))
-    if spread < 0.01 * w:
-        return False
-
-    # 5. Tip bounding box must span a reasonable range
-    tip_range = float(np.ptp(tips, axis=0).max())
-    if tip_range < 0.02 * max(h, w):
+    if palm_span < MIN_PALM_RATIO * max(h, w):
         return False
 
     return True
 
 
 # ============================================================
-#  ROI GEOMETRY HELPERS
+#  ROI GEOMETRY
 # ============================================================
 
 def _midpoints(pairs):
@@ -186,48 +301,38 @@ def _midpoints(pairs):
 
 
 def _calculate_point_c(m1, m2, thumb):
-    """
-    Palm centre C = 1.8× knuckle-line length, offset toward the wrist.
-    """
     m1, m2, thumb = map(np.asarray, (m1, m2, thumb))
     O    = (m1 + m2) / 2.0
     AB   = m2 - m1
     L    = float(np.linalg.norm(AB))
     if L == 0:
-        raise ValueError("Midpoints coincide — degenerate hand pose.")
+        raise ValueError("Midpoints coincide.")
     ABu  = AB / L
     perp = np.array([-ABu[1], ABu[0]])
-    cross_z = float(ABu[0]) * float((thumb - O)[1]) \
-            - float(ABu[1]) * float((thumb - O)[0])
-    if cross_z < 0:
+    cz   = float(ABu[0]) * float((thumb - O)[1]) \
+         - float(ABu[1]) * float((thumb - O)[0])
+    if cz < 0:
         perp = -perp
     C = O + 1.8 * L * perp
     return int(C[0]), int(C[1])
 
 
 def _extract_roi(img, mid1, mid2, C, thumb, hand_type):
-    """
-    Rotate image so the knuckle line is horizontal, then square-crop at C.
-    """
     vec   = np.array(mid2) - np.array(mid1)
     angle = float(np.degrees(np.arctan2(float(vec[1]), float(vec[0]))))
     C     = (int(C[0]), int(C[1]))
-
     if hand_type.lower() == "right":
         if np.dot(vec, np.array(thumb) - np.array(C)) > 0:
             angle += 180.0
     else:
         if np.dot(vec, np.array(thumb) - np.array(C)) < 0:
             angle += 180.0
-
-    side = float(np.linalg.norm(vec)) * 2.5
-    side = max(side, 10.0)
-
-    rect = (C, (side, side), angle)
-    M    = cv2.getRotationMatrix2D(C, angle, 1.0)
-    rot  = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]))
-    roi  = cv2.getRectSubPix(rot, (int(side), int(side)), C)
-    box  = cv2.boxPoints(rect).astype(np.int32)
+    side  = max(float(np.linalg.norm(vec)) * 2.5, 10.0)
+    rect  = (C, (side, side), angle)
+    M     = cv2.getRotationMatrix2D(C, angle, 1.0)
+    rot   = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]))
+    roi   = cv2.getRectSubPix(rot, (int(side), int(side)), C)
+    box   = cv2.boxPoints(rect).astype(np.int32)
     return roi, box
 
 
@@ -237,24 +342,20 @@ def _extract_roi(img, mid1, mid2, C, thumb, hand_type):
 
 def extract_palm_roi(image_bgr):
     """
-    Full pipeline: detect → validate → crop → rotate 180°.
+    Full pipeline: robust detect → validate → crop → rotate 180°.
     Returns (roi_bgr, annotated_bgr, hand_type) or (None, None, None).
     """
     lms, hand_type = _run_mp_hands_robust(image_bgr)
-
     if lms is None:
         return None, None, None
-
     if not _validate_landmarks(lms, image_bgr.shape):
         return None, None, None
 
     idx = lambda i: lms[i]
 
     mids4 = _midpoints([
-        (idx(17), idx(18)),
-        (idx(14), idx(13)),
-        (idx(10), idx(9)),
-        (idx(6),  idx(5)),
+        (idx(17), idx(18)), (idx(14), idx(13)),
+        (idx(10), idx(9)),  (idx(6),  idx(5)),
     ])
     adj = _midpoints([
         (mids4[0], mids4[1]),
@@ -265,7 +366,6 @@ def extract_palm_roi(image_bgr):
                 (adj[0][1] + adj[1][1]) / 2.0)
     roi_mid2 = ((adj[1][0] + adj[2][0]) / 2.0,
                 (adj[1][1] + adj[2][1]) / 2.0)
-
     thumb = idx(2)
 
     try:
@@ -275,13 +375,11 @@ def extract_palm_roi(image_bgr):
 
     roi, box = _extract_roi(image_bgr, roi_mid1, roi_mid2,
                             C, thumb, hand_type)
-
     if roi is None or roi.size == 0:
         return None, None, None
 
     roi = cv2.rotate(roi, cv2.ROTATE_180)
 
-    # Annotated overlay for debugging
     ann = image_bgr.copy()
     for x, y in lms:
         cv2.circle(ann, (int(x), int(y)), 3, (0, 255, 0), -1)
@@ -292,38 +390,29 @@ def extract_palm_roi(image_bgr):
 
 
 # ============================================================
-#  FILENAME PARSER — supports MPDv2, Scanner, and generic formats
+#  FILENAME PARSER
 # ============================================================
 
 def parse_filename(fname):
     """
-    Supports:
-      MPDv2   : 001_1_h_l_01.jpg   → 5 parts, parts[2]=='h'
-      Scanner : 065_S2_Left_magenta.jpg → 4 parts
-      Generic : anything else → accepted with minimal metadata
-
-    Returns a metadata dict (never returns None — no file is skipped
-    due to filename format).
+    MPDv2   : 001_1_h_l_01.jpg   (5 parts, parts[2]=='h')
+    Scanner : 065_S2_Left_magenta.jpg (4 parts)
+    Generic : anything else — always accepted
     """
     stem  = os.path.splitext(fname)[0]
     parts = stem.split("_")
 
-    # ── MPDv2 format: 001_1_h_l_01 ───────────────────────────
     if len(parts) == 5 and parts[2].lower() == "h":
         side = "Left" if parts[3].lower() == "l" else "Right"
         return dict(id=parts[0], session=parts[1],
                     hand=side, iter=parts[4], fmt="mpd")
 
-    # ── Scanner format: 065_S2_Left_magenta ──────────────────
     if len(parts) == 4:
-        subj_id, session, hand, extra = parts
-        if (subj_id.isdigit()
-                and session.startswith("S")
-                and hand in ("Left", "Right")):
-            return dict(id=subj_id, session=session,
-                        hand=hand, color=extra, fmt="scanner")
+        sid, ses, hand, extra = parts
+        if sid.isdigit() and ses.startswith("S") and hand in ("Left","Right"):
+            return dict(id=sid, session=ses, hand=hand,
+                        color=extra, fmt="scanner")
 
-    # ── Generic fallback — accept anything ───────────────────
     return dict(id=parts[0] if parts else stem,
                 session="", hand="unknown", fmt="generic")
 
@@ -335,26 +424,23 @@ def parse_filename(fname):
 def main():
     os.makedirs(DST_ROOT, exist_ok=True)
 
-    # ── Diagnostic scan ──────────────────────────────────────
+    # ── Diagnostic scan ───────────────────────────────────────
     print(f"\nScanning {SRC_ROOT} ...")
-    raw_count   = 0
-    sample_paths = []
+    raw_count, samples = 0, []
     for root, _, files in os.walk(SRC_ROOT):
         for f in sorted(files):
-            if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
+            if f.lower().endswith((".jpg",".jpeg",".png",".bmp")):
                 full = os.path.join(root, f)
-                if raw_count < 5:
-                    sample_paths.append(full)
+                if raw_count < 5: samples.append(full)
                 raw_count += 1
 
-    print(f"  Raw image files found : {raw_count}")
+    print(f"  Raw image files : {raw_count}")
     if raw_count == 0:
         print(f"\n  ERROR: No images found in {SRC_ROOT}")
-        print(f"  Check that SRC_ROOT is correct and the folder is not empty.")
+        print(f"  Check that SRC_ROOT is set correctly.")
         return
-
-    print(f"  First few paths found :")
-    for p in sample_paths:
+    print(f"  First few paths :")
+    for p in samples:
         print(f"    {p}")
     print()
 
@@ -362,26 +448,23 @@ def main():
     all_images = []
     for root, _, files in os.walk(SRC_ROOT):
         for f in sorted(files):
-            if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
-                meta = parse_filename(f)
-                all_images.append((os.path.join(root, f), meta))
+            if f.lower().endswith((".jpg",".jpeg",".png",".bmp")):
+                all_images.append((os.path.join(root, f), parse_filename(f)))
 
-    print(f"Found {len(all_images)} images after parsing.")
+    print(f"Found {len(all_images)} images.")
     print(f"Detection scales  : {DETECTION_SCALES}")
     print(f"Output dir        : {DST_ROOT}\n")
 
-    num_success    = 0
-    num_failed     = 0
+    num_success, num_failed = 0, 0
     failed_samples = []
 
     pbar = tqdm(all_images, desc="Extracting palm ROIs")
-
     for src_path, meta in pbar:
         rel_path = os.path.relpath(src_path, SRC_ROOT)
         dst_path = os.path.join(DST_ROOT, rel_path)
         os.makedirs(os.path.dirname(dst_path), exist_ok=True)
 
-        # Load image
+        # Load
         try:
             img_rgb = np.array(Image.open(src_path).convert("RGB"))
             img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
@@ -392,22 +475,22 @@ def main():
             pbar.set_postfix(ok=num_success, fail=num_failed)
             continue
 
-        # Extract ROI
-        roi_bgr, ann_bgr, hand_type = extract_palm_roi(img_bgr)
+        # Extract
+        roi_bgr, _, hand_type = extract_palm_roi(img_bgr)
 
         if roi_bgr is None or roi_bgr.size == 0:
             failed_samples.append({"path": src_path,
                                    "reason": "no_detection"})
             num_failed += 1
             if SAVE_FAILED:
-                fallback = cv2.resize(img_bgr, (ROI_SIZE, ROI_SIZE))
-                cv2.imwrite(dst_path, fallback)
+                cv2.imwrite(dst_path,
+                            cv2.resize(img_bgr, (ROI_SIZE, ROI_SIZE)))
         else:
             roi_out = cv2.resize(roi_bgr, (ROI_SIZE, ROI_SIZE),
                                  interpolation=cv2.INTER_LINEAR)
             # Save as RGB
-            roi_rgb_out = cv2.cvtColor(roi_out, cv2.COLOR_BGR2RGB)
-            cv2.imwrite(dst_path, roi_rgb_out)
+            cv2.imwrite(dst_path,
+                        cv2.cvtColor(roi_out, cv2.COLOR_BGR2RGB))
             num_success += 1
 
         pbar.set_postfix(ok=num_success, fail=num_failed)
@@ -424,7 +507,7 @@ def main():
           f"({100*num_success/max(total,1):.1f}%)")
     print(f"  Failed   : {num_failed:>6} / {total}  "
           f"({100*num_failed/max(total,1):.1f}%)")
-    print(f"  Failures saved to : {FAILED_JSON_PATH}")
+    print(f"  Failures : {FAILED_JSON_PATH}")
     print(f"{'='*52}\n")
 
 
