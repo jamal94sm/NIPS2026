@@ -212,10 +212,9 @@ class CO3Net(nn.Module):
 
     def forward(self, x, y=None):
         h, e = self._backbone(x)
-        fe   = F.normalize(torch.cat([h, e], dim=1), dim=-1)  # 6144-d contrastive
-        emb  = F.normalize(e, dim=-1)                          # 2048-d matching embedding
+        fe   = F.normalize(torch.cat([h, e], dim=1), dim=-1)  # 6144-d
         out  = self.arc(self.drop(e), y)
-        return out, fe, emb                                     # ← added emb
+        return out, fe
 
     @torch.no_grad()
     def get_embedding(self, x):
