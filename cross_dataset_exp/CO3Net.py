@@ -1097,20 +1097,20 @@ def main():
         train_label  = "CASIA-MS"
         test_label   = "Smartphone"
         train_parser = lambda: parse_casia_ms(
-                        data_root,
-                        n_subjects      = CONFIG["n_casia_subjects"],
-                        n_total_samples = CONFIG["n_casia_samples"],
-                        seed            = seed)
+                            data_root,
+                            n_subjects      = CONFIG["n_casia_subjects"],
+                            n_total_samples = CONFIG["n_casia_samples"],
+                            seed            = seed)
         test_parser  = lambda: parse_smartphone_data(test_data_root)
     else:
         train_label  = "Smartphone"
         test_label   = "CASIA-MS"
-        train_parser = lambda: parse_smartphone_data(data_root)
-        test_parser  = lambda: parse_casia_ms(
-                        test_data_root,
-                        n_subjects      = CONFIG["n_casia_subjects"],
-                        n_total_samples = CONFIG["n_casia_samples"],
-                        seed            = seed)
+        train_parser = lambda: parse_smartphone_data(test_data_root)  # ← test_data_root
+        test_parser  = lambda: parse_casia_ms(                        # ← data_root
+                            data_root,
+                            n_subjects      = CONFIG["n_casia_subjects"],
+                            n_total_samples = CONFIG["n_casia_samples"],
+                            seed            = seed)
 
     print(f"\n{'='*60}")
     print(f"  CO3Net Palmprint Recognition")
