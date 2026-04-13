@@ -29,8 +29,8 @@ Architecture: CO3Net (unchanged from official repo)
 #  CONFIG  — edit this block only
 # ==============================================================
 CONFIG = {
-    "train_data"           : "Smartphone",   # "Smartphone" | "CASIA-MS"
-    "test_data"            : "Smartphone",     # "Smartphone" | "CASIA-MS"
+    "train_data"           : "CASIA-MS",   # "Smartphone" | "CASIA-MS"
+    "test_data"            : "CASIA-MS",     # "Smartphone" | "CASIA-MS"
     "data_root"            : "/home/pai-ng/Jamal/CASIA-MS-ROI",
     "test_data_root"       : "/home/pai-ng/Jamal/smartphone_data",
     "train_subject_ratio"  : 0.80,   # 70% of subjects → train
