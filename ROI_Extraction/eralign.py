@@ -1,1024 +1,765 @@
-"""
-ROI Extraction — CASIA-MS / MPDv2 / Smartphone palmprint datasets
-==================================================================
-NumPy 2.0 compatible — all np.cross / implicit scalar conversions fixed.
-All user-facing settings are in the CONFIG block at the top.
-"""
-
-import warnings
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-
-# ══════════════════════════════════════════════════════════════
-#  USER CONFIG  — edit only this block
-# ══════════════════════════════════════════════════════════════
-
-# ── Paths ──────────────────────────────────────────────────────
-DIR_SOURCE = "/home/pai-ng/Jamal/MPDv2"
-DIR_OUTPUT = "/home/pai-ng/Jamal/MPDv2_roi"
-
-# ── Dataset preset ─────────────────────────────────────────────
-#    "Smartphone"  |  "CASIA-MS"  |  "MPDv2"  |  "Generic"
-DATASET_PRESET = "Smartphone"
-
-# ── Debug options ──────────────────────────────────────────────
-DEBUG             = True    # per-image console output
-SAVE_OVERLAY_PASS = False   # save overlay for PASSED images too
-                            # (overlays always saved for rejected)
-
-# ── Validation & rejected-image saving ─────────────────────────
-VALIDATE_ROI  = True
-SAVE_REJECTED = True
-
-# ── Inspect a single tricky image (set to None to skip) ────────
-DEBUG_SINGLE_IMAGE = None
-# DEBUG_SINGLE_IMAGE = "/home/pai-ng/Jamal/MPDv2/subject01/img001.jpg"
-
-# ── Quality thresholds ─────────────────────────────────────────
-QUALITY_CONFIG = {
-    "min_size"         : 80,
-    "max_size"         : 3000,
-    "min_aspect"       : 0.5,
-    "max_aspect"       : 2.0,
-    "min_texture_std"  : 8.0,
-    "max_texture_std"  : 90.0,
-    "min_skin_ratio"   : 0.20,
-    "min_sharpness"    : 15.0,
-    "min_gabor_energy" : 3.0,
-    "max_local_var_std": 55.0,
-}
-
-# ── Dataset processing configs ─────────────────────────────────
-DATASET_CONFIGS = {
-
-    "Smartphone": {
-        "THRESHOLD_SEG"           : 0,
-        "BI_THRESHOLD_SEG"        : False,
-        "THRESHOLD_EDGE"          : 4,
-        "BLUR"                    : True,
-        "BLUR_SIGMA"              : 1.5,
-        "KERNEL_SIZE"             : None,
-        "BLUR_ROTATE"             : True,
-        "BLUR_SIGMA_ROTATE"       : 1.5,
-        "BI_THRESHOLD_SEG_ROTATE" : False,
-        "THRESHOLD_SEG_ROTATE"    : 0,
-        "ratio_rotate"            : 4.0,   # high-res images: downsample more
-        "ratio"                   : 2.0,
-    },
-
-    "CASIA-MS": {
-        "THRESHOLD_SEG"           : 90,
-        "BI_THRESHOLD_SEG"        : True,
-        "THRESHOLD_EDGE"          : 10,
-        "BLUR"                    : False,
-        "BLUR_SIGMA"              : 0.05,
-        "KERNEL_SIZE"             : (45, 45),
-        "BLUR_ROTATE"             : True,
-        "BLUR_SIGMA_ROTATE"       : 0.05,
-        "BI_THRESHOLD_SEG_ROTATE" : False,
-        "THRESHOLD_SEG_ROTATE"    : 90,
-        "ratio_rotate"            : 1.0,
-        "ratio"                   : 1.0,
-    },
-
-    "MPDv2": {
-        "THRESHOLD_SEG"           : 0,
-        "BI_THRESHOLD_SEG"        : False,
-        "THRESHOLD_EDGE"          : 5,
-        "BLUR"                    : True,
-        "BLUR_SIGMA"              : 1.0,
-        "KERNEL_SIZE"             : None,
-        "BLUR_ROTATE"             : True,
-        "BLUR_SIGMA_ROTATE"       : 1.0,
-        "BI_THRESHOLD_SEG_ROTATE" : False,
-        "THRESHOLD_SEG_ROTATE"    : 0,
-        "ratio_rotate"            : 2.0,
-        "ratio"                   : 1.0,
-    },
-
-    "Generic": {
-        "THRESHOLD_SEG"           : 0,
-        "BI_THRESHOLD_SEG"        : False,
-        "THRESHOLD_EDGE"          : 7,
-        "BLUR"                    : True,
-        "BLUR_SIGMA"              : 1.5,
-        "KERNEL_SIZE"             : None,
-        "BLUR_ROTATE"             : True,
-        "BLUR_SIGMA_ROTATE"       : 1.0,
-        "BI_THRESHOLD_SEG_ROTATE" : False,
-        "THRESHOLD_SEG_ROTATE"    : 0,
-        "ratio_rotate"            : 2.0,
-        "ratio"                   : 1.0,
-    },
-}
-
-FALLBACK_CONFIGS = [
-    {"THRESHOLD_SEG": 0,   "BI_THRESHOLD_SEG": False, "THRESHOLD_EDGE": 4,
-     "BLUR": True, "BLUR_SIGMA": 2.5,  "KERNEL_SIZE": None},
-    {"THRESHOLD_SEG": 30,  "BI_THRESHOLD_SEG": True,  "THRESHOLD_EDGE": 5,
-     "BLUR": True, "BLUR_SIGMA": 1.5,  "KERNEL_SIZE": None},
-    {"THRESHOLD_SEG": 60,  "BI_THRESHOLD_SEG": True,  "THRESHOLD_EDGE": 3,
-     "BLUR": True, "BLUR_SIGMA": 3.0,  "KERNEL_SIZE": None},
-    {"THRESHOLD_SEG": 120, "BI_THRESHOLD_SEG": True,  "THRESHOLD_EDGE": 3,
-     "BLUR": True, "BLUR_SIGMA": 0.5,  "KERNEL_SIZE": None},
-]
-
-# ══════════════════════════════════════════════════════════════
-#  END OF CONFIG
-# ══════════════════════════════════════════════════════════════
-
 import os
 import cv2
 import numpy as np
 from skimage.morphology import skeletonize
 import networkx as nx
+from shapely.geometry import Polygon
 
 
-# ──────────────────────────────────────────────────────────────
-#  NumPy 2.0 safe helpers
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# GaborFilter.py (original, unchanged)
+# ─────────────────────────────────────────────
 
-def _pt(arr):
-    """Convert any array-like to a (int, int) tuple safe for OpenCV."""
-    a = np.asarray(arr).ravel()
-    return (int(a[0]), int(a[1]))
+def GaborFilter_cc(len_filter, sigma=4.6, delta=2.6, num_direction=6):
+    assert num_direction % 2 == 0, 'num_direction should be an even number!'
+    half_len = int(len_filter / 2)
 
+    Filter = np.zeros((num_direction, len_filter, len_filter))
+    for a in range(num_direction):
+        theta = np.pi / 2 - np.pi * a / num_direction
+        kappa = np.sqrt(2 * np.log(2)) * (delta + 1) / (delta - 1)
+        w = kappa / sigma
+        fFactor1 = -w / (np.sqrt(2 * np.pi) * kappa)
+        fFactor2 = -(w * w) / (8 * kappa * kappa)
+        sin_theta = np.sin(theta)
+        cos_theta = np.cos(theta)
 
-def _cross2d(vecs, v):
-    """
-    Scalar cross product for each row of vecs against vector v.
-    cross(a, b) = a[0]*b[1] - a[1]*b[0]
-    Replaces np.cross which is deprecated for 2-D inputs in NumPy 2.0.
-    vecs : (N, 2)   v : (2,)   returns : (N,)
-    """
-    vecs = np.asarray(vecs, dtype=float)
-    v    = np.asarray(v,    dtype=float)
-    return vecs[:, 0] * v[1] - vecs[:, 1] * v[0]
+        for c in range(len_filter):
+            x = c - half_len
+            for r in range(len_filter):
+                y = r - half_len
+                x1 = x * cos_theta + y * sin_theta
+                y1 = y * cos_theta - x * sin_theta
+                f_comp = fFactor1 * np.exp(fFactor2 * (4 * x1 * x1 + y1 * y1))
+                Filter[a, r, c] = f_comp * np.cos(w * x1)
 
+        Filter[a, :, :] -= Filter[a, :, :].mean()
 
-def _dot2d(vecs, v):
-    """Dot product of each row of vecs against vector v. (N,2)@(2,)->(N,)"""
-    return np.asarray(vecs, dtype=float) @ np.asarray(v, dtype=float)
+    return Filter
 
-
-# ──────────────────────────────────────────────────────────────
-#  Gabor filter
-# ──────────────────────────────────────────────────────────────
 
 def GaborFilter(ksize, num_direction, sigma, lambd, gamma):
-    assert num_direction % 2 == 0
-    half   = ksize // 2
-    sigma2 = 2.0 * sigma ** 2
-    F      = np.zeros((num_direction, ksize, ksize), dtype=np.float32)
-    x, y   = np.meshgrid(range(-half, half + 1), range(-half, half + 1))
+    assert num_direction % 2 == 0, 'num_direction should be an even number!'
+    half_size = int(ksize/2)
+    sigma2 = 2*sigma**2
+
+    Filter = np.zeros((num_direction, ksize, ksize))
+    l_min = -half_size
+    l_max = half_size
+    x, y = np.meshgrid(range(l_min, l_max + 1), range(l_min, l_max + 1))
     for a in range(num_direction):
-        th   = np.pi * a / num_direction
-        xt   =  x * np.cos(th) + y * np.sin(th)
-        yt   = -x * np.sin(th) + y * np.cos(th)
-        F[a] = (np.exp(-(xt**2 + (gamma*yt)**2) / sigma2)
-                * np.cos(2 * np.pi * xt / lambd)).astype(np.float32)
-        F[a] -= F[a].mean()
-    return F
+        theta = np.pi * a / num_direction
+        sin_theta = np.sin(theta)
+        cos_theta = np.cos(theta)
+        x_theta = x * cos_theta + y * sin_theta
+        y_theta = y * cos_theta - x * sin_theta
+        term1 = np.exp(-(x_theta ** 2 + (gamma * y_theta) ** 2) / sigma2)
+        term2 = np.cos(2 * np.pi * x_theta / lambd)
+        Filter[a] = term1 * term2
+        Filter[a] -= Filter[a].mean()
+
+    return Filter
 
 
-# ──────────────────────────────────────────────────────────────
-#  Kernel size helper
-# ──────────────────────────────────────────────────────────────
+def GaborArray(sigma=4.85, wavelength=14.1, ratio=1.92):
+    halfLength = 17
 
-def _resolve_kernel(cfg, shape):
-    if cfg.get("KERNEL_SIZE") is not None:
-        return cfg["KERNEL_SIZE"]
-    k = max(15, min(int(shape[0]), int(shape[1])) // 10)
-    k = k if k % 2 == 1 else k + 1
-    return (k, k)
+    xmax = halfLength
+    xmin = -halfLength
+    ymax = halfLength
+    ymin = -halfLength
+    [x, y] = np.meshgrid(range(xmin, xmax+1), range(ymin, ymax+1))
+
+    mask = np.ones((35, 35))
+    for row in range(1,36):
+        for col in range(1,36):
+            if (row - 18)**2 + (col - 18)**2 > 289:
+                mask[row-1, col-1] = 0
+
+    gb_r = np.zeros((6, 35, 35))
+    for oriIndex in range(1, 7):
+        theta = np.pi / 6 * (oriIndex - 1)
+
+        x_theta = x * np.cos(theta) + y * np.sin(theta)
+        y_theta = -x * np.sin(theta) + y * np.cos(theta)
+
+        gb = np.exp(-.5*(x_theta**2/sigma**2 + y_theta**2/(ratio*sigma)**2)) * np.cos(2*np.pi/wavelength*x_theta)
+
+        total = (gb * mask).sum()
+        meanInner = total / (mask).sum()
+
+        gb = gb - meanInner.mean()
+        gb = gb * mask
+        gb_r[oriIndex-1] = gb
+
+    return gb_r
 
 
-# ──────────────────────────────────────────────────────────────
-#  PalmBasic
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# PalmBasic.py (original, unchanged)
+# ─────────────────────────────────────────────
 
 class PalmBasic:
 
+    def __init__(self):
+        pass
+
     def gaussian_blur(self, img, kernel_size=(5, 5), sigma=2, blur=True):
-        return cv2.GaussianBlur(img, kernel_size, sigma) if blur else img
+        if blur:
+            return cv2.GaussianBlur(img, kernel_size, sigma)
+        else:
+            return img
 
     def threshold_image(self, img, threshold_val=20, bi_threshold=True):
         if bi_threshold:
-            _, t = cv2.threshold(img, threshold_val, 255, cv2.THRESH_BINARY)
+            _, thresholded = cv2.threshold(img, threshold_val, 255, cv2.THRESH_BINARY)
         else:
-            _, t = cv2.threshold(img, 0, 255,
-                                 cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        return t
+            _, thresholded = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return thresholded
 
-    def compute_edist(self, p1, p2):
-        return float(np.linalg.norm(
-            np.asarray(p1, dtype=float) - np.asarray(p2, dtype=float)))
+    def compute_edist(self, point1, point2):
+        return np.sqrt(np.sum((point1-point2)**2))
 
     def find_largest_component(self, img):
         _, labels, stats, _ = cv2.connectedComponentsWithStats(img)
-        if len(stats) <= 1:
+        if len(stats) <= 1:  # only background, no foreground components
             return np.zeros_like(img), None, np.zeros_like(img)
-        lbl  = int(np.argmax(stats[1:, -1])) + 1
-        comp = np.zeros_like(img)
-        comp[labels == lbl] = 255
-        cnt  = self.find_contour(comp)
-        cimg = cv2.drawContours(np.zeros_like(img, np.uint8), [cnt], -1, 255, 1)
-        return comp, cnt, cimg
+        largest_component_label = np.argmax(stats[1:, -1]) + 1
+        max_comp_img = np.zeros_like(img)
+        max_comp_img[labels == largest_component_label] = 255
+        max_comp_contour_coord = self.find_contour(max_comp_img)
+        max_comp_contour_img = cv2.drawContours(np.zeros_like(img, dtype=np.uint8), [max_comp_contour_coord], -1, (255), thickness=1)
+        return max_comp_img, max_comp_contour_coord, max_comp_contour_img
 
     def find_contour(self, img):
-        cnts, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        return max(cnts, key=cv2.contourArea)
+        contours, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        cnt = max(contours, key=cv2.contourArea)
+        return cnt
 
     def fill_contour(self, img, contour, filled=False):
-        out = np.zeros_like(img, np.uint8)
-        cv2.drawContours(out, [contour], -1, 255, cv2.FILLED if filled else 1)
-        return out
+        img_contour = np.zeros_like(img, dtype=np.uint8)
+        thickness = cv2.FILLED if filled else 1
+        cv2.drawContours(img_contour, [contour], -1, (255), thickness=thickness)
+        return img_contour
 
-    def erode_binary_image(self, img, kernel_size=(7, 7),
-                           iterations=1, th_binary=180):
-        er  = cv2.erode(img, np.ones(kernel_size, np.uint8),
-                        iterations=iterations)
-        _, b = cv2.threshold(er, th_binary, 255, cv2.THRESH_BINARY)
-        return b
+    def erode_binary_image(self, img, kernel_size=(7, 7), iterations=1, th_binary=180):
+        kernel = np.ones(kernel_size, np.uint8)
+        eroded = cv2.erode(img, kernel, iterations=iterations)
+        _, binaried = cv2.threshold(eroded, th_binary, 255, cv2.THRESH_BINARY)
+        return binaried
 
     def resize_image(self, img, ratio):
-        ratio = int(ratio)
-        return cv2.resize(img, (img.shape[1] // ratio, img.shape[0] // ratio))
+        img_resized = cv2.resize(img, (img.shape[1] // ratio, img.shape[0] // ratio))
+        return img_resized
 
-    def hull_image(self, img, contour):
-        eps  = 0.01 * cv2.arcLength(contour, True)
-        apx  = cv2.approxPolyDP(contour, eps, True)
-        hull = cv2.convexHull(apx, clockwise=False, returnPoints=True)
-        hi   = cv2.drawContours(np.zeros_like(img, np.uint8),
-                                [hull], -1, 255, cv2.FILLED)
-        return hull, hi
+    def hull_image(self, img, img_contour):
+        epsilon = 0.01*cv2.arcLength(img_contour, True)
+        approx = cv2.approxPolyDP(img_contour, epsilon, True)
+        hull_coord = cv2.convexHull(approx, clockwise=False, returnPoints=True)
+        hull_img = cv2.drawContours(np.zeros_like(img, dtype=np.uint8), [hull_coord], -1, 255, thickness=cv2.FILLED)
+        return hull_coord, hull_img
 
     def get_skeleton(self, img):
-        return (skeletonize(img == 255) * 255).astype(np.uint8)
+        img = img == 255
+        skeleton = skeletonize(img)*255
+        return skeleton
+
+    def euclidean_distance(self, point1, point2):
+        point1 = np.array(point1)
+        point2 = np.array(point2)
+        difference = point1 - point2
+        squared_difference = np.square(difference)
+        sum_of_squared_difference = np.sum(squared_difference)
+        distance = np.sqrt(sum_of_squared_difference)
+        return distance
 
     def find_closest_path_graph(self, matrix):
-        cleaned = np.zeros_like(matrix)
-        G       = self._build_graph(matrix)
-        deg1    = [n for n in G.nodes() if G.degree[n] == 1]
-        if not deg1:
-            return [cleaned, []]
-        src  = min(deg1, key=lambda n: n[1])
-        best = []
-        for node in deg1:
-            if node == src:
-                continue
-            try:
-                p = nx.shortest_path(G, src, node)
-                if len(p) > len(best):
-                    best = p
-            except nx.NetworkXNoPath:
-                pass
-        for pt in best:
-            cleaned[pt[0], pt[1]] = 255
-        return [cleaned, best]
+        cleaned_matrix = np.zeros_like(matrix)
+        graph = self.build_undirected_graph(matrix)
+        nodes_with_degree_1 = [node for node in graph.nodes() if graph.degree[node] == 1]
 
-    def _build_graph(self, matrix):
-        nz = np.argwhere(matrix == 255)
-        if len(nz) == 0:
-            return nx.Graph()
-        r0, c0 = int(nz[:, 0].min()), int(nz[:, 1].min())
-        r1, c1 = int(nz[:, 0].max()), int(nz[:, 1].max())
-        G    = nx.Graph()
-        dirs = [(-1, 0), (-1, -1), (0, -1), (1, -1)]
-        for i in range(r0, r1 + 1):
-            for j in range(c0, c1 + 1):
+        leftmost_node = None
+        min_x = float('inf')
+        for node in nodes_with_degree_1:
+            x = node[1]
+            if x < min_x:
+                min_x = x
+                leftmost_node = node
+        source_node = leftmost_node
+
+        longest_shortest_path = []
+        for node in nodes_with_degree_1:
+            if node != source_node:
+                shortest_path = nx.shortest_path(graph, source=source_node, target=node)
+                if len(shortest_path) > len(longest_shortest_path):
+                    longest_shortest_path = shortest_path
+
+        for point in longest_shortest_path:
+            cleaned_matrix[point[0], point[1]] = 255
+
+        return [cleaned_matrix, longest_shortest_path]
+
+    def build_undirected_graph(self, matrix):
+        non_zero_elements = np.argwhere(matrix == 255)
+        min_row, min_col = np.min(non_zero_elements, axis=0)
+        max_row, max_col = np.max(non_zero_elements, axis=0)
+
+        graph = nx.Graph()
+        directions = [(-1, 0), (-1, -1), (0, -1), (1, -1)]
+
+        for i in range(min_row, max_row + 1):
+            for j in range(min_col, max_col + 1):
                 if matrix[i, j] == 255:
-                    G.add_node((i, j))
-                    for d in dirs:
-                        nb = (i + d[0], j + d[1])
-                        if (r0 <= nb[0] <= r1 and c0 <= nb[1] <= c1
-                                and matrix[nb[0], nb[1]] == 255):
-                            G.add_edge((i, j), nb)
-        return G
+                    current_node = (i, j)
+                    graph.add_node(current_node)
+                    for direction in directions:
+                        neighbor = (i + direction[0], j + direction[1])
+                        if (min_row <= neighbor[0] <= max_row) and (min_col <= neighbor[1] <= max_col) and matrix[neighbor[0], neighbor[1]] == 255:
+                            graph.add_edge(current_node, neighbor)
+
+        return graph
 
     def judge_valley(self, path):
-        if not path:
-            return False, 0
-        ri  = max(range(len(path)), key=lambda k: path[k][1])
-        n1, n2 = len(path[ri + 1:]), len(path[:ri + 1])
-        return min(n1, n2) > len(path) / 3, ri
+        rightmost_node = max(path, key=lambda node: node[1])
+        rightmost_index = path.index(rightmost_node)
+        nodes_between1 = path[rightmost_index + 1:]
+        nodes_between2 = path[:rightmost_index + 1]
+        nodes_between = min(len(nodes_between1), len(nodes_between2))
+        flag_valley = False
+        if nodes_between > (len(path)/3):
+            flag_valley = True
+        return flag_valley, rightmost_index
 
     def find_farthest_point(self, path, th):
-        """NumPy 2.0 safe — uses _cross2d/_dot2d instead of np.cross/np.dot."""
-        lp   = len(path)
-        path = np.array(path, dtype=float)[:, [1, 0]]  # swap to (x, y)
-        li, ri = int(lp / 5 * 2), lp - 1
-        ln, rn = path[li], path[ri]
+        len_path = len(path)
+        path = np.array(path)
+        path = path[:, [1, 0]]
 
-        def _flag(li, ri, ln, rn):
-            fv  = ln - rn                    # shape (2,)
-            est = path[li + 1:ri] - rn       # shape (N, 2)
-            if len(est) == 0:
-                return False
-            cp  = _cross2d(est, fv)          # (N,) — no np.cross
-            dp  = _dot2d(est, fv)            # (N,) — no np.dot ambiguity
-            ang = np.degrees(np.arctan2(cp, dp))
-            return float(np.abs(np.abs(np.mean(ang)) -
-                                np.mean(np.abs(ang)))) > 1.5
+        left_ind = int(len_path/5*2)
+        left_node = path[left_ind]
+        right_ind = len_path-1
+        right_node = path[right_ind]
+        fix_vect = left_node - right_node
 
-        flag = _flag(li, ri, ln, rn)
-        while flag and li < lp - 1 and ri > 0:
-            if li < lp // 3:
-                li += 2;  ln = path[li]
-            elif ri > int(lp / 5 * 4):
-                ri -= 2;  rn = path[ri]
+        estimated_nodes = path[left_ind+1:-1]
+        estimated_vects = estimated_nodes - right_node
+        angle_degrees = self.compute_clockwise_angle_out(estimated_vects, fix_vect)
+        flag_inter = np.abs(np.abs(np.mean(angle_degrees))-np.mean(np.abs(angle_degrees))) > 1.5
+
+        while flag_inter and left_ind < (len_path-1) and right_ind > 0:
+            if left_ind < int(len_path/3):
+                left_ind += 2
+                left_node = path[left_ind]
+            elif right_ind > int((len_path/5*4)):
+                right_ind -= 2
+                right_node = path[right_ind]
             else:
                 break
-            flag = _flag(li, ri, ln, rn)
 
-        pv = path[li:ri + 1]
-        if len(pv) < 3:
-            return pv
-        x1, y1 = float(pv[0, 0]), float(pv[0, 1])
-        x2, y2 = float(pv[-1, 0]), float(pv[-1, 1])
-        A, B   = y2 - y1, x1 - x2
-        C      = x2 * y1 - x1 * y2
-        inner  = pv[1:-1]
-        dist   = (np.abs(A * inner[:, 0] + B * inner[:, 1] + C) /
-                  (np.sqrt(A**2 + B**2) + 1e-9))
-        mx = int(np.argmax(dist))
-        if float(dist[mx]) > th:
-            pv = pv[:mx + 4]
-        return pv
+            fix_vect = left_node - right_node
+            estimated_nodes = path[left_ind+1:right_ind]
+            estimated_vects = estimated_nodes - right_node
+            angle_degrees = self.compute_clockwise_angle_out(estimated_vects, fix_vect)
+            flag_inter = np.abs(np.abs(np.mean(angle_degrees))-np.mean(np.abs(angle_degrees))) > 1.5
+
+        path_valid = path[left_ind:right_ind+1]
+        distances = self.compute_perpendicular_dist(path_valid)
+        max_idx = np.argmax(distances)
+        if distances[max_idx] > th:
+            path_valid = path_valid[:max_idx+4]
+
+        return path_valid
+
+    def compute_perpendicular_dist(self, path):
+        x1, y1 = path[0]
+        x2, y2 = path[-1]
+        path_valid = path[1:-1]
+        A = y2 - y1
+        B = x1 - x2
+        C = x2 * y1 - x1 * y2
+        distances = abs(A * path_valid[:, 0] + B * path_valid[:, 1] + C) / (np.sqrt(A**2 + B**2)+0.00000000001)
+        return distances
+
+    def compute_clockwise_angle_out(self, fix_vect, moved_vect):
+        cross_product = np.cross(moved_vect, fix_vect)
+        dot_product = np.dot(moved_vect, fix_vect.T)
+        angle_relative = np.arctan2(cross_product, dot_product)
+        angle_degrees = np.degrees(angle_relative)
+        return angle_degrees
 
     def find_closest_white_point(self, image, point):
-        nz = cv2.findNonZero(image)
-        if nz is None:
-            return _pt(point), float('inf')
-        # nz shape: (N, 1, 2) — explicit reshape for NumPy 2.0
-        nz2 = nz.reshape(-1, 2).astype(float)
-        pt  = np.asarray(point, dtype=float).ravel()[:2]
-        dist = np.linalg.norm(nz2 - pt, axis=1)
-        idx  = int(np.argmin(dist))
-        return (int(nz2[idx, 0]), int(nz2[idx, 1])), float(dist[idx])
+        non_zero_points = cv2.findNonZero(image)
+        distances = np.linalg.norm(non_zero_points - point, axis=2)
+        min_index = np.argmin(distances)
+        return tuple(non_zero_points[min_index][0]), distances[min_index][0]
 
 
-# ──────────────────────────────────────────────────────────────
-#  ROI geometry
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# run_roi.py (original, unchanged)
+# ─────────────────────────────────────────────
+
+# Setting for CUHK
+THRESHOLD_SEG = 90
+THRESHOLD_EDGE = 10
+BI_THRESHOLD_SEG = True
+BI_THRESHOLD_ROI_CHECK = True
+BLUR = False
+BLUR_SIGMA = 0.05
+KERNEL_SIZE = (45, 45)
+
+BLUR_ROTATE = True
+BLUR_SIGMA_ROTATE = 0.05
+BI_THRESHOLD_SEG_ROTATE = False
+THRESHOLD_SEG_ROTATE = 90
 
 pad = 0
 
-def extract_roi(p1, p2, img, color=(0, 255, 0), thickness=2):
-    p1  = np.asarray(p1, dtype=float)
-    p2  = np.asarray(p2, dtype=float)
-    d   = float(np.linalg.norm(p2 - p1))
-    dirv = (p2 - p1) / (d + 1e-9)
-    norm = np.array([dirv[1], -dirv[0]])
-    s    = int(d / 6 * 7)
-    he   = int(d / 12)
-    ds   = int(d / 6)
+def extract_roi(p1, p2, img, color, thickness):
+    d = np.linalg.norm(p2 - p1)
+    direction = (p2 - p1) / (d+0.000001)
+    normal = np.array([direction[1], -direction[0]])
 
-    C = (p1 + (ds + s) * norm - he * dirv).astype(np.int32)
-    D = (C + s * dirv).astype(np.int32)
-    E = (D - s * norm).astype(np.int32)
-    F = (C - s * norm).astype(np.int32)
+    s = int(d/6*7)
+    half_extend = int(d/12)
+    distance_to_square = int(d/6*1)
 
-    img_pad = cv2.copyMakeBorder(img, pad, pad, pad, pad,
-                                 cv2.BORDER_CONSTANT, value=0)
-    Cp, Dp, Ep, Fp = C + pad, D + pad, E + pad, F + pad
-    pts    = np.array([Cp, Dp, Ep, Fp], dtype=np.float32)
-    width  = float(max(np.linalg.norm(Ep - Dp), np.linalg.norm(Fp - Cp)))
-    height = float(max(np.linalg.norm(Dp - Cp), np.linalg.norm(Ep - Fp)))
-    dst    = np.array([[0, 0], [width - 1, 0],
-                       [width - 1, height - 1], [0, height - 1]],
-                      dtype=np.float32)
-    M      = cv2.getPerspectiveTransform(pts, dst)
-    warped = cv2.warpPerspective(img_pad, M, (int(width), int(height)))
-    cv2.polylines(img_pad, [np.array([Cp, Dp, Ep, Fp])],
-                  True, color, thickness)
-    return warped, [_pt(Cp), _pt(Dp), _pt(Ep), _pt(Fp)], img_pad
+    C = (p1 + (distance_to_square+s) * normal - half_extend * direction).astype(np.int32)
+    D = (C + s * direction).astype(np.int32)
+    E = (D - s * normal).astype(np.int32)
+    F = (C - s * normal).astype(np.int32)
 
+    img_padded = cv2.copyMakeBorder(img, top=pad, bottom=pad, left=pad, right=pad, borderType=cv2.BORDER_CONSTANT, value=[0, 0, 0])
 
-# ──────────────────────────────────────────────────────────────
-#  GetROI — config-driven, NumPy 2.0 safe
-# ──────────────────────────────────────────────────────────────
+    C += pad
+    D += pad
+    E += pad
+    F += pad
+
+    pts = np.array([C, D, E, F], dtype="float32")
+    width = max(np.linalg.norm(E-D), np.linalg.norm(F-C))
+    height = max(np.linalg.norm(D-C), np.linalg.norm(E-F))
+
+    dst = np.array([
+        [0, 0],
+        [width - 1, 0],
+        [width - 1, height - 1],
+        [0, height - 1]], dtype="float32")
+
+    M = cv2.getPerspectiveTransform(pts, dst)
+    warped = cv2.warpPerspective(img_padded, M, (int(width), int(height)))
+    cv2.polylines(img_padded, [np.array([C, D, E, F])], isClosed=True, color=color, thickness=thickness)
+
+    corner_points = [(C[0], C[1]), (D[0], D[1]), (E[0], E[1]), (F[0], F[1])]
+
+    return warped, corner_points, img_padded
+
 
 class GetROI(PalmBasic):
 
-    def __init__(self, img, config):
-        self.cfg          = config
-        self.ratio_rotate = float(config["ratio_rotate"])
-        self.ratio        = float(config["ratio"])
-        self.ori_img      = img
-        self.w, self.h    = img.shape
-        self.w_rotate     = max(1, int(self.w / self.ratio_rotate))
-        self.h_rotate     = max(1, int(self.h / self.ratio_rotate))
-        self._ksize       = _resolve_kernel(config, img.shape)
-
-    # ── internal helpers ──────────────────────────────────────
-
-    def _rotate(self, img, angle):
-        cx, cy = img.shape[1] // 2, img.shape[0] // 2
-        M = cv2.getRotationMatrix2D((cx, cy), float(angle), 1.0)
-        return cv2.warpAffine(img, M, (img.shape[1], img.shape[0]))
-
-    def rotate_keypoints(self, img, angle, kps):
-        cx, cy = img.shape[1] // 2, img.shape[0] // 2
-        M  = cv2.getRotationMatrix2D((cx, cy), float(angle), 1.0)
-        pt = np.hstack([kps.astype(float),
-                        np.ones((kps.shape[0], 1))])
-        return np.round(pt @ M.T).astype(np.int32)
-
-    def _detect_edges(self, img, thr=10):
-        lap   = cv2.Laplacian(img, cv2.CV_64F, ksize=7).clip(min=0)
-        edges = cv2.normalize(lap, None, 0, 255,
-                              cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-        _, e  = cv2.threshold(edges, int(thr), 255, cv2.THRESH_BINARY)
-        return cv2.morphologyEx(e, cv2.MORPH_CLOSE,
-                                np.ones((3, 3), np.uint8))
-
-    def _select_palm(self, edges_img):
-        _, lbl, stats = cv2.connectedComponentsWithStats(
-            edges_img, connectivity=8)[:3]
-        return lbl, np.argsort(stats[1:, cv2.CC_STAT_AREA])[::-1]
-
-    def _rough_orientation(self, labels, sidx, hull_img, gabors):
-        eimg = np.zeros((self.w_rotate, self.h_rotate), dtype=np.float32)
-        for idx in sidx[1:4]:
-            if np.sum(labels == idx + 1) > 20.0 / self.ratio:
-                eimg[labels == idx + 1] = 255
-        pts = np.argwhere(eimg > 0)
-        if len(pts) == 0:
-            return 0.0
-        cx   = float(np.mean(pts[:, 1]))
-        cy   = float(np.mean(pts[:, 0]))
-        fhull = cv2.convexHull(pts[:, [1, 0]].astype(np.int32))
-        fhf   = cv2.drawContours(np.zeros_like(eimg, np.uint8),
-                                  [fhull], -1, 255, cv2.FILLED)
-        rem   = np.argwhere((fhf.astype(bool) & hull_img.astype(bool))
-                            ^ hull_img.astype(bool))
-        if len(rem) == 0:
-            return 0.0
-        ctr    = np.mean(rem, axis=0)
-        vect   = np.array([cx - float(ctr[1]), cy - float(ctr[0])])
-        ang_r  = float(np.degrees(np.arctan2(vect[1], vect[0])))
-        mx, my = eimg.shape[1] // 2, eimg.shape[0] // 2
-        Mr     = cv2.getRotationMatrix2D((mx, my), ang_r, 1.0)
-        erot   = cv2.warpAffine(eimg, Mr, (eimg.shape[1], eimg.shape[0]))
-        res    = np.stack([cv2.filter2D(erot, -1,
-                                        gabors[j].astype(np.float32))
-                           for j in range(len(gabors))])
-        vi     = np.argmax(res, axis=0)[erot > 0]
-        if len(vi) == 0:
-            return ang_r + 180.0
-        u, c   = np.unique(vi, return_counts=True)
-        fine   = 90.0 - 180.0 / len(gabors) * float(u[np.argmax(c)])
-        return ang_r - fine + 180.0
-
-    # ── rotation stage ────────────────────────────────────────
+    def __init__(self, img, ratio_rotate=2.0, ratio=1.0):
+        self.ratio_rotate = ratio_rotate
+        self.ratio = ratio
+        self.ori_img = img
+        self.w, self.h = img.shape
+        self.w_rotate, self.h_rotate = int(self.w/ratio_rotate), int(self.h/ratio_rotate)
 
     def run_rotate(self):
-        cfg    = self.cfg
-        img    = self.resize_image(self.ori_img, int(self.ratio_rotate))
-        gabors = GaborFilter(15, 12, sigma=3, lambd=10, gamma=0.2)
-        blur   = self.gaussian_blur(img, sigma=cfg["BLUR_SIGMA_ROTATE"],
-                                    blur=cfg["BLUR_ROTATE"])
-        binary = self.threshold_image(blur,
-                                      threshold_val=cfg["THRESHOLD_SEG_ROTATE"],
-                                      bi_threshold=cfg["BI_THRESHOLD_SEG_ROTATE"])
-        comp, cnt, _ = self.find_largest_component(binary)
-        hull, himg   = self.hull_image(img, cnt)
-        edges        = self._detect_edges(blur & comp, cfg["THRESHOLD_EDGE"])
-        lbl, sidx    = self._select_palm(edges & himg)
-        self.rotation_angle = self._rough_orientation(lbl, sidx, himg, gabors)
-        self.norm_img = self._rotate(self.ori_img, self.rotation_angle)
-        h, w = self.norm_img.shape[:2]
-        self.cut_norm_img = self.norm_img[0:h, 0:int(w / 4 * 3)]
+        img = self.resize_image(self.ori_img, self.ratio_rotate)
+        gabors = self._get_gabor_filters()
 
-    # ── localisation stage ────────────────────────────────────
+        img_blurred = self.gaussian_blur(img, sigma=BLUR_SIGMA_ROTATE, blur=BLUR_ROTATE)
+        rough_binary = self.threshold_image(img_blurred, threshold_val=THRESHOLD_SEG_ROTATE, bi_threshold=BI_THRESHOLD_SEG_ROTATE)
+        max_comp_img, max_comp_contour_coord, max_comp_contour_img = self.find_largest_component(rough_binary)
+        hull_coord, hull_img = self.hull_image(img, max_comp_contour_coord)
+        rough_edges_img = self._detect_rough_edges(img_blurred & max_comp_img)
+        edges_hull_img = rough_edges_img & hull_img
+        palm_edges_labels, palm_edges_sorted_indices = self._select_rough_palm(edges_hull_img)
+
+        self.rotation_angle = self.compute_rough_orientation(palm_edges_labels, palm_edges_sorted_indices, hull_img, gabors)
+        self.norm_img = self.rotate_image(self.ori_img, self.rotation_angle)
+        height, width = self.norm_img.shape[:2]
+        self.cut_norm_img = self.norm_img[0:height, 0:int(width/4*3)]
 
     def run_localization(self):
-        cfg = self.cfg
         img = self.cut_norm_img
         self.w, self.h = img.shape
+        img_blurred = self.gaussian_blur(img, sigma=BLUR_SIGMA, blur=BLUR)
+        rough_binary = self.threshold_image(img_blurred, threshold_val=THRESHOLD_SEG, bi_threshold=BI_THRESHOLD_SEG)
+        max_comp_img, max_comp_contour_coord, max_comp_contour_img = self.find_largest_component(rough_binary)
 
-        blur   = self.gaussian_blur(img, sigma=cfg["BLUR_SIGMA"],
-                                    blur=cfg["BLUR"])
-        binary = self.threshold_image(blur,
-                                      threshold_val=cfg["THRESHOLD_SEG"],
-                                      bi_threshold=cfg["BI_THRESHOLD_SEG"])
-        comp, cnt, _ = self.find_largest_component(binary)
-        if cnt is None:
+        if max_comp_contour_coord is None:
             return False
 
-        cs = self.erode_binary_image(comp, self._ksize)
-        if cv2.countNonZero(cs) == 0:
-            cs = self.erode_binary_image(comp, (15, 15))
-        if cv2.countNonZero(cs) == 0:
+        max_comp_img_small = self.erode_binary_image(max_comp_img, kernel_size=KERNEL_SIZE)
+        if cv2.countNonZero(max_comp_img_small) == 0:
+            max_comp_img_small = self.erode_binary_image(max_comp_img, kernel_size=(15, 15))
+        if cv2.countNonZero(max_comp_img_small) == 0:
+            return False
+        max_comp_contour_coord_small = self.find_contour(max_comp_img_small)
+        max_comp_contour_img_small = self.fill_contour(img, max_comp_contour_coord_small)
+
+        hull_coord, hull_img = self.hull_image(img, max_comp_contour_coord)
+        rough_edges_img = self._detect_rough_edges(img_blurred & max_comp_img)
+
+        hull_img_small = self.erode_binary_image(hull_img, kernel_size=KERNEL_SIZE)
+        if cv2.countNonZero(hull_img_small) == 0:
+            hull_img_small = self.erode_binary_image(hull_img, kernel_size=(15, 15))
+        if cv2.countNonZero(hull_img_small) == 0:
             return False
 
-        hull, himg = self.hull_image(img, cnt)
-        edges      = self._detect_edges(blur & comp, cfg["THRESHOLD_EDGE"])
-        hs         = self.erode_binary_image(himg, self._ksize)
-        if cv2.countNonZero(hs) == 0:
-            hs = self.erode_binary_image(himg, (15, 15))
-        if cv2.countNonZero(hs) == 0:
-            return False
+        hull_contour_coord_small = self.find_contour(hull_img_small)
+        hull_contour_img_small = self.fill_contour(img, hull_contour_coord_small)
+        concave_contour_img = max_comp_contour_img & hull_img_small
 
-        hcnt_s    = self.find_contour(hs)
-        hcimg_s   = self.fill_contour(img, hcnt_s)
-        cnt_img   = cv2.drawContours(np.zeros_like(img, np.uint8),
-                                     [cnt], -1, 255, 1)
-        concave   = cnt_img & hs
-        lbl, sidx = self._select_palm(edges & hs)
-        palm_len  = float(np.max(hull[:, 0, :][:, 0]) -
-                          np.min(hull[:, 0, :][:, 0]))
+        edges_hull_img = rough_edges_img & hull_img_small
+        self.edges_hull_img = edges_hull_img
 
-        self.finger_edges_img = self._process_contour(
-            sidx, lbl, palm_len, hcimg_s, concave, cnt_img)
-        self.palm_contour_img, self.palm_contour_coord = \
-            self._inner_contour(self.finger_edges_img)
-        self.finger_lines = self._concave_fingers(
-            hcnt_s, hs, palm_len,
-            float(np.max(hull[:, 0, :][:, 0])),
-            self.palm_contour_coord)
-        self.finger_lines_sorted = self._sort_lines(self.finger_lines)
-        self.keypoints           = self._detect_keypoints(
-            self.finger_lines_sorted)
-        self.show_img = cv2.cvtColor(np.copy(self.norm_img),
-                                     cv2.COLOR_GRAY2BGR)
+        palm_edges_labels, palm_edges_sorted_indices = self._select_rough_palm(edges_hull_img)
+
+        palm_len = np.max(hull_coord[:,0,:][:,0]) - np.min(hull_coord[:,0,:][:,0])
+
+        self.finger_edges_img = self.process_palm_contour_rough(palm_edges_sorted_indices, palm_edges_labels, palm_len, hull_contour_img_small, concave_contour_img, max_comp_contour_img)
+        self.palm_contour_img, self.palm_contour_coord = self.find_inner_contour(self.finger_edges_img)
+        self.finger_lines = self.find_concave_finger(hull_contour_coord_small, hull_contour_img_small, palm_len, np.max(hull_coord[:,0,:][:,0]), self.palm_contour_coord)
+        self.finger_lines_sorted = self.sort_and_surround_lines(self.finger_lines)
+        self.keypoints = self.detect_keypoints(self.finger_lines_sorted)
+        self.show_img = cv2.cvtColor(np.copy(self.norm_img), cv2.COLOR_GRAY2BGR)
+
         if self.keypoints is None:
             return False
-
-        idx = np.argsort(self.keypoints[:, 1])
-        self.keypoints = self.keypoints[idx]
-        self._localise_keypoints(self.keypoints)
-        return True
-
-    # ── keypoints ─────────────────────────────────────────────
-
-    def _localise_keypoints(self, kps):
-        if len(kps) == 4:
-            d1 = (self.compute_edist(kps[0], kps[2]) +
-                  self.compute_edist(kps[0], kps[1]))
-            d2 = (self.compute_edist(kps[1], kps[3]) +
-                  self.compute_edist(kps[2], kps[3]))
-            kp1, kp2 = (kps[0], kps[2]) if d2 > d1 else (kps[1], kps[3])
         else:
-            kp1, kp2 = kps[0], kps[1]
-        self.keypoints_localization = [kp1, kp2]
+            for point in self.keypoints:
+                x, y = int(point[0]), int(point[1])
+            sorted_indices = np.argsort(self.keypoints[:, 1])
+            self.keypoints = self.keypoints[sorted_indices]
+            self.localize_keypoints(self.keypoints)
+            return True
 
-    def _detect_keypoints(self, lines):
-        def right_of(p1, p2, p):
-            return ((int(p2[0]) - int(p1[0])) * (int(p[1]) - int(p1[1])) -
-                    (int(p2[1]) - int(p1[1])) * (int(p[0]) - int(p1[0]))) < 0
+    def localize_keypoints(self, keypoints):
+        if len(keypoints) == 4:
+            dist1 = self.compute_edist(keypoints[0], keypoints[2]) + self.compute_edist(keypoints[0], keypoints[1])
+            dist2 = self.compute_edist(keypoints[1], keypoints[3]) + self.compute_edist(keypoints[2], keypoints[3])
+            if dist2 > dist1:
+                keypoint1 = keypoints[0]
+                keypoint2 = keypoints[2]
+            else:
+                keypoint1 = keypoints[1]
+                keypoint2 = keypoints[3]
+        elif len(keypoints) == 2:
+            keypoint1 = keypoints[0]
+            keypoint2 = keypoints[1]
+        self.keypoints_localization = [keypoint1, keypoint2]
 
-        def best(s1, s2):
-            for a in s1:
-                for b in s2:
-                    if (all(not right_of(a, b, p) for p in s1 if not np.array_equal(p, a))
-                            and all(not right_of(a, b, p) for p in s2 if not np.array_equal(p, b))):
-                        return a, b
-            return s1[np.argmax(s1[:, 0])], s2[np.argmax(s2[:, 0])]
+    def detect_keypoints(self, lines_segment):
+        def is_on_right(p1, p2, p):
+            return (p2[0] - p1[0]) * (p[1] - p1[1]) - (p2[1] - p1[1]) * (p[0] - p1[0]) < 0
 
-        if len(lines) == 4:
-            kps = np.zeros((4, 2), np.int32)
-            r1  = best(lines[0], lines[2])
-            r2  = best(lines[1], lines[3])
-            kps[0], kps[2] = r1
-            kps[1], kps[3] = r2
-        elif len(lines) in (2, 3):
-            kps = np.zeros((2, 2), np.int32)
-            r   = best(lines[0], lines[-1])
-            kps[0], kps[1] = r
+        def find_line_with_all_points_on_right(set1, set2):
+            for p1 in set1:
+                for p2 in set2:
+                    all_on_right = True
+                    for p in set1:
+                        if p is not p1 and is_on_right(p1, p2, p):
+                            all_on_right = False
+                            break
+                    if all_on_right:
+                        for p in set2:
+                            if p is not p2 and is_on_right(p1, p2, p):
+                                all_on_right = False
+                                break
+                    if all_on_right:
+                        return (p1, p2)
+            return set1[np.argmax(set1[:, 0])], set2[np.argmax(set2[:, 0])]
+
+        if len(lines_segment) == 4:
+            keypoints = np.zeros([4, 2], np.int32)
+            points1_result = find_line_with_all_points_on_right(lines_segment[0], lines_segment[2])
+            points2_result = find_line_with_all_points_on_right(lines_segment[1], lines_segment[3])
+            keypoints[0] = points1_result[0]
+            keypoints[2] = points1_result[1]
+            keypoints[1] = points2_result[0]
+            keypoints[3] = points2_result[1]
+        elif len(lines_segment) == 3:
+            keypoints = np.zeros([2, 2], np.int32)
+            points_result = find_line_with_all_points_on_right(lines_segment[0], lines_segment[2])
+            keypoints[0] = points_result[0]
+            keypoints[1] = points_result[1]
+        elif len(lines_segment) == 2:
+            keypoints = np.zeros([2, 2], np.int32)
+            points_result = find_line_with_all_points_on_right(lines_segment[0], lines_segment[1])
+            keypoints[0] = points_result[0]
+            keypoints[1] = points_result[1]
         else:
-            return None
-        return kps
+            keypoints = None
+            print('error keypoints--------------')
 
-    def _sort_lines(self, lines, num_pts=80):
-        half = num_pts // 2
-        out  = []
-        for line in sorted(lines, key=lambda l: np.min(l[:, 1])):
-            mi  = int(np.argmax(line[:, 0]))
-            s   = max(0, mi - half)
-            e   = min(line.shape[0], mi + half + 1)
-            out.append(line[s:e])
-        return out
+        return keypoints
 
-    def _concave_fingers(self, hcnt_s, hs, palm_len, hull_right, palm_cnt):
-        mask = np.array([
-            cv2.pointPolygonTest(
-                hcnt_s[:, 0, :].astype(np.float32),
-                (float(p[0]), float(p[1])), True) > 0.5
-            for p in palm_cnt])
-        trans = np.where(mask[:-1] != mask[1:])[0] + 1
-        if mask[0]:  trans = np.insert(trans, 0, 0)
-        if mask[-1]: trans = np.append(trans, len(palm_cnt))
-        rough = [palm_cnt[s:e]
-                 for s, e in zip(trans[::2], trans[1::2]) if e - s > 5]
-        if len(rough) <= 4:
-            return rough
-        fingers = []
-        for i in np.argsort([r.shape[0] for r in rough])[::-1]:
-            if len(fingers) >= 4:
-                break
-            line = rough[i]
-            if line.shape[0] <= 20:
-                continue
-            rpt  = line[np.argmax(line[:, 0])]
-            cp, cd = self.find_closest_white_point(hs, rpt)
-            rx   = float(np.max(line[:, 0]))
-            if cd < 20.0 / self.ratio:
-                if cd / line.shape[0] > 1.0 / 3:
-                    fingers.append(line)
+    def sort_and_surround_lines(self, finger_lines, num_points=80):
+        min_ys_and_lines = [(np.min(line[:, 1]), line) for line in finger_lines]
+        sorted_by_y = sorted(min_ys_and_lines, key=lambda item: item[0])
+        sorted_lines = [item[1] for item in sorted_by_y]
+
+        new_point_sets = []
+        half_num = num_points // 2
+        for line in sorted_lines:
+            idx_max_x = np.argmax(line[:, 0])
+            start_idx = max(0, idx_max_x - half_num)
+            end_idx = min(line.shape[0], idx_max_x + half_num + 1)
+            extracted_points = line[start_idx:end_idx]
+            new_point_sets.append(extracted_points)
+
+        return new_point_sets
+
+    def find_concave_finger(self, hull_contour_coord_small, hull_contour_img_small, palm_len, hull_coord_right, palm_contour):
+        finger_lines = []
+        mask = np.array([cv2.pointPolygonTest(hull_contour_coord_small[:,0,:].astype(np.float32), (float(pt[0]), float(pt[1])), measureDist=True) > 0.5 for pt in palm_contour])
+        transitions = np.where(mask[:-1] != mask[1:])[0] + 1
+
+        if mask[0]:
+            transitions = np.insert(transitions, 0, 0)
+        if mask[-1]:
+            transitions = np.append(transitions, len(palm_contour))
+
+        finger_lines_rough = [palm_contour[start:end] for start, end in zip(transitions[::2], transitions[1::2]) if end - start > 5]
+
+        finger_lines = []
+        if len(finger_lines_rough) <= 4:
+            finger_lines = finger_lines_rough
+        else:
+            lines_long = np.zeros(len(finger_lines_rough))
+            for ind, finger_line in enumerate(finger_lines_rough):
+                lines_long[ind] = finger_line.shape[0]
+
+            sorted_indices = np.argsort(lines_long)[::-1]
+            for index in sorted_indices:
+                if len(finger_lines) >= 4:
+                    break
+                finger_line = finger_lines_rough[index]
+                if finger_line.shape[0] > 20:
+                    right_point = finger_line[np.argmax(finger_line[:,0])]
+                    closet_point, closet_dist = self.find_closest_white_point(hull_contour_img_small, right_point)
+                    right_most_finger_x = np.max(finger_lines_rough[index][:, 0])
+                    if closet_dist < 20/self.ratio:
+                        if closet_dist/finger_line.shape[0] > 1/3:
+                            finger_lines.append(finger_lines_rough[index])
+                    else:
+                        if hull_coord_right - right_most_finger_x > palm_len / 4:
+                            finger_lines.append(finger_lines_rough[index])
+
+        return finger_lines
+
+    def find_inner_contour(self, finger_edges):
+        contours_final, hierarchy = cv2.findContours(finger_edges, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+        contours_sorted = sorted(contours_final, key=cv2.contourArea, reverse=True)
+        top_contours = contours_sorted[:2]
+
+        selected_contour = None
+        for i, contour in enumerate(top_contours):
+            parent_contour_exists = False
+            if any((np.array_equal(contour, target) for target in contours_final)):
+                hierarchy_idx = hierarchy[0][i]
+                if hierarchy_idx[3] != -1 and contours_final[hierarchy_idx[3]] in top_contours:
+                    parent_contour_exists = True
+            if parent_contour_exists:
+                selected_contour = contour
             else:
-                if hull_right - rx > palm_len / 4:
-                    fingers.append(line)
-        return fingers
+                selected_contour = top_contours[1]
 
-    def _inner_contour(self, fe):
-        cnts, _ = cv2.findContours(fe, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
-        top2    = sorted(cnts, key=cv2.contourArea, reverse=True)[:2]
-        sel     = top2[1] if len(top2) > 1 else top2[0]
-        return self.fill_contour(self.ori_img, sel), sel[:, 0, :]
+        palm_contour_coord = selected_contour[:, 0, :]
+        palm_contour_img = self.fill_contour(self.ori_img, selected_contour)
+        return palm_contour_img, palm_contour_coord
 
-    def _process_contour(self, sidx, labels, palm_len,
-                         hcimg_s, concave, cnt_img):
-        ch     = concave | hcimg_s
-        fe     = concave | hcimg_s
-        th_rm  = 6.0 / self.ratio
-        count  = 0
-        hpts   = np.argwhere(cnt_img == 255)
+    def _select_rough_palm(self, edges_hull_img):
+        num_labels, labels, stats = cv2.connectedComponentsWithStats(edges_hull_img, connectivity=8)[:3]
+        sorted_indices = np.argsort(stats[1:, cv2.CC_STAT_AREA])[::-1]
+        return labels, sorted_indices
 
-        for ind in sidx:
-            if count > 3:
+    def _detect_rough_edges(self, img):
+        edges = cv2.normalize(cv2.Laplacian(img, cv2.CV_64F, ksize=7).clip(min=0), None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        _, edges = cv2.threshold(edges, THRESHOLD_EDGE, 255, cv2.THRESH_BINARY)
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        return edges
+
+    def compute_rough_orientation(self, labels, sorted_indices, hull_filled_img, gabors):
+        edges_img = np.zeros([self.w_rotate, self.h_rotate])
+
+        for index in sorted_indices[1:4]:
+            if np.sum(labels == index + 1) > (20 / self.ratio):
+                edges_img[labels == index + 1] = 255
+
+        points = np.argwhere(edges_img > 0)
+        centroid_x, centroid_y = np.mean(points, axis=0)[1], np.mean(points, axis=0)[0]
+
+        finger_hull = cv2.convexHull(points[:, [1, 0]])
+        finger_hull_filled_img = cv2.drawContours(np.zeros_like(edges_img, dtype=np.uint8), [finger_hull], -1, 255, thickness=cv2.FILLED)
+        points_remained = np.argwhere((finger_hull_filled_img & hull_filled_img) ^ hull_filled_img)
+        center = np.mean(points_remained, axis=0)
+
+        rough_orien_vect = np.array([centroid_x - center[1], centroid_y - center[0]])
+        angle_degrees_rough = np.degrees(np.arctan2(rough_orien_vect[1], rough_orien_vect[0]))
+        center_rotate = (edges_img.shape[1] // 2, edges_img.shape[0] // 2)
+        rotation_matrix_rough = cv2.getRotationMatrix2D(center_rotate, angle_degrees_rough, 1)
+        edges_img_rough = cv2.warpAffine(edges_img, rotation_matrix_rough, (edges_img.shape[1], edges_img.shape[0]))
+
+        results = np.zeros((12, edges_img_rough.shape[0], edges_img_rough.shape[1]))
+        for jj, gabor in enumerate(gabors):
+            result = cv2.filter2D(edges_img_rough.astype(np.float32), -1, gabor)
+            results[jj] = result
+
+        valid_ind = np.argmax(results, axis=0)[edges_img_rough == 255]
+        unique, counts = np.unique(valid_ind, return_counts=True)
+        most_common_item = unique[np.argmax(counts)]
+        angle_degree_fine = 90 - 180/12 * most_common_item
+
+        angle_combined = angle_degrees_rough - angle_degree_fine + 180
+        return angle_combined
+
+    def _get_gabor_filters(self) -> list:
+        return GaborFilter(15, 12, sigma=3, lambd=10, gamma=0.2)
+
+    def rotate_image(self, image: np.ndarray, angle_degrees: float) -> np.ndarray:
+        center = (image.shape[1] // 2, image.shape[0] // 2)
+        rotation_matrix = cv2.getRotationMatrix2D(center, angle_degrees, 1.0)
+        rotated = cv2.warpAffine(image, rotation_matrix, (image.shape[1], image.shape[0]))
+        return rotated
+
+    def rotate_keypoints(self, image, angle_degrees, kk_data):
+        center = (image.shape[1] // 2, image.shape[0] // 2)
+        rotation_matrix = cv2.getRotationMatrix2D(center, angle_degrees, 1.0)
+        transformed_points = np.hstack([kk_data, np.ones((kk_data.shape[0], 1))])
+        transformed_points = np.dot(transformed_points, rotation_matrix.T)[:, :2]
+        transformed_points = np.round(transformed_points).astype(int)
+        return transformed_points
+
+    def process_palm_contour_rough(self, sorted_edges_indices, labels, len_palm, hull_contour_small, concave_contour_img, hull_contour):
+        concave_hull = concave_contour_img | hull_contour_small
+        finger_edges = concave_contour_img | hull_contour_small
+
+        th_removed = 6/self.ratio
+        edges_counts = 0
+        th_edge_count = 3
+        hull_points = np.argwhere(hull_contour == 255)
+
+        for ind in sorted_edges_indices:
+            if edges_counts > th_edge_count:
                 break
-            ge = np.zeros((self.w, self.h), dtype=np.uint8)
-            ge[labels == ind + 1] = 255
-            sk = self.get_skeleton(ge)
-            if sk.sum() / 255.0 < 25:
-                continue
-            res = self.find_closest_path_graph(sk)
-            if not res[1]:
-                continue
-            valley, _ = self.judge_valley(res[1])
+            gray_edge = np.zeros((self.w, self.h))
+            gray_edge[labels == ind + 1] = 255
+            gray_edge_skele = self.get_skeleton(gray_edge)
 
-            if not valley:
-                ln  = res[1][0]
-                lhp = hpts[hpts[:, 0] == ln[0]]
-                if len(lhp) == 0:
+            if gray_edge_skele.sum()/255 < 25:
+                continue
+
+            results_graph = self.find_closest_path_graph(gray_edge_skele)
+
+            if len(results_graph[1]) == 0:
+                continue
+
+            flag_valley, rightnode_index = self.judge_valley(results_graph[1])
+
+            if not flag_valley:
+                right_node = results_graph[1][-1]
+                left_node = results_graph[1][0]
+                left_hull_points = hull_points[np.argwhere(hull_points[:,0] == left_node[0])]
+                left_dest = left_node[1] - np.min(left_hull_points[:,0,1])
+                if left_dest > (len_palm/6):
                     continue
-                if float(ln[1]) - float(np.min(lhp[:, 1])) > palm_len / 6:
-                    continue
-                pv  = self.find_farthest_point(res[1], th_rm)
-                sk  = np.zeros_like(self.cut_norm_img, dtype=np.uint8)
-                pts_draw = pv.astype(np.int32)
-                cv2.polylines(sk, [pts_draw], False, 255, 1)
-                cp, _ = self.find_closest_white_point(ch, pv[0])
-                p0    = _pt(pv[0])
-                cv2.line(sk, cp, p0, 255, 1)
+                path_valid = self.find_farthest_point(results_graph[1], th_removed)
+                gray_edge_skele = np.zeros_like(self.cut_norm_img)
+                cv2.polylines(gray_edge_skele, [path_valid], isClosed=False, color=(255, 255, 255), thickness=1)
+                closest_point, closest_dist = self.find_closest_white_point(concave_hull, path_valid[0])
+                cv2.line(gray_edge_skele, closest_point, tuple(path_valid[0]), 255, thickness=1)
             else:
-                dn  = res[1][-1]
-                sn  = res[1][0]
-                dhp = hpts[hpts[:, 0] == dn[0]]
-                shp = hpts[hpts[:, 0] == sn[0]]
-                if len(dhp) == 0 or len(shp) == 0:
+                dest_node = results_graph[1][-1]
+                src_node = results_graph[1][0]
+                dest_hull_points = hull_points[np.argwhere(hull_points[:,0] == dest_node[0])]
+                dist_dest = dest_node[1] - np.min(dest_hull_points[:,0,1])
+                src_hull_points = hull_points[np.argwhere(hull_points[:,0] == src_node[0])]
+                src_dest = src_node[1] - np.min(src_hull_points[:,0,1])
+                dist_node = min(dist_dest, src_dest)
+                if dist_node > (len_palm/5):
                     continue
-                dd  = float(dn[1]) - float(np.min(dhp[:, 1]))
-                ds  = float(sn[1]) - float(np.min(shp[:, 1]))
-                if min(dd, ds) > palm_len / 5:
-                    continue
-                sk  = res[0].astype(np.uint8)
-                cp_d, _ = self.find_closest_white_point(ch, (dn[1], dn[0]))
-                cv2.line(sk, cp_d, (int(dn[1]), int(dn[0])), 255, 1)
-                cp_s, _ = self.find_closest_white_point(ch, (sn[1], sn[0]))
-                cv2.line(sk, cp_s, (int(sn[1]), int(sn[0])), 255, 1)
+                gray_edge_skele = results_graph[0].astype(np.uint8)
+                closest_point_dest, closest_dist = self.find_closest_white_point(concave_hull, dest_node[::-1])
+                cv2.line(gray_edge_skele, closest_point_dest, dest_node[::-1], 255, thickness=1)
+                closest_point_src, closest_dist = self.find_closest_white_point(concave_hull, src_node[::-1])
+                cv2.line(gray_edge_skele, closest_point_src, src_node[::-1], 255, thickness=1)
 
-            count += 1
-            fe = fe | sk
+            edges_counts += 1
+            finger_edges = finger_edges | gray_edge_skele
 
-        return fe.astype(np.uint8)
+        finger_edges = finger_edges.astype(np.uint8)
+        return finger_edges
 
 
-# ──────────────────────────────────────────────────────────────
-#  Quality validation
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Main: ROI extraction only
+# ─────────────────────────────────────────────
 
-def _skin_mask(bgr):
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    m1  = cv2.inRange(hsv, np.array([0,   15,  40], np.uint8),
-                           np.array([25,  255, 255], np.uint8))
-    m2  = cv2.inRange(hsv, np.array([155, 15,  40], np.uint8),
-                           np.array([180, 255, 255], np.uint8))
-    return m1 | m2
-
-
-def _gabor_energy(gray):
-    vals = []
-    for ang in range(0, 180, 30):
-        k = cv2.getGaborKernel((21, 21), sigma=4.0,
-                               theta=np.deg2rad(ang),
-                               lambd=10.0, gamma=0.5, psi=0,
-                               ktype=cv2.CV_32F)
-        k /= float(k.sum()) + 1e-9
-        r  = cv2.filter2D(gray.astype(np.float32), cv2.CV_32F, k)
-        vals.append(float(np.mean(np.abs(r))))
-    return float(np.mean(vals))
-
-
-def _local_var_std(gray, block=32):
-    h, w = gray.shape
-    g    = gray.astype(np.float32)
-    blocks = [float(g[r:r+block, c:c+block].var())
-              for r in range(0, h - block, block)
-              for c in range(0, w - block, block)]
-    return float(np.std(blocks)) if blocks else 0.0
-
-
-def validate_roi(roi_bgr, qcfg=None):
-    if qcfg is None:
-        qcfg = QUALITY_CONFIG
-    failed = []; scores = {}
-    h, w   = roi_bgr.shape[:2]
-    gray   = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-
-    scores["w"] = w; scores["h"] = h
-    if w < qcfg["min_size"] or h < qcfg["min_size"]:
-        failed.append(f"too_small({w}x{h})")
-    if w > qcfg["max_size"] or h > qcfg["max_size"]:
-        failed.append(f"too_large({w}x{h})")
-
-    asp = w / (h + 1e-9); scores["aspect"] = round(asp, 3)
-    if not (qcfg["min_aspect"] <= asp <= qcfg["max_aspect"]):
-        failed.append(f"bad_aspect({asp:.2f})")
-
-    tstd = float(gray.std()); scores["texture_std"] = round(tstd, 2)
-    if tstd < qcfg["min_texture_std"]:  failed.append(f"low_texture({tstd:.1f})")
-    if tstd > qcfg["max_texture_std"]:  failed.append(f"high_texture({tstd:.1f})")
-
-    skin  = _skin_mask(roi_bgr)
-    skrat = float(np.count_nonzero(skin)) / (w * h + 1e-9)
-    scores["skin_ratio"] = round(skrat, 3)
-    if skrat < qcfg["min_skin_ratio"]:  failed.append(f"low_skin({skrat:.2f})")
-
-    sharp = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    scores["sharpness"] = round(sharp, 2)
-    if sharp < qcfg["min_sharpness"]:   failed.append(f"blurry({sharp:.1f})")
-
-    ge = _gabor_energy(gray); scores["gabor_energy"] = round(ge, 3)
-    if ge < qcfg["min_gabor_energy"]:   failed.append(f"no_lines({ge:.2f})")
-
-    lvs = _local_var_std(gray); scores["local_var_std"] = round(lvs, 2)
-    if lvs > qcfg["max_local_var_std"]: failed.append(f"non_uniform({lvs:.1f})")
-
-    return len(failed) == 0, failed, scores
-
-
-# ──────────────────────────────────────────────────────────────
-#  Overlay visualiser
-# ──────────────────────────────────────────────────────────────
-
-def save_overlay(orig_color, get_roi_obj, out_path,
-                 scores=None, reasons=None):
-    vis = (orig_color.copy() if len(orig_color.shape) == 3
-           else cv2.cvtColor(orig_color, cv2.COLOR_GRAY2BGR))
-    kk  = np.array(get_roi_obj.keypoints_localization)
-    kkt = get_roi_obj.rotate_keypoints(
-        get_roi_obj.norm_img, -get_roi_obj.rotation_angle, kk)
-
-    for pt in kkt:
-        cv2.circle(vis, _pt(pt), 10, (0, 0, 255), -1)
-
-    p1 = kkt[0].astype(float); p2 = kkt[1].astype(float)
-    d  = float(np.linalg.norm(p2 - p1))
-    dv = (p2 - p1) / (d + 1e-9)
-    nv = np.array([dv[1], -dv[0]])
-    s  = int(d/6*7); he = int(d/12); ds = int(d/6)
-    C  = (p1 + (ds+s)*nv - he*dv).astype(np.int32)
-    D  = (C + s*dv).astype(np.int32)
-    E  = (D - s*nv).astype(np.int32)
-    F  = (C - s*nv).astype(np.int32)
-    cv2.polylines(vis, [np.array([C, D, E, F])], True, (0, 255, 0), 3)
-
-    if reasons is not None:
-        label  = "PASS" if not reasons else "FAIL: " + " | ".join(reasons)
-        colour = (0, 200, 0) if not reasons else (0, 0, 220)
-        cv2.putText(vis, label, (10, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, colour, 2)
-    if scores is not None:
-        y = 80
-        for k, v in scores.items():
-            cv2.putText(vis, f"{k}={v}", (10, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 0), 1)
-            y += 24
-
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    cv2.imwrite(out_path, vis)
-
-
-# ──────────────────────────────────────────────────────────────
-#  Core: try primary then fallbacks
-# ──────────────────────────────────────────────────────────────
-
-def _merged(primary, override, shape):
-    m = dict(primary); m.update(override)
-    m["KERNEL_SIZE"] = _resolve_kernel(m, shape)
-    return m
-
-
-def try_extract(gray_img, color_img, primary_cfg,
-                fallback_cfgs, debug=False):
-    attempts = [("primary", primary_cfg)] + \
-               [(f"fallback_{i+1}", fb)
-                for i, fb in enumerate(fallback_cfgs)]
-
-    for label, override in attempts:
-        cfg = _merged(primary_cfg, override, gray_img.shape)
-        try:
-            gr = GetROI(gray_img, cfg)
-            gr.run_rotate()
-            gr.norm_img = gr._rotate(gr.ori_img, gr.rotation_angle)
-            h, w = gr.norm_img.shape[:2]
-            gr.cut_norm_img = gr.norm_img[0:h, 0:int(w / 4 * 3)]
-            ok  = gr.run_localization()
-        except Exception as e:
-            if debug:
-                print(f"      [{label}] exception: {e}")
-            continue
-        if ok:
-            kk  = np.array(gr.keypoints_localization)
-            kkt = gr.rotate_keypoints(gr.norm_img, -gr.rotation_angle, kk)
-            roi, _, _ = extract_roi(kkt[0], kkt[1], color_img,
-                                    color=(0, 255, 0), thickness=2)
-            return roi, label, gr
-        if debug:
-            print(f"      [{label}] localization failed")
-
-    return None, None, None
-
-
-# ──────────────────────────────────────────────────────────────
-#  Single-image debug helper
-# ──────────────────────────────────────────────────────────────
-
-def debug_single_image(img_path, preset=None):
-    if preset is None:
-        preset = DATASET_PRESET
-    gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-    if gray is None:
-        print(f"Cannot read: {img_path}"); return
-    cfg  = dict(DATASET_CONFIGS[preset])
-    cfg["KERNEL_SIZE"] = _resolve_kernel(cfg, gray.shape)
-    out  = os.path.dirname(img_path)
-
-    cv2.imwrite(os.path.join(out, "dbg_0_raw.jpg"), gray)
-    blur = (cv2.GaussianBlur(gray, (5, 5), cfg["BLUR_SIGMA"])
-            if cfg["BLUR"] else gray.copy())
-    cv2.imwrite(os.path.join(out, "dbg_1_blurred.jpg"), blur)
-
-    otsu_val, _ = cv2.threshold(blur, 0, 255,
-                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if cfg["BI_THRESHOLD_SEG"]:
-        _, thr = cv2.threshold(blur, cfg["THRESHOLD_SEG"],
-                               255, cv2.THRESH_BINARY)
-    else:
-        _, thr = cv2.threshold(blur, 0, 255,
-                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    cv2.imwrite(os.path.join(out, "dbg_2_threshold.jpg"), thr)
-
-    _, lbl, stats, _ = cv2.connectedComponentsWithStats(thr)
-    comp = np.zeros_like(gray)
-    if len(stats) > 1:
-        comp[lbl == int(np.argmax(stats[1:, -1])) + 1] = 255
-    cv2.imwrite(os.path.join(out, "dbg_3_component.jpg"), comp)
-    eroded = cv2.erode(comp, np.ones(cfg["KERNEL_SIZE"], np.uint8))
-    cv2.imwrite(os.path.join(out, "dbg_4_eroded.jpg"), eroded)
-    lap   = cv2.Laplacian(blur & comp, cv2.CV_64F, ksize=7).clip(min=0)
-    edges = cv2.normalize(lap, None, 0, 255,
-                          cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-    _, eb = cv2.threshold(edges, cfg["THRESHOLD_EDGE"], 255, cv2.THRESH_BINARY)
-    cv2.imwrite(os.path.join(out, "dbg_5_edges.jpg"), eb)
-    color = cv2.imread(img_path, cv2.IMREAD_COLOR)
-    if color is not None:
-        cv2.imwrite(os.path.join(out, "dbg_6_skin.jpg"), _skin_mask(color))
-
-    print(f"\nDebug images → {out}")
-    print(f"  Size     : {gray.shape[1]}x{gray.shape[0]}")
-    print(f"  Otsu val : {otsu_val:.1f}")
-    print(f"  Kernel   : {cfg['KERNEL_SIZE']}")
-    print(f"  Preset   : {preset}")
-
-
-# ──────────────────────────────────────────────────────────────
-#  Main extraction runner
-# ──────────────────────────────────────────────────────────────
-
-def run_extraction(dir_source, dir_output,
-                   dataset_preset=None, debug=None):
-    if dataset_preset is None: dataset_preset = DATASET_PRESET
-    if debug          is None: debug          = DEBUG
-
-    if dataset_preset not in DATASET_CONFIGS:
-        raise ValueError(f"Unknown preset '{dataset_preset}'. "
-                         f"Valid: {list(DATASET_CONFIGS.keys())}")
-
-    primary_cfg = DATASET_CONFIGS[dataset_preset]
-    rej_root    = dir_output + "_rejected"
-    ov_root     = dir_output + "_overlays"
+def run_extraction(dir_source, dir_output):
     os.makedirs(dir_output, exist_ok=True)
 
     all_images = []
     for root, _, files in os.walk(dir_source):
-        for fn in sorted(files):
-            if fn.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
-                all_images.append((root, fn))
+        for filename in sorted(files):
+            if filename.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                all_images.append((root, filename))
 
-    print(f"\n{'='*58}")
-    print(f"  Source   : {dir_source}")
-    print(f"  Output   : {dir_output}")
-    print(f"  Preset   : {dataset_preset}")
-    print(f"  Validate : {VALIDATE_ROI}")
-    print(f"  Images   : {len(all_images)}")
-    print(f"{'='*58}\n")
+    print(f"Found {len(all_images)} images.")
 
-    n_ok = n_fail = n_reject = 0
-    usage = {}
+    num_success = 0
+    num_failed = 0
 
-    for idx, (root, fn) in enumerate(all_images):
-        img_path = os.path.join(root, fn)
-        rel      = os.path.relpath(root, dir_source)
-        out_dir  = os.path.join(dir_output, rel)
+    for idx, (root, filename) in enumerate(all_images):
+        img_path = os.path.join(root, filename)
+
+        rel_path = os.path.relpath(root, dir_source)
+        out_dir = os.path.join(dir_output, rel_path)
         os.makedirs(out_dir, exist_ok=True)
 
-        color_img = cv2.imread(img_path, cv2.IMREAD_COLOR)
-        if color_img is None:
-            print(f"[{idx:05d}] SKIP (unreadable): {fn}")
-            n_fail += 1; continue
+        gray_img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        if gray_img is None:
+            print(f"{idx}: Skipped {filename} (not a readable image)")
+            num_failed += 1
+            continue
 
-        gray_img = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
-        if debug:
-            print(f"[{idx:05d}] {fn}  "
-                  f"({color_img.shape[1]}x{color_img.shape[0]})")
+        try:
+            get_roi = GetROI(gray_img, ratio_rotate=1, ratio=1)
+            get_roi.run_rotate()
 
-        roi, used, gr = try_extract(gray_img, color_img,
-                                    primary_cfg, FALLBACK_CONFIGS,
-                                    debug=debug)
+            get_roi.norm_img = get_roi.rotate_image(get_roi.ori_img, get_roi.rotation_angle)
+            height, width = get_roi.norm_img.shape[:2]
+            get_roi.cut_norm_img = get_roi.norm_img[0:height, 0:int(width/4*3)]
 
-        if roi is None:
-            print(f"[{idx:05d}] FAILED all configs: {fn}")
-            n_fail += 1; continue
+            bool_result = get_roi.run_localization()
+        except Exception as e:
+            print(f"{idx}: Error processing {filename}: {e}")
+            num_failed += 1
+            continue
 
-        passed, reasons, scores = (validate_roi(roi)
-                                   if VALIDATE_ROI
-                                   else (True, [], {}))
+        if bool_result:
+            kk_pred = np.array(get_roi.keypoints_localization)
+            kk_pred_transformed = get_roi.rotate_keypoints(get_roi.norm_img, -get_roi.rotation_angle, kk_pred)
 
-        roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+            roi_pred, corner_points_pred, _ = extract_roi(
+                kk_pred_transformed[0], kk_pred_transformed[1],
+                gray_img, color=[0, 0, 255], thickness=2
+            )
 
-        if passed:
-            cv2.imwrite(os.path.join(out_dir, fn), roi_rgb)
-            usage[used] = usage.get(used, 0) + 1
-            if SAVE_OVERLAY_PASS and gr is not None:
-                ov_dir = os.path.join(ov_root, rel)
-                os.makedirs(ov_dir, exist_ok=True)
-                save_overlay(color_img, gr,
-                             os.path.join(ov_dir, fn),
-                             scores=scores, reasons=reasons)
-            if debug:
-                print(f"        OK  [{used}]  {scores}")
-            n_ok += 1
+            out_path = os.path.join(out_dir, filename)
+            cv2.imwrite(out_path, roi_pred)
+            print(f"{idx}: Saved ROI -> {out_path}")
+            num_success += 1
         else:
-            if SAVE_REJECTED and gr is not None:
-                rej_dir = os.path.join(rej_root, rel)
-                os.makedirs(rej_dir, exist_ok=True)
-                cv2.imwrite(os.path.join(rej_dir, fn), roi_rgb)
-                save_overlay(color_img, gr,
-                             os.path.join(rej_dir, "overlay_" + fn),
-                             scores=scores, reasons=reasons)
-            print(f"[{idx:05d}] REJECTED {reasons}  {fn}")
-            n_reject += 1
+            print(f"{idx}: Failed to extract ROI for {filename}")
+            num_failed += 1
 
-    total = n_ok + n_fail + n_reject
-    print(f"\n{'='*58}")
-    print(f"  Done.")
-    print(f"  Passed   : {n_ok}")
-    print(f"  Rejected : {n_reject}  (saved → {rej_root})")
-    print(f"  Failed   : {n_fail}")
-    print(f"  Total    : {total}")
-    if usage:
-        print(f"\n  Config usage:")
-        for lbl, cnt in sorted(usage.items()):
-            print(f"    {lbl:15s}: {cnt:5d}  "
-                  f"({100*cnt/max(n_ok, 1):.1f}%)")
-    print(f"{'='*58}\n")
+    print(f"\nDone. Success: {num_success}, Failed: {num_failed}")
 
 
-# ──────────────────────────────────────────────────────────────
-#  Entry point
-# ──────────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    dir_source = "/home/pai-ng/Jamal/MPDv2"
+    dir_output = "/home/pai-ng/Jamal/MPDv2_eralign_roi"
 
-if __name__ == "__main__":
-
-    if DEBUG_SINGLE_IMAGE is not None:
-        debug_single_image(DEBUG_SINGLE_IMAGE, preset=DATASET_PRESET)
-
-    run_extraction(
-        dir_source     = DIR_SOURCE,
-        dir_output     = DIR_OUTPUT,
-        dataset_preset = DATASET_PRESET,
-        debug          = DEBUG,
-    )
+    run_extraction(dir_source, dir_output)
