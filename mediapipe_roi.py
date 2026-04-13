@@ -267,31 +267,6 @@ def _run_mp_hands_robust(image_bgr):
 
 
 # ============================================================
-#  LANDMARK VALIDATION  (minimal — avoids rejecting real palms)
-# ============================================================
-
-def _validate_landmarks(pts, img_shape):
-    """
-    Only rejects clearly impossible detections.
-    Avoids orientation/pose assumptions that break on MPDv2.
-    """
-    h, w = img_shape[:2]
-    arr  = np.array(pts, dtype=float)
-
-    # All 21 landmarks inside the image
-    if (np.any(arr[:, 0] < 0) or np.any(arr[:, 0] >= w) or
-            np.any(arr[:, 1] < 0) or np.any(arr[:, 1] >= h)):
-        return False
-
-    # Palm span must be at least MIN_PALM_RATIO of image size
-    palm_span = float(np.linalg.norm(arr[0] - arr[17]))
-    if palm_span < MIN_PALM_RATIO * max(h, w):
-        return False
-
-    return True
-
-
-# ============================================================
 #  ROI GEOMETRY
 # ============================================================
 
@@ -341,14 +316,8 @@ def _extract_roi(img, mid1, mid2, C, thumb, hand_type):
 # ============================================================
 
 def extract_palm_roi(image_bgr):
-    """
-    Full pipeline: robust detect → validate → crop → rotate 180°.
-    Returns (roi_bgr, annotated_bgr, hand_type) or (None, None, None).
-    """
     lms, hand_type = _run_mp_hands_robust(image_bgr)
     if lms is None:
-        return None, None, None
-    if not _validate_landmarks(lms, image_bgr.shape):
         return None, None, None
 
     idx = lambda i: lms[i]
