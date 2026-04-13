@@ -29,34 +29,31 @@ Architecture: CO3Net (unchanged from official repo)
 #  CONFIG  — edit this block only
 # ==============================================================
 CONFIG = {
-    # --- existing keys unchanged ---
-    "protocol"             : "open-set",
-    "n_casia_subjects"     : 190,    # N — how many CASIA-MS identities to use
-    "n_casia_samples"      : 2776,   # S — total images across all selected identities
-    "data_root"            : "/home/pai-ng/Jamal/CASIA-MS-ROI",   # train only
-    "test_data_root"       : "/home/pai-ng/Jamal/smartphone_data", # test only
-    "swap_datasets"        : "False",
-    "test_gallery_ratio"   : 0.3,   # fraction of each identity's samples → gallery
+    "swap_datasets"        : True,
+    "data_root"            : "/home/pai-ng/Jamal/CASIA-MS-ROI",
+    "test_data_root"       : "/home/pai-ng/Jamal/smartphone_data",
+    "test_gallery_ratio"   : 0.3,
     "results_dir"          : "./rst_co3net_casia_ms",
     "img_side"             : 128,
-    "batch_size"           : 1024,
-    "num_epochs"           : 150,
+    "batch_size"           : 256,    # ← was 1024
+    "num_epochs"           : 200,    # ← was 150
     "lr"                   : 0.001,
-    "lr_step"              : 500,
-    "lr_gamma"             : 0.8,
+    "lr_step"              : 30,     # ← was 500
+    "lr_gamma"             : 0.6,    # ← was 0.8
     "dropout"              : 0.5,
-    "arcface_s"            : 30.0,
-    "arcface_m"            : 0.50,
+    "arcface_s"            : 20.0,   # ← was 30.0
+    "arcface_m"            : 0.30,   # ← was 0.50
     "ce_weight"            : 0.8,
     "con_weight"           : 0.2,
     "temperature"          : 0.07,
-    "train_ratio"          : 1.0,   # use ALL CASIA-MS for training
-    "gallery_ratio"        : 0.3,   # unused now (smartphone split used instead)
-    "augment_factor"       : 2,
+    "n_casia_subjects"     : 190,
+    "n_casia_samples"      : 2776,
+    "augment_factor"       : 3,      # ← increase to 3 to compensate small dataset
     "random_seed"          : 42,
-    "save_every"           : 10,
+    "save_every"           : 50,
     "eval_every"           : 50,
     "num_workers"          : 4,
+    "eval_only"            : False,
 }
 # ==============================================================
 
