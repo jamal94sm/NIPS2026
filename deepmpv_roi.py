@@ -36,7 +36,7 @@ from tqdm import tqdm
 # PATHS  — edit these two lines
 # ============================================================
 SRC_ROOT = "/home/pai-ng/Jamal/MPDv2"       # source directory
-DST_ROOT = "/home/pai-ng/Jamal/MPDv2-ROI"   # output directory
+DST_ROOT = "/home/pai-ng/Jamal/MPDv2_deepmpv_roi"   # output directory
 ROI_SIZE = 224                               # output side length in pixels
 SAVE_FAILED = False  # ← Set to True to save fallback ROIs, False to skip them
 
