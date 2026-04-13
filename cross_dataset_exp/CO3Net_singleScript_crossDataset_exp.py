@@ -29,8 +29,8 @@ Architecture: CO3Net (unchanged from official repo)
 #  CONFIG  — edit this block only
 # ==============================================================
 CONFIG = {
-    "train_data"           : "MPDv2",     # "Smartphone" | "CASIA-MS" | "MPDv2"
-    "test_data"            : "MPDv2",  # "Smartphone" | "CASIA-MS" | "MPDv2"
+    "train_data"           : "Smartphone",     # "Smartphone" | "CASIA-MS" | "MPDv2"
+    "test_data"            : "CASIA-MS",  # "Smartphone" | "CASIA-MS" | "MPDv2"
     "data_root"            : "/home/pai-ng/Jamal/CASIA-MS-ROI",
     "test_data_root"       : "/home/pai-ng/Jamal/smartphone_data",
     "mpd_data_root"        : "/home/pai-ng/Jamal/MPDv2_mediapipe_roi",
