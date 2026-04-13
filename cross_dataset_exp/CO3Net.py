@@ -46,9 +46,8 @@ CONFIG = {
     "con_weight"      : 0.2,            # contrastive loss weight (weight2)
     "temperature"     : 0.07,           # SupConLoss temperature (CO3Net default)
     "embedding_dim"   : 2048,           # CO3Net fc1 output
-    "train_ratio"     : 0.60,
+    "train_ratio"     : 1.0,
     "gallery_ratio"   : 0.10,
-    "val_ratio"       : 0.10,
     "random_seed"     : 42,
     "save_every"      : 10,
     "eval_every"      : 50,
