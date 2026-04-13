@@ -54,6 +54,7 @@ CONFIG = {
     "eval_every"           : 50,
     "num_workers"          : 4,
     "eval_only"            : False,
+    "protocol"             : "open-set"
 }
 # ==============================================================
 
