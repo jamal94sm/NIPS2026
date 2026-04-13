@@ -759,6 +759,7 @@ def run_extraction(dir_source, dir_output):
 
 
 if __name__ == '__main__':
-    dir_source = "/home/pai-ng/Jamal/scanner_data"
-    dir_output = "/home/pai-ng/Jamal/scanner_data_eralign_roi"
+    dir_source = "/home/pai-ng/Jamal/MPDv2"
+    dir_output = "/home/pai-ng/Jamal/MPDv2_eralign_roi"
+
     run_extraction(dir_source, dir_output)
