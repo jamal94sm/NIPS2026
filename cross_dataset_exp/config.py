@@ -49,7 +49,7 @@ CONFIG = {
     "num_workers"          : 4,
     "eval_only"            : False,
 
-    # ── Triplet loss on embedding ────────────────────────────────────────
+    # ── Triplet loss on embedding in CO3Net ────────────────────────────────────────
     "use_triplet"    : True,    # True → add batch-hard triplet loss on 2048-d embedding
     "triplet_weight" : 0.10,    # weight in total loss
     "triplet_margin" : 0.25,    # margin for batch-hard triplet
