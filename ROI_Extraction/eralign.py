@@ -821,10 +821,11 @@ def _build_merged_cfg(primary_cfg, override_dict, img_shape):
     return merged
 
 
-def try_extract(gray_img, primary_cfg, fallback_cfgs, debug=False):
+def try_extract(gray_img, color_img, primary_cfg, fallback_cfgs, debug=False):
     """
-    Try primary config, then each fallback in order.
-    Returns (roi_img, config_label) or (None, None).
+    gray_img  — used for all processing (segmentation, keypoint detection)
+    color_img — used only for the final warp so the saved ROI is in colour
+    Returns (roi_bgr, config_label) or (None, None).
     """
     all_attempts = [("primary", primary_cfg)] + \
                    [(f"fallback_{i+1}", fb) for i, fb in enumerate(fallback_cfgs)]
@@ -848,7 +849,8 @@ def try_extract(gray_img, primary_cfg, fallback_cfgs, debug=False):
             kk  = np.array(get_roi.keypoints_localization)
             kkt = get_roi.rotate_keypoints(get_roi.norm_img,
                                            -get_roi.rotation_angle, kk)
-            roi, _, _ = extract_roi(kkt[0], kkt[1], gray_img,
+            # ── warp the COLOUR image using the keypoints found on gray ──
+            roi, _, _ = extract_roi(kkt[0], kkt[1], color_img,
                                     color=[0, 0, 255], thickness=2)
             return roi, cfg_label
 
@@ -856,7 +858,6 @@ def try_extract(gray_img, primary_cfg, fallback_cfgs, debug=False):
             print(f"      [{cfg_label}] localization returned False")
 
     return None, None
-
 
 # ──────────────────────────────────────────────────────────────
 #  Debug: save intermediate stages for a single image
@@ -962,22 +963,24 @@ def run_extraction(dir_source, dir_output, dataset_preset="MPDv2", debug=False):
         out_dir  = os.path.join(dir_output, rel_path)
         os.makedirs(out_dir, exist_ok=True)
 
-        gray_img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-        if gray_img is None:
+        color_img = cv2.imread(img_path, cv2.IMREAD_COLOR)   # BGR, 3-channel
+        if color_img is None:
             print(f"[{idx:05d}] SKIP  (unreadable) : {filename}")
             num_failed += 1
             continue
+        gray_img = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)  # gray for processing
 
         if debug:
             print(f"[{idx:05d}] Processing : {filename}  "
                   f"({gray_img.shape[1]}×{gray_img.shape[0]})")
 
-        roi, used = try_extract(gray_img, primary_cfg,
+        roi, used = try_extract(gray_img, color_img, primary_cfg,
                                 FALLBACK_CONFIGS, debug=debug)
 
         if roi is not None:
+            roi_rgb  = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)   # BGR → RGB
             out_path = os.path.join(out_dir, filename)
-            cv2.imwrite(out_path, roi)
+            cv2.imwrite(out_path, roi_rgb)
             usage_counts[used] = usage_counts.get(used, 0) + 1
             if debug or used != "primary":
                 print(f"[{idx:05d}] OK  [{used}]  →  {out_path}")
