@@ -29,7 +29,7 @@ CONFIG = {
     # ── Training ────────────────────────────────────────────────────────
     "img_side"             : 128,
     "batch_size"           : 256,
-    "num_epochs"           : 200,
+    "num_epochs"           : 100,
     "lr"                   : 0.001,
     "lr_step"              : 30,
     "lr_gamma"             : 0.6,
@@ -48,4 +48,9 @@ CONFIG = {
     "eval_every"           : 50,
     "num_workers"          : 4,
     "eval_only"            : False,
+
+    # ── Triplet loss on embedding ────────────────────────────────────────
+    "use_triplet"    : True,    # True → add batch-hard triplet loss on 2048-d embedding
+    "triplet_weight" : 0.10,    # weight in total loss
+    "triplet_margin" : 0.25,    # margin for batch-hard triplet
 }
