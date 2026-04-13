@@ -534,43 +534,51 @@ def parse_mpd_data(data_root, n_subjects=190, n_total_samples=2776, seed=42):
         identity = subject + "_" + hand_side
         id_dev[identity][device].append(os.path.join(data_root, fname))
 
-    # ── Step 2: keep only IDs that have >= min_per_device on EACH device ──
+    # ── Step 2: keep only IDs that have >= 7 on one device and >= 8 on the other ──
+    def _qualifies(devs):
+        h = len(devs.get("h", []))
+        m = len(devs.get("m", []))
+        # either arrangement: h≥8,m≥7  or  h≥7,m≥8
+        return (h >= 8 and m >= 7) or (h >= 7 and m >= 8)
+
     eligible = {
         ident: devs
         for ident, devs in id_dev.items()
-        if all(len(devs.get(d, [])) >= min_per_device for d in ("h", "m"))
+        if _qualifies(devs)
     }
 
-    print(f"  Eligible IDs (≥{min_per_device} images on each device): "
+    print(f"  Eligible IDs (≥7 on one device and ≥8 on the other): "
           f"{len(eligible)} / {len(id_dev)} total")
 
     if n_subjects > len(eligible):
         raise ValueError(
             f"Requested {n_subjects} IDs but only {len(eligible)} qualify "
-            f"(need ≥{min_per_device} images per device) in {data_root}.")
+            f"(need ≥7 on one device and ≥8 on the other) in {data_root}.")
 
     # ── Step 3: randomly select N eligible identities ─────────────────────
     selected = sorted(rng.sample(sorted(eligible.keys()), n_subjects))
 
-    # ── Step 4: sample exactly images_per_id split across h and m ─────────
-    # Split 15 into two parts that sum to 15, each between 7 and 8.
-    # Randomise which device gets the extra image per ID.
+    # ── Step 4: sample exactly 15 split across h and m ────────────────────
+    # Allocate 8 to whichever device has more images, 7 to the other.
+    # If both have equal counts, randomise.
     id2paths     = {}
     actual_total = 0
 
     for ident in selected:
-        devs = eligible[ident]
+        devs  = eligible[ident]
+        h_cnt = len(devs["h"])
+        m_cnt = len(devs["m"])
 
-        # Decide the split: one device gets 8, the other gets 7
-        if rng.random() < 0.5:
+        if h_cnt > m_cnt:
             alloc = {"h": 8, "m": 7}
-        else:
+        elif m_cnt > h_cnt:
             alloc = {"h": 7, "m": 8}
+        else:
+            alloc = {"h": 8, "m": 7} if rng.random() < 0.5 else {"h": 7, "m": 8}
 
         chosen = []
         for device, k in alloc.items():
-            available = devs[device]
-            chosen.extend(rng.sample(available, k))
+            chosen.extend(rng.sample(devs[device], k))
 
         id2paths[ident]  = chosen
         actual_total    += len(chosen)
