@@ -39,7 +39,7 @@ CONFIG = {
     "results_dir"          : "./rst_co3net_casia_ms",
     "img_side"             : 128,
     "batch_size"           : 1024,
-    "num_epochs"           : 100,
+    "num_epochs"           : 150,
     "lr"                   : 0.001,
     "lr_step"              : 500,
     "lr_gamma"             : 0.8,
