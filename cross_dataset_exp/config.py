@@ -6,8 +6,8 @@ Edit only this file to change datasets, hyperparameters, or paths.
 CONFIG = {
     # ── Dataset selection ───────────────────────────────────────────────
     # Choices: "CASIA-MS" | "Smartphone" | "MPDv2"
-    "train_data"           : "CASIA-MS",
-    "test_data"            : "CASIA-MS",
+    "train_data"           : "MPDv2",
+    "test_data"            : "MPDv2",
 
     # ── Dataset paths ───────────────────────────────────────────────────
     "casiams_data_root"    : "/home/pai-ng/Jamal/CASIA-MS-ROI",
