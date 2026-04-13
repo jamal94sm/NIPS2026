@@ -29,10 +29,12 @@ Architecture: CO3Net (unchanged from official repo)
 #  CONFIG  — edit this block only
 # ==============================================================
 CONFIG = {
-    "swap_datasets"        : False,
+    "train_data"           : "Smartphone",   # "Smartphone" | "CASIA-MS"
+    "test_data"            : "CASIA-MS",     # "Smartphone" | "CASIA-MS"
     "data_root"            : "/home/pai-ng/Jamal/CASIA-MS-ROI",
     "test_data_root"       : "/home/pai-ng/Jamal/smartphone_data",
-    "test_gallery_ratio"   : 0.3,
+    "train_subject_ratio"  : 0.70,   # 70% of subjects → train
+    "test_gallery_ratio"   : 0.30,   # 30% of test-subject images → gallery
     "results_dir"          : "./rst_co3net_casia_ms",
     "img_side"             : 128,
     "batch_size"           : 256,    # ← was 1024
@@ -650,7 +652,66 @@ def parse_casia_ms(data_root, n_subjects=190, n_total_samples=2776, seed=42):
           f"mean={sum(spec_counts)/len(spec_counts):.2f}")
 
     return id2paths
-  
+
+
+def get_parser(dataset_name, casia_root, smartphone_root,
+               n_subjects, n_samples, seed):
+    """
+    Returns (parse_fn, root_path) for the requested dataset name.
+    parse_fn() → id2paths dict.
+    """
+    name = dataset_name.strip().lower().replace("-", "").replace("_", "")
+    if name == "casiams":
+        return (lambda: parse_casia_ms(casia_root,
+                                       n_subjects=n_subjects,
+                                       n_total_samples=n_samples,
+                                       seed=seed),
+                casia_root)
+    elif name == "smartphone":
+        return (lambda: parse_smartphone_data(smartphone_root),
+                smartphone_root)
+    else:
+        raise ValueError(f"Unknown dataset name: '{dataset_name}'. "
+                         f"Use 'CASIA-MS' or 'Smartphone'.")
+
+
+def split_same_dataset(id2paths, train_subject_ratio=0.70,
+                       gallery_ratio=0.50, seed=42):
+    """
+    Used when train and test come from the same dataset.
+    - Splits subjects:  train_subject_ratio → train | rest → test
+    - Within test subjects: gallery_ratio of images → gallery | rest → probe
+    Returns (train_samples, gallery_samples, probe_samples,
+             train_label_map, test_label_map)
+    """
+    rng = random.Random(seed)
+    identities = sorted(id2paths.keys())
+    rng.shuffle(identities)
+
+    n_train = max(1, int(len(identities) * train_subject_ratio))
+    train_ids = identities[:n_train]
+    test_ids  = identities[n_train:]
+
+    train_label_map = {k: i for i, k in enumerate(train_ids)}
+    test_label_map  = {k: i for i, k in enumerate(test_ids)}
+
+    train_samples   = [(p, train_label_map[ident])
+                       for ident in train_ids
+                       for p in id2paths[ident]]
+
+    gallery_samples, probe_samples = [], []
+    for ident in test_ids:
+        paths = list(id2paths[ident])
+        rng.shuffle(paths)
+        n_gal = max(1, int(len(paths) * gallery_ratio))
+        for p in paths[:n_gal]:
+            gallery_samples.append((p, test_label_map[ident]))
+        for p in paths[n_gal:]:
+            probe_samples.append((p, test_label_map[ident]))
+
+    return (train_samples, gallery_samples, probe_samples,
+            train_label_map, test_label_map)
+
 
 # ────────── closed-set split ──────────
 def split_closed_set(id2paths, train_ratio=0.8, seed=42):
@@ -1058,101 +1119,116 @@ def plot_loss_acc(train_losses, val_losses,
 # ══════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════
-
 def main():
-    protocol          = CONFIG["protocol"]
-    data_root         = CONFIG["data_root"]
-    test_data_root    = CONFIG["test_data_root"]
-    test_gallery_ratio= CONFIG["test_gallery_ratio"]
-    results_dir       = CONFIG["results_dir"]
-    img_side          = CONFIG["img_side"]
-    batch_size        = CONFIG["batch_size"]
-    num_epochs        = CONFIG["num_epochs"]
-    lr                = CONFIG["lr"]
-    lr_step           = CONFIG["lr_step"]
-    lr_gamma          = CONFIG["lr_gamma"]
-    dropout           = CONFIG["dropout"]
-    arcface_s         = CONFIG["arcface_s"]
-    arcface_m         = CONFIG["arcface_m"]
-    ce_weight         = CONFIG["ce_weight"]
-    con_weight        = CONFIG["con_weight"]
-    temperature       = CONFIG["temperature"]
-    seed              = CONFIG["random_seed"]
-    save_every        = CONFIG["save_every"]
-    eval_every        = CONFIG["eval_every"]
-    nw                = CONFIG["num_workers"]
-    augment_factor    = CONFIG["augment_factor"]
-    swap              = CONFIG["swap_datasets"]
+    train_data          = CONFIG["train_data"]
+    test_data           = CONFIG["test_data"]
+    data_root           = CONFIG["data_root"]           # CASIA-MS path
+    test_data_root      = CONFIG["test_data_root"]      # Smartphone path
+    test_gallery_ratio  = CONFIG["test_gallery_ratio"]
+    train_subject_ratio = CONFIG["train_subject_ratio"]
+    results_dir         = CONFIG["results_dir"]
+    img_side            = CONFIG["img_side"]
+    batch_size          = CONFIG["batch_size"]
+    num_epochs          = CONFIG["num_epochs"]
+    lr                  = CONFIG["lr"]
+    lr_step             = CONFIG["lr_step"]
+    lr_gamma            = CONFIG["lr_gamma"]
+    dropout             = CONFIG["dropout"]
+    arcface_s           = CONFIG["arcface_s"]
+    arcface_m           = CONFIG["arcface_m"]
+    ce_weight           = CONFIG["ce_weight"]
+    con_weight          = CONFIG["con_weight"]
+    temperature         = CONFIG["temperature"]
+    seed                = CONFIG["random_seed"]
+    save_every          = CONFIG["save_every"]
+    eval_every          = CONFIG["eval_every"]
+    nw                  = CONFIG["num_workers"]
+    augment_factor      = CONFIG["augment_factor"]
+    n_subjects          = CONFIG["n_casia_subjects"]
+    n_samples           = CONFIG["n_casia_samples"]
+
+    same_dataset = (train_data.strip().lower().replace("-", "") ==
+                    test_data.strip().lower().replace("-", ""))
 
     os.makedirs(results_dir, exist_ok=True)
     rst_eval = os.path.join(results_dir, "eval")
     os.makedirs(rst_eval, exist_ok=True)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-    # ── assign dataset roles based on swap flag ───────────────────────────
-    if not swap:
-        train_label  = "CASIA-MS"
-        test_label   = "Smartphone"
-        train_parser = lambda: parse_casia_ms(
-                            data_root,
-                            n_subjects      = CONFIG["n_casia_subjects"],
-                            n_total_samples = CONFIG["n_casia_samples"],
-                            seed            = seed)
-        test_parser  = lambda: parse_smartphone_data(test_data_root)
-    else:
-        train_label  = "Smartphone"
-        test_label   = "CASIA-MS"
-        train_parser = lambda: parse_smartphone_data(test_data_root)  # ← test_data_root
-        test_parser  = lambda: parse_casia_ms(                        # ← data_root
-                            data_root,
-                            n_subjects      = CONFIG["n_casia_subjects"],
-                            n_total_samples = CONFIG["n_casia_samples"],
-                            seed            = seed)
-
     print(f"\n{'='*60}")
     print(f"  CO3Net Palmprint Recognition")
     print(f"  Device         : {device}")
-    print(f"  Train dataset  : {train_label}  ({data_root})")
-    print(f"  Test dataset   : {test_label}  ({test_data_root})")
+    print(f"  Train dataset  : {train_data}")
+    print(f"  Test dataset   : {test_data}")
+    if same_dataset:
+        print(f"  Mode           : same-dataset split  "
+              f"({int(train_subject_ratio*100)}% subjects train / "
+              f"{int((1-train_subject_ratio)*100)}% subjects test)")
     print(f"  Loss           : {ce_weight}*CE + {con_weight}*SupCon(τ={temperature})")
     print(f"  Augment factor : {augment_factor}x")
     print(f"{'='*60}\n")
 
-    # ── training set ──────────────────────────────────────────────────────
-    print(f"Scanning {train_label} (train) …")
-    train_id2paths = train_parser()
-    n_train_ids    = len(train_id2paths)
-    n_train_imgs   = sum(len(v) for v in train_id2paths.values())
-    print(f"  Found {n_train_ids} identities, {n_train_imgs} images.\n")
+    # ── get parsers ───────────────────────────────────────────────────────
+    train_parser, train_root = get_parser(train_data, data_root, test_data_root,
+                                          n_subjects, n_samples, seed)
+    test_parser,  test_root  = get_parser(test_data,  data_root, test_data_root,
+                                          n_subjects, n_samples, seed)
 
-    train_label_map = {k: i for i, k in enumerate(sorted(train_id2paths.keys()))}
-    train_samples   = [
-        (p, train_label_map[ident])
-        for ident, paths in train_id2paths.items()
-        for p in paths
-    ]
-    num_classes = len(train_label_map)
+    # ══════════════════════════════════════════════════════════════════════
+    #  CASE 1 — different datasets
+    # ══════════════════════════════════════════════════════════════════════
+    if not same_dataset:
+        # ── training set ─────────────────────────────────────────────────
+        print(f"Scanning {train_data} (train) …")
+        train_id2paths = train_parser()
+        n_train_ids    = len(train_id2paths)
+        n_train_imgs   = sum(len(v) for v in train_id2paths.values())
+        print(f"  Found {n_train_ids} identities, {n_train_imgs} images.\n")
 
+        train_label_map = {k: i for i, k in enumerate(sorted(train_id2paths.keys()))}
+        train_samples   = [(p, train_label_map[ident])
+                           for ident, paths in train_id2paths.items()
+                           for p in paths]
+        num_classes = len(train_label_map)
+
+        # ── test set ─────────────────────────────────────────────────────
+        print(f"Scanning {test_data} (test) …")
+        test_id2paths = test_parser()
+        n_test_ids    = len(test_id2paths)
+        n_test_imgs   = sum(len(v) for v in test_id2paths.values())
+        print(f"  Found {n_test_ids} identities, {n_test_imgs} images.\n")
+
+        gallery_samples, probe_samples, _ = split_smartphone_eval(
+            test_id2paths, gallery_ratio=test_gallery_ratio, seed=seed)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  CASE 2 — same dataset, split by subject
+    # ══════════════════════════════════════════════════════════════════════
+    else:
+        print(f"Scanning {train_data} (shared train+test) …")
+        all_id2paths = train_parser()           # parse once
+        n_total_ids  = len(all_id2paths)
+        n_total_imgs = sum(len(v) for v in all_id2paths.values())
+        print(f"  Found {n_total_ids} identities, {n_total_imgs} images.\n")
+
+        (train_samples, gallery_samples, probe_samples,
+         train_label_map, _) = split_same_dataset(
+            all_id2paths,
+            train_subject_ratio = train_subject_ratio,
+            gallery_ratio       = test_gallery_ratio,
+            seed                = seed)
+
+        num_classes  = len(train_label_map)
+        n_train_ids  = num_classes
+        n_train_imgs = len(train_samples)
+        n_test_ids   = n_total_ids - n_train_ids
+        n_test_imgs  = len(gallery_samples) + len(probe_samples)
+
+    # ── loaders (shared for both cases) ──────────────────────────────────
     train_dataset = CASIAMSDataset(train_samples, img_side=img_side,
                                    train=True, augment_factor=augment_factor)
     train_loader  = DataLoader(train_dataset, batch_size=batch_size,
                                shuffle=True, num_workers=nw, pin_memory=True)
-
-    print(f"  Train samples  : {len(train_samples)} "
-          f"(+aug → {len(train_samples) * augment_factor})")
-    print(f"  Num classes    : {num_classes}\n")
-
-    # ── test set (gallery + probe) ────────────────────────────────────────
-    print(f"Scanning {test_label} (test) …")
-    test_id2paths = test_parser()
-    n_test_ids    = len(test_id2paths)
-    n_test_imgs   = sum(len(v) for v in test_id2paths.values())
-    print(f"  Found {n_test_ids} identities, {n_test_imgs} images.\n")
-
-    gallery_samples, probe_samples, _ = split_smartphone_eval(
-        test_id2paths, gallery_ratio=test_gallery_ratio, seed=seed)
-
     gallery_loader = DataLoader(
         CASIAMSDatasetSingle(gallery_samples, img_side=img_side),
         batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
@@ -1160,8 +1236,11 @@ def main():
         CASIAMSDatasetSingle(probe_samples, img_side=img_side),
         batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
 
-    print(f"  Gallery        : {len(gallery_samples)} samples")
-    print(f"  Probe          : {len(probe_samples)} samples\n")
+    print(f"  Train subjects : {n_train_ids}  |  "
+          f"Train images : {n_train_imgs} (+aug → {n_train_imgs*augment_factor})")
+    print(f"  Test subjects  : {n_test_ids}  |  "
+          f"Gallery : {len(gallery_samples)}  |  Probe : {len(probe_samples)}")
+    print(f"  Num classes    : {num_classes}\n")
 
     # ── model ─────────────────────────────────────────────────────────────
     print(f"Building CO3Net — num_classes={num_classes} …")
@@ -1171,6 +1250,20 @@ def main():
     if torch.cuda.device_count() > 1:
         print(f"  Using {torch.cuda.device_count()} GPUs (DataParallel)")
         net = DataParallel(net)
+
+    # ── resume from checkpoint if one exists ──────────────────────────────
+    for ckpt_path in [
+        os.path.join(results_dir, "net_params_best_eer.pth"),
+        os.path.join(results_dir, "net_params_best.pth"),
+        os.path.join(results_dir, "net_params.pth"),
+    ]:
+        if os.path.exists(ckpt_path):
+            _net = net.module if isinstance(net, DataParallel) else net
+            _net.load_state_dict(torch.load(ckpt_path, map_location=device))
+            print(f"  Resumed from checkpoint : {ckpt_path}\n")
+            break
+    else:
+        print(f"  No checkpoint found — training from scratch.\n")
 
     criterion     = nn.CrossEntropyLoss()
     con_criterion = SupConLoss(temperature=temperature, base_temperature=temperature)
@@ -1184,68 +1277,69 @@ def main():
     last_eer     = float("nan")
     last_rank1   = float("nan")
 
-    print(f"\nStarting training for {num_epochs} epochs …")
+    print(f"Starting training for {num_epochs} epochs …")
     print(f"  EER / Rank-1 evaluated every {eval_every} epochs.\n")
 
-    for epoch in range(num_epochs):
-        t_loss, t_acc = run_one_epoch(
-            epoch, net, train_loader, criterion, con_criterion,
-            optimizer, device, "training",
-            ce_weight=ce_weight, con_weight=con_weight)
-        scheduler.step()
+    if CONFIG.get("eval_only", False):
+        print("  eval_only=True — skipping training.\n")
+    else:
+        for epoch in range(num_epochs):
+            t_loss, t_acc = run_one_epoch(
+                epoch, net, train_loader, criterion, con_criterion,
+                optimizer, device, "training",
+                ce_weight=ce_weight, con_weight=con_weight)
+            scheduler.step()
 
-        train_losses.append(t_loss)
-        train_accs.append(t_acc)
+            train_losses.append(t_loss)
+            train_accs.append(t_acc)
 
-        _net = net.module if isinstance(net, DataParallel) else net
+            _net = net.module if isinstance(net, DataParallel) else net
 
-        # ── periodic evaluation ───────────────────────────────────────────
-        if epoch % eval_every == 0 or epoch == num_epochs - 1:
-            tag = f"ep{epoch:04d}_{test_label.replace('-', '')}"
-            cur_eer, cur_aggr_eer, cur_rank1 = evaluate(
-                _net, probe_loader, gallery_loader,
-                device, out_dir=rst_eval, tag=tag)
-            last_eer   = cur_eer
-            last_rank1 = cur_rank1
+            # ── periodic evaluation ───────────────────────────────────────
+            if epoch % eval_every == 0 or epoch == num_epochs - 1:
+                tag = f"ep{epoch:04d}_{test_data.replace('-','')}"
+                cur_eer, cur_aggr_eer, cur_rank1 = evaluate(
+                    _net, probe_loader, gallery_loader,
+                    device, out_dir=rst_eval, tag=tag)
+                last_eer   = cur_eer
+                last_rank1 = cur_rank1
 
-            if cur_eer < best_eer:
-                best_eer = cur_eer
+                if cur_eer < best_eer:
+                    best_eer = cur_eer
+                    torch.save(_net.state_dict(),
+                               os.path.join(results_dir, "net_params_best_eer.pth"))
+                    print(f"  *** New best EER: {best_eer*100:.4f}% ***")
+
+            # ── periodic console print ────────────────────────────────────
+            if epoch % 10 == 0 or epoch == num_epochs - 1:
+                ts        = time.strftime("%H:%M:%S")
+                eer_str   = f"{last_eer*100:.4f}%"  if not math.isnan(last_eer)   else "N/A"
+                rank1_str = f"{last_rank1:.2f}%"     if not math.isnan(last_rank1) else "N/A"
+                print(
+                    f"[{ts}] ep {epoch:04d} | "
+                    f"loss={t_loss:.5f} | cls-acc={t_acc:.2f}% | "
+                    f"EER={eer_str}  Rank-1={rank1_str}")
+
+            # ── periodic checkpoint ───────────────────────────────────────
+            if epoch % save_every == 0 or epoch == num_epochs - 1:
                 torch.save(_net.state_dict(),
-                           os.path.join(results_dir, "net_params_best_eer.pth"))
-                print(f"  *** New best EER: {best_eer*100:.4f}% ***")
-
-        # ── periodic console print ────────────────────────────────────────
-        if epoch % 10 == 0 or epoch == num_epochs - 1:
-            ts        = time.strftime("%H:%M:%S")
-            eer_str   = f"{last_eer*100:.4f}%"  if not math.isnan(last_eer)   else "N/A"
-            rank1_str = f"{last_rank1:.2f}%"     if not math.isnan(last_rank1) else "N/A"
-            print(
-                f"[{ts}] ep {epoch:04d} | "
-                f"loss={t_loss:.5f} | cls-acc={t_acc:.2f}% | "
-                f"EER={eer_str}  Rank-1={rank1_str}")
-
-        # ── periodic checkpoint + training curves ─────────────────────────
-        if epoch % save_every == 0 or epoch == num_epochs - 1:
-            torch.save(_net.state_dict(),
-                       os.path.join(results_dir, "net_params.pth"))
-            try:
-                fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-                axes[0].plot(train_losses, 'b')
-                axes[0].set_title("Train Loss")
-                axes[0].set_xlabel("epoch")
-                axes[0].grid(True)
-                axes[1].plot(train_accs, 'b')
-                axes[1].set_title("Train Acc (%)")
-                axes[1].set_xlabel("epoch")
-                axes[1].grid(True)
-                fig.tight_layout()
-                fig.savefig(os.path.join(results_dir, "train_curves.png"))
-                plt.close(fig)
-            except Exception:
-                pass
+                           os.path.join(results_dir, "net_params.pth"))
+                try:
+                    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+                    axes[0].plot(train_losses, 'b')
+                    axes[0].set_title("Train Loss")
+                    axes[0].set_xlabel("epoch"); axes[0].grid(True)
+                    axes[1].plot(train_accs, 'b')
+                    axes[1].set_title("Train Acc (%)")
+                    axes[1].set_xlabel("epoch"); axes[1].grid(True)
+                    fig.tight_layout()
+                    fig.savefig(os.path.join(results_dir, "train_curves.png"))
+                    plt.close(fig)
+                except Exception:
+                    pass
 
     # ── final evaluation ──────────────────────────────────────────────────
-    print(f"\n=== Final evaluation on {test_label} (best EER model) ===")
+    print(f"\n=== Final evaluation on {test_data} (best EER model) ===")
     best_model_path = os.path.join(results_dir, "net_params_best_eer.pth")
     if not os.path.exists(best_model_path):
         best_model_path = os.path.join(results_dir, "net_params.pth")
@@ -1253,19 +1347,19 @@ def main():
     eval_net = net.module if isinstance(net, DataParallel) else net
     eval_net.load_state_dict(torch.load(best_model_path, map_location=device))
 
-    saved_name = f"CO3Net_{train_label.replace('-', '')}_train.pth"
-    torch.save(eval_net.state_dict(),
-               os.path.join(results_dir, saved_name))
+    saved_name = (f"CO3Net_train{train_data.replace('-','').replace(' ','')}"
+                  f"_test{test_data.replace('-','').replace(' ','')}.pth")
+    torch.save(eval_net.state_dict(), os.path.join(results_dir, saved_name))
     print(f"  Model saved as {saved_name}")
 
     final_eer, final_aggr_eer, final_rank1 = evaluate(
         eval_net, probe_loader, gallery_loader,
         device, out_dir=rst_eval,
-        tag=f"FINAL_{test_label.replace('-', '')}")
+        tag=f"FINAL_{test_data.replace('-','')}")
 
     print(f"\n{'='*60}")
-    print(f"  Train set            : {train_label} ({n_train_ids} IDs)")
-    print(f"  Test set             : {test_label}  ({n_test_ids} IDs)")
+    print(f"  Train          : {train_data} ({n_train_ids} subjects, {n_train_imgs} imgs)")
+    print(f"  Test           : {test_data}  ({n_test_ids} subjects, {n_test_imgs} imgs)")
     print(f"  FINAL Pairwise EER   : {final_eer*100:.4f}%")
     print(f"  FINAL Aggregated EER : {final_aggr_eer*100:.4f}%")
     print(f"  FINAL Rank-1         : {final_rank1:.3f}%")
@@ -1273,19 +1367,20 @@ def main():
     print(f"{'='*60}\n")
 
     with open(os.path.join(results_dir, "summary.txt"), "w") as f:
-        f.write(f"Train set          : {train_label}\n")
-        f.write(f"Train IDs          : {n_train_ids}\n")
+        f.write(f"Train dataset      : {train_data}\n")
+        f.write(f"Train subjects     : {n_train_ids}\n")
         f.write(f"Train images       : {n_train_imgs}\n")
         f.write(f"Augment factor     : {augment_factor}x\n")
         f.write(f"Num classes        : {num_classes}\n")
-        f.write(f"Test set           : {test_label}\n")
-        f.write(f"Test IDs           : {n_test_ids}\n")
+        f.write(f"Test dataset       : {test_data}\n")
+        f.write(f"Test subjects      : {n_test_ids}\n")
         f.write(f"Test images        : {n_test_imgs}\n")
         f.write(f"Gallery samples    : {len(gallery_samples)}\n")
         f.write(f"Probe samples      : {len(probe_samples)}\n")
         f.write(f"Final Pairwise EER : {final_eer*100:.6f}%\n")
         f.write(f"Final Aggreg. EER  : {final_aggr_eer*100:.6f}%\n")
         f.write(f"Final Rank-1       : {final_rank1:.3f}%\n")
+
 
 if __name__ == "__main__":
     main()
