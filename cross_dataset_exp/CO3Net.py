@@ -31,6 +31,8 @@ Architecture: CO3Net (unchanged from official repo)
 CONFIG = {
     # --- existing keys unchanged ---
     "protocol"             : "open-set",
+    "n_casia_subjects"     : 190,    # N — how many CASIA-MS identities to use
+    "n_casia_samples"      : 2776,   # S — total images across all selected identities
     "data_root"            : "/home/pai-ng/Jamal/CASIA-MS-ROI",   # train only
     "test_data_root"       : "/home/pai-ng/Jamal/smartphone_data", # test only
     "test_gallery_ratio"   : 0.3,   # fraction of each identity's samples → gallery
@@ -49,7 +51,7 @@ CONFIG = {
     "temperature"          : 0.07,
     "train_ratio"          : 1.0,   # use ALL CASIA-MS for training
     "gallery_ratio"        : 0.3,   # unused now (smartphone split used instead)
-    "augment_factor"       : 3,
+    "augment_factor"       : 2,
     "random_seed"          : 42,
     "save_every"           : 10,
     "eval_every"           : 50,
@@ -543,43 +545,113 @@ def split_smartphone_eval(id2paths, gallery_ratio=0.3, seed=42):
             probe_samples.append((p, idx))
 
     return gallery_samples, probe_samples, label_map
-  
-def parse_casia_ms(data_root, iterations_per_spectrum=3, seed=42):
-    """
-    Scan CASIA-MS-ROI folder.  Filename format:
-        {subjectID}_{handSide}_{spectrum}_{iteration}.jpg
-    Identity key = subjectID + "_" + handSide  (e.g. "025_l").
 
-    For every (identity, spectrum) group, keeps exactly
-    `iterations_per_spectrum` randomly chosen iterations.
-    With 6 spectra this yields 6 × 3 = 18 samples per identity.
+
+def parse_casia_ms(data_root, n_subjects=190, n_total_samples=2776, seed=42):
+    """
+    Select n_subjects identities from CASIA-MS with near-uniform sample counts.
+
+    Distribution logic (example: N=190, S=2776):
+      - target per ID  : S // N = 14,  remainder = S % N = 116
+        → 116 IDs get 15 images, 74 IDs get 14 images
+      - target per spectrum (6 spectra, e.g. target=14):
+          base_per_spectrum = 14 // 6 = 2, remainder = 14 % 6 = 2
+        → 2 spectra get 3 images, 4 spectra get 2 images  (total = 14)
+      - which IDs / spectra get the extra image is randomised via seed.
 
     Returns dict  {identity_key: [path1, path2, …]}
     """
     rng = random.Random(seed)
 
-    # group files by (identity, spectrum)
-    id_spectrum_paths = defaultdict(list)
+    # ── Step 1: index all files by (identity, spectrum) ──────────────────
+    # id_spec[(identity, spectrum)] = [path, …]
+    id_spec = defaultdict(lambda: defaultdict(list))
+
     for fname in sorted(os.listdir(data_root)):
         if not fname.lower().endswith((".jpg", ".jpeg", ".bmp", ".png")):
             continue
-        stem  = os.path.splitext(fname)[0]      # "025_l_940_04"
+        stem  = os.path.splitext(fname)[0]          # "025_l_940_04"
         parts = stem.split("_")
         if len(parts) < 4:
             continue
-        identity = parts[0] + "_" + parts[1]    # "025_l"
-        spectrum = parts[2]                      # "940"
-        id_spectrum_paths[(identity, spectrum)].append(
+        identity = parts[0] + "_" + parts[1]        # "025_l"
+        spectrum = parts[2]                          # "940"
+        id_spec[identity][spectrum].append(
             os.path.join(data_root, fname))
 
-    # sample up to `iterations_per_spectrum` per (identity, spectrum) group
-    id2paths = defaultdict(list)
-    for (identity, spectrum), paths in id_spectrum_paths.items():
-        chosen = rng.sample(paths, min(iterations_per_spectrum, len(paths)))
-        id2paths[identity].extend(chosen)
+    all_identities = sorted(id_spec.keys())
+    if n_subjects > len(all_identities):
+        raise ValueError(
+            f"Requested {n_subjects} subjects but only "
+            f"{len(all_identities)} available in {data_root}.")
 
-    return dict(id2paths)
+    # ── Step 2: randomly select N identities ─────────────────────────────
+    selected = sorted(rng.sample(all_identities, n_subjects))
 
+    # ── Step 3: assign per-ID sample targets ─────────────────────────────
+    # base IDs get (S // N) images; the first `remainder` IDs get one extra
+    base_per_id   = n_total_samples // n_subjects   # e.g. 14
+    remainder_ids = n_total_samples %  n_subjects   # e.g. 116
+
+    id_list = list(selected)
+    rng.shuffle(id_list)                            # randomise who gets the extra
+    id_target = {
+        ident: base_per_id + (1 if i < remainder_ids else 0)
+        for i, ident in enumerate(id_list)
+    }
+
+    # ── Step 4: for each identity distribute target across spectra ────────
+    id2paths = {}
+    actual_total = 0
+
+    for ident in selected:
+        target   = id_target[ident]
+        spectra  = sorted(id_spec[ident].keys())
+        n_spec   = len(spectra)
+
+        if n_spec == 0:
+            id2paths[ident] = []
+            continue
+
+        # base images per spectrum; first `rem_spec` spectra get one extra
+        base_per_spec = target // n_spec            # e.g. 2
+        rem_spec      = target %  n_spec            # e.g. 2
+
+        spec_list = list(spectra)
+        rng.shuffle(spec_list)                      # randomise which spectra get extra
+
+        chosen = []
+        for j, spectrum in enumerate(spec_list):
+            k         = base_per_spec + (1 if j < rem_spec else 0)
+            available = id_spec[ident][spectrum]
+            k         = min(k, len(available))      # guard: never exceed available
+            chosen.extend(rng.sample(available, k))
+
+        id2paths[ident] = chosen
+        actual_total   += len(chosen)
+
+    # ── Step 5: summary ───────────────────────────────────────────────────
+    counts      = [len(v) for v in id2paths.values()]
+    spec_counts = []
+    for ident in selected:
+        for spectrum, paths in id_spec[ident].items():
+            # how many were actually chosen from this spectrum
+            chosen_from_spec = [
+                p for p in id2paths[ident]
+                if f"_{spectrum}_" in os.path.basename(p)
+            ]
+            spec_counts.append(len(chosen_from_spec))
+
+    print(f"  Selected  : {len(id2paths)} identities")
+    print(f"  Total     : {actual_total} images  (target={n_total_samples}, "
+          f"diff={actual_total - n_total_samples})")
+    print(f"  Per-ID    : min={min(counts)}  max={max(counts)}  "
+          f"mean={sum(counts)/len(counts):.2f}")
+    print(f"  Per-spec  : min={min(spec_counts)}  max={max(spec_counts)}  "
+          f"mean={sum(spec_counts)/len(spec_counts):.2f}")
+
+    return id2paths
+  
 
 # ────────── closed-set split ──────────
 def split_closed_set(id2paths, train_ratio=0.8, seed=42):
@@ -1011,33 +1083,54 @@ def main():
     eval_every        = CONFIG["eval_every"]
     nw                = CONFIG["num_workers"]
     augment_factor    = CONFIG["augment_factor"]
+    swap              = CONFIG["swap_datasets"]
 
     os.makedirs(results_dir, exist_ok=True)
     rst_eval = os.path.join(results_dir, "eval")
     os.makedirs(rst_eval, exist_ok=True)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    # ── assign dataset roles based on swap flag ───────────────────────────
+    if not swap:
+        train_label  = "CASIA-MS"
+        test_label   = "Smartphone"
+        train_parser = lambda: parse_casia_ms(
+                        data_root,
+                        n_subjects      = CONFIG["n_casia_subjects"],
+                        n_total_samples = CONFIG["n_casia_samples"],
+                        seed            = seed)
+        test_parser  = lambda: parse_smartphone_data(test_data_root)
+    else:
+        train_label  = "Smartphone"
+        test_label   = "CASIA-MS"
+        train_parser = lambda: parse_smartphone_data(data_root)
+        test_parser  = lambda: parse_casia_ms(
+                        test_data_root,
+                        n_subjects      = CONFIG["n_casia_subjects"],
+                        n_total_samples = CONFIG["n_casia_samples"],
+                        seed            = seed)
+
     print(f"\n{'='*60}")
-    print(f"  CO3Net — Train: CASIA-MS  |  Test: Smartphone")
+    print(f"  CO3Net Palmprint Recognition")
     print(f"  Device         : {device}")
-    print(f"  Train data     : {data_root}")
-    print(f"  Test data      : {test_data_root}")
+    print(f"  Train dataset  : {train_label}  ({data_root})")
+    print(f"  Test dataset   : {test_label}  ({test_data_root})")
     print(f"  Loss           : {ce_weight}*CE + {con_weight}*SupCon(τ={temperature})")
     print(f"  Augment factor : {augment_factor}x")
     print(f"{'='*60}\n")
 
-    # ── CASIA-MS: training only (use all samples) ─────────────────────────
-    print("Scanning CASIA-MS (train) …")
-    casia_id2paths = parse_casia_ms(data_root, iterations_per_spectrum=3, seed=seed)
-    n_casia_ids  = len(casia_id2paths)
-    n_casia_imgs = sum(len(v) for v in casia_id2paths.values())
-    print(f"  Found {n_casia_ids} identities, {n_casia_imgs} images.\n")
+    # ── training set ──────────────────────────────────────────────────────
+    print(f"Scanning {train_label} (train) …")
+    train_id2paths = train_parser()
+    n_train_ids    = len(train_id2paths)
+    n_train_imgs   = sum(len(v) for v in train_id2paths.values())
+    print(f"  Found {n_train_ids} identities, {n_train_imgs} images.\n")
 
-    # Assign a label to every CASIA-MS identity
-    train_label_map = {k: i for i, k in enumerate(sorted(casia_id2paths.keys()))}
+    train_label_map = {k: i for i, k in enumerate(sorted(train_id2paths.keys()))}
     train_samples   = [
         (p, train_label_map[ident])
-        for ident, paths in casia_id2paths.items()
+        for ident, paths in train_id2paths.items()
         for p in paths
     ]
     num_classes = len(train_label_map)
@@ -1048,18 +1141,18 @@ def main():
                                shuffle=True, num_workers=nw, pin_memory=True)
 
     print(f"  Train samples  : {len(train_samples)} "
-          f"(+aug → {len(train_samples)*augment_factor})")
+          f"(+aug → {len(train_samples) * augment_factor})")
     print(f"  Num classes    : {num_classes}\n")
 
-    # ── Smartphone: test only (gallery + probe) ───────────────────────────
-    print("Scanning smartphone data (test) …")
-    phone_id2paths = parse_smartphone_data(test_data_root)
-    n_phone_ids  = len(phone_id2paths)
-    n_phone_imgs = sum(len(v) for v in phone_id2paths.values())
-    print(f"  Found {n_phone_ids} identities, {n_phone_imgs} images.\n")
+    # ── test set (gallery + probe) ────────────────────────────────────────
+    print(f"Scanning {test_label} (test) …")
+    test_id2paths = test_parser()
+    n_test_ids    = len(test_id2paths)
+    n_test_imgs   = sum(len(v) for v in test_id2paths.values())
+    print(f"  Found {n_test_ids} identities, {n_test_imgs} images.\n")
 
-    gallery_samples, probe_samples, phone_label_map = split_smartphone_eval(
-        phone_id2paths, gallery_ratio=test_gallery_ratio, seed=seed)
+    gallery_samples, probe_samples, _ = split_smartphone_eval(
+        test_id2paths, gallery_ratio=test_gallery_ratio, seed=seed)
 
     gallery_loader = DataLoader(
         CASIAMSDatasetSingle(gallery_samples, img_side=img_side),
@@ -1107,9 +1200,9 @@ def main():
 
         _net = net.module if isinstance(net, DataParallel) else net
 
-        # ── periodic evaluation on smartphone data ────────────────────────
+        # ── periodic evaluation ───────────────────────────────────────────
         if epoch % eval_every == 0 or epoch == num_epochs - 1:
-            tag = f"ep{epoch:04d}_smartphone"
+            tag = f"ep{epoch:04d}_{test_label.replace('-', '')}"
             cur_eer, cur_aggr_eer, cur_rank1 = evaluate(
                 _net, probe_loader, gallery_loader,
                 device, out_dir=rst_eval, tag=tag)
@@ -1138,10 +1231,14 @@ def main():
                        os.path.join(results_dir, "net_params.pth"))
             try:
                 fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-                axes[0].plot(train_losses, 'b'); axes[0].set_title("Train Loss")
-                axes[0].set_xlabel("epoch"); axes[0].grid(True)
-                axes[1].plot(train_accs,   'b'); axes[1].set_title("Train Acc (%)")
-                axes[1].set_xlabel("epoch"); axes[1].grid(True)
+                axes[0].plot(train_losses, 'b')
+                axes[0].set_title("Train Loss")
+                axes[0].set_xlabel("epoch")
+                axes[0].grid(True)
+                axes[1].plot(train_accs, 'b')
+                axes[1].set_title("Train Acc (%)")
+                axes[1].set_xlabel("epoch")
+                axes[1].grid(True)
                 fig.tight_layout()
                 fig.savefig(os.path.join(results_dir, "train_curves.png"))
                 plt.close(fig)
@@ -1149,7 +1246,7 @@ def main():
                 pass
 
     # ── final evaluation ──────────────────────────────────────────────────
-    print("\n=== Final evaluation on smartphone data (best EER model) ===")
+    print(f"\n=== Final evaluation on {test_label} (best EER model) ===")
     best_model_path = os.path.join(results_dir, "net_params_best_eer.pth")
     if not os.path.exists(best_model_path):
         best_model_path = os.path.join(results_dir, "net_params.pth")
@@ -1157,17 +1254,19 @@ def main():
     eval_net = net.module if isinstance(net, DataParallel) else net
     eval_net.load_state_dict(torch.load(best_model_path, map_location=device))
 
+    saved_name = f"CO3Net_{train_label.replace('-', '')}_train.pth"
     torch.save(eval_net.state_dict(),
-               os.path.join(results_dir, "CO3Net_CASIA-MS.pth"))
-    print("  Model saved as CO3Net_CASIA-MS.pth")
+               os.path.join(results_dir, saved_name))
+    print(f"  Model saved as {saved_name}")
 
     final_eer, final_aggr_eer, final_rank1 = evaluate(
         eval_net, probe_loader, gallery_loader,
-        device, out_dir=rst_eval, tag="FINAL_smartphone")
+        device, out_dir=rst_eval,
+        tag=f"FINAL_{test_label.replace('-', '')}")
 
     print(f"\n{'='*60}")
-    print(f"  Train set            : CASIA-MS ({n_casia_ids} IDs)")
-    print(f"  Test set             : Smartphone ({n_phone_ids} IDs)")
+    print(f"  Train set            : {train_label} ({n_train_ids} IDs)")
+    print(f"  Test set             : {test_label}  ({n_test_ids} IDs)")
     print(f"  FINAL Pairwise EER   : {final_eer*100:.4f}%")
     print(f"  FINAL Aggregated EER : {final_aggr_eer*100:.4f}%")
     print(f"  FINAL Rank-1         : {final_rank1:.3f}%")
@@ -1175,15 +1274,16 @@ def main():
     print(f"{'='*60}\n")
 
     with open(os.path.join(results_dir, "summary.txt"), "w") as f:
-        f.write(f"Train set       : CASIA-MS\n")
-        f.write(f"Train IDs       : {n_casia_ids}\n")
-        f.write(f"Train images    : {n_casia_imgs}\n")
-        f.write(f"Augment factor  : {augment_factor}x\n")
-        f.write(f"Test set        : Smartphone\n")
-        f.write(f"Test IDs        : {n_phone_ids}\n")
-        f.write(f"Test images     : {n_phone_imgs}\n")
-        f.write(f"Gallery samples : {len(gallery_samples)}\n")
-        f.write(f"Probe samples   : {len(probe_samples)}\n")
+        f.write(f"Train set          : {train_label}\n")
+        f.write(f"Train IDs          : {n_train_ids}\n")
+        f.write(f"Train images       : {n_train_imgs}\n")
+        f.write(f"Augment factor     : {augment_factor}x\n")
+        f.write(f"Num classes        : {num_classes}\n")
+        f.write(f"Test set           : {test_label}\n")
+        f.write(f"Test IDs           : {n_test_ids}\n")
+        f.write(f"Test images        : {n_test_imgs}\n")
+        f.write(f"Gallery samples    : {len(gallery_samples)}\n")
+        f.write(f"Probe samples      : {len(probe_samples)}\n")
         f.write(f"Final Pairwise EER : {final_eer*100:.6f}%\n")
         f.write(f"Final Aggreg. EER  : {final_aggr_eer*100:.6f}%\n")
         f.write(f"Final Rank-1       : {final_rank1:.3f}%\n")
