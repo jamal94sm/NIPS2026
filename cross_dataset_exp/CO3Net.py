@@ -29,29 +29,31 @@ Architecture: CO3Net (unchanged from official repo)
 #  CONFIG  — edit this block only
 # ==============================================================
 CONFIG = {
-    "protocol"        : "open-set",   # "closed-set" | "open-set"
-    "data_root"       : "/home/pai-ng/Jamal/CASIA-MS-ROI",
-    "augment_factor"  : 3,   # K — each training sample appears K times per epoch
-    "results_dir"     : "./rst_co3net_casia_ms",
-    "img_side"        : 128,            # input image size (128×128 → fc=17328)
-    "batch_size"      : 1024,           # CO3Net default
-    "num_epochs"      : 100,            # CO3Net default is 3000; adjust as needed
-    "lr"              : 0.001,          # CO3Net default
-    "lr_step"         : 500,            # CO3Net default (redstep)
-    "lr_gamma"        : 0.8,            # CO3Net default
-    "dropout"         : 0.5,            # CO3Net default
-    "arcface_s"       : 30.0,
-    "arcface_m"       : 0.50,
-    "ce_weight"       : 0.8,            # cross-entropy loss weight (weight1)
-    "con_weight"      : 0.2,            # contrastive loss weight (weight2)
-    "temperature"     : 0.07,           # SupConLoss temperature (CO3Net default)
-    "embedding_dim"   : 2048,           # CO3Net fc1 output
-    "train_ratio"     : 1.0,
-    "gallery_ratio"   : 0.10,
-    "random_seed"     : 42,
-    "save_every"      : 10,
-    "eval_every"      : 50,
-    "num_workers"     : 4,
+    # --- existing keys unchanged ---
+    "protocol"             : "open-set",
+    "data_root"            : "/home/pai-ng/Jamal/CASIA-MS-ROI",   # train only
+    "test_data_root"       : "/home/pai-ng/Jamal/smartphone_data", # test only
+    "test_gallery_ratio"   : 0.3,   # fraction of each identity's samples → gallery
+    "results_dir"          : "./rst_co3net_casia_ms",
+    "img_side"             : 128,
+    "batch_size"           : 1024,
+    "num_epochs"           : 100,
+    "lr"                   : 0.001,
+    "lr_step"              : 500,
+    "lr_gamma"             : 0.8,
+    "dropout"              : 0.5,
+    "arcface_s"            : 30.0,
+    "arcface_m"            : 0.50,
+    "ce_weight"            : 0.8,
+    "con_weight"           : 0.2,
+    "temperature"          : 0.07,
+    "train_ratio"          : 1.0,   # use ALL CASIA-MS for training
+    "gallery_ratio"        : 0.3,   # unused now (smartphone split used instead)
+    "augment_factor"       : 3,
+    "random_seed"          : 42,
+    "save_every"           : 10,
+    "eval_every"           : 50,
+    "num_workers"          : 4,
 }
 # ==============================================================
 
@@ -493,7 +495,55 @@ class NormSingleROI(object):
 # ══════════════════════════════════════════════════════════════
 #  DATASET  — paired & single, for CASIA-MS-ROI
 # ══════════════════════════════════════════════════════════════
+def parse_smartphone_data(data_root):
+    """
+    Scan smartphone_data folder.
+    Structure : {data_root}/{ID}/roi_square/{ID}_{hand}_{condition}.jpg
+    Identity key = "{ID}_{hand}"  e.g. "1_left", "1_right"
+    Returns dict  {identity_key: [path1, path2, …]}
+    """
+    id2paths = defaultdict(list)
+    for subject_id in sorted(os.listdir(data_root)):
+        roi_dir = os.path.join(data_root, subject_id, "roi_square")
+        if not os.path.isdir(roi_dir):
+            continue
+        for fname in sorted(os.listdir(roi_dir)):
+            if not fname.lower().endswith((".jpg", ".jpeg", ".bmp", ".png")):
+                continue
+            stem  = os.path.splitext(fname)[0]      # "1_left_jf"
+            parts = stem.split("_")
+            if len(parts) < 3:
+                continue
+            # parts[0] = ID, parts[1] = hand (left/right)
+            identity = parts[0] + "_" + parts[1]    # "1_left"
+            id2paths[identity].append(os.path.join(roi_dir, fname))
+    return dict(id2paths)
 
+
+def split_smartphone_eval(id2paths, gallery_ratio=0.3, seed=42):
+    """
+    Split smartphone identities into gallery and probe.
+    Each identity keeps its own label (0 … N-1).
+    Returns (gallery_samples, probe_samples, label_map)
+    where each sample is (path, label).
+    """
+    rng = random.Random(seed)
+    label_map       = {}
+    gallery_samples = []
+    probe_samples   = []
+
+    for idx, identity in enumerate(sorted(id2paths.keys())):
+        label_map[identity] = idx
+        paths = list(id2paths[identity])
+        rng.shuffle(paths)
+        n_gallery = max(1, int(len(paths) * gallery_ratio))
+        for p in paths[:n_gallery]:
+            gallery_samples.append((p, idx))
+        for p in paths[n_gallery:]:
+            probe_samples.append((p, idx))
+
+    return gallery_samples, probe_samples, label_map
+  
 def parse_casia_ms(data_root, iterations_per_spectrum=3, seed=42):
     """
     Scan CASIA-MS-ROI folder.  Filename format:
@@ -939,30 +989,28 @@ def plot_loss_acc(train_losses, val_losses,
 # ══════════════════════════════════════════════════════════════
 
 def main():
-    protocol       = CONFIG["protocol"]
-    data_root      = CONFIG["data_root"]
-    results_dir    = CONFIG["results_dir"]
-    img_side       = CONFIG["img_side"]
-    batch_size     = CONFIG["batch_size"]
-    num_epochs     = CONFIG["num_epochs"]
-    lr             = CONFIG["lr"]
-    lr_step        = CONFIG["lr_step"]
-    lr_gamma       = CONFIG["lr_gamma"]
-    dropout        = CONFIG["dropout"]
-    arcface_s      = CONFIG["arcface_s"]
-    arcface_m      = CONFIG["arcface_m"]
-    ce_weight      = CONFIG["ce_weight"]
-    con_weight     = CONFIG["con_weight"]
-    temperature    = CONFIG["temperature"]
-    train_ratio    = CONFIG["train_ratio"]
-    gallery_ratio  = CONFIG["gallery_ratio"]
-    seed           = CONFIG["random_seed"]
-    save_every     = CONFIG["save_every"]
-    eval_every     = CONFIG["eval_every"]
-    nw             = CONFIG["num_workers"]
-    augment_factor = CONFIG["augment_factor"]
-
-    assert protocol in ("closed-set", "open-set")
+    protocol          = CONFIG["protocol"]
+    data_root         = CONFIG["data_root"]
+    test_data_root    = CONFIG["test_data_root"]
+    test_gallery_ratio= CONFIG["test_gallery_ratio"]
+    results_dir       = CONFIG["results_dir"]
+    img_side          = CONFIG["img_side"]
+    batch_size        = CONFIG["batch_size"]
+    num_epochs        = CONFIG["num_epochs"]
+    lr                = CONFIG["lr"]
+    lr_step           = CONFIG["lr_step"]
+    lr_gamma          = CONFIG["lr_gamma"]
+    dropout           = CONFIG["dropout"]
+    arcface_s         = CONFIG["arcface_s"]
+    arcface_m         = CONFIG["arcface_m"]
+    ce_weight         = CONFIG["ce_weight"]
+    con_weight        = CONFIG["con_weight"]
+    temperature       = CONFIG["temperature"]
+    seed              = CONFIG["random_seed"]
+    save_every        = CONFIG["save_every"]
+    eval_every        = CONFIG["eval_every"]
+    nw                = CONFIG["num_workers"]
+    augment_factor    = CONFIG["augment_factor"]
 
     os.makedirs(results_dir, exist_ok=True)
     rst_eval = os.path.join(results_dir, "eval")
@@ -970,64 +1018,60 @@ def main():
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"\n{'='*60}")
-    print(f"  CO3Net on CASIA-MS")
-    print(f"  Protocol       : {protocol}")
+    print(f"  CO3Net — Train: CASIA-MS  |  Test: Smartphone")
     print(f"  Device         : {device}")
-    print(f"  Data           : {data_root}")
+    print(f"  Train data     : {data_root}")
+    print(f"  Test data      : {test_data_root}")
     print(f"  Loss           : {ce_weight}*CE + {con_weight}*SupCon(τ={temperature})")
     print(f"  Augment factor : {augment_factor}x")
     print(f"{'='*60}\n")
 
-    # ---------- parse dataset ----------
-    print("Scanning dataset …")
-    id2paths = parse_casia_ms(data_root, iterations_per_spectrum=3, seed=seed)
-    n_total_ids  = len(id2paths)
-    n_total_imgs = sum(len(v) for v in id2paths.values())
-    print(f"  Found {n_total_ids} identities, {n_total_imgs} images total.\n")
+    # ── CASIA-MS: training only (use all samples) ─────────────────────────
+    print("Scanning CASIA-MS (train) …")
+    casia_id2paths = parse_casia_ms(data_root, iterations_per_spectrum=3, seed=seed)
+    n_casia_ids  = len(casia_id2paths)
+    n_casia_imgs = sum(len(v) for v in casia_id2paths.values())
+    print(f"  Found {n_casia_ids} identities, {n_casia_imgs} images.\n")
 
-    # ---------- protocol-specific split ----------
-    if protocol == "closed-set":
-        train_samples, test_samples, label_map = split_closed_set(
-            id2paths, train_ratio=train_ratio, seed=seed)
-        num_classes = len(label_map)
+    # Assign a label to every CASIA-MS identity
+    train_label_map = {k: i for i, k in enumerate(sorted(casia_id2paths.keys()))}
+    train_samples   = [
+        (p, train_label_map[ident])
+        for ident, paths in casia_id2paths.items()
+        for p in paths
+    ]
+    num_classes = len(train_label_map)
 
-        train_dataset  = CASIAMSDataset(train_samples, img_side=img_side,
-                                        train=True, augment_factor=augment_factor)
-        gallery_loader = DataLoader(
-            CASIAMSDatasetSingle(train_samples, img_side=img_side),
-            batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
-        probe_loader   = DataLoader(
-            CASIAMSDatasetSingle(test_samples,  img_side=img_side),
-            batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
+    train_dataset = CASIAMSDataset(train_samples, img_side=img_side,
+                                   train=True, augment_factor=augment_factor)
+    train_loader  = DataLoader(train_dataset, batch_size=batch_size,
+                               shuffle=True, num_workers=nw, pin_memory=True)
 
-        print(f"  [closed-set] #classes={num_classes} | "
-              f"train={len(train_samples)} (+aug→{len(train_samples)*augment_factor}) | "
-              f"test={len(test_samples)}\n")
+    print(f"  Train samples  : {len(train_samples)} "
+          f"(+aug → {len(train_samples)*augment_factor})")
+    print(f"  Num classes    : {num_classes}\n")
 
-    else:  # open-set
-        (train_samples, _, gallery_samples, probe_samples,
-         train_label_map, test_label_map) = split_open_set(
-            id2paths, train_ratio=train_ratio,
-            gallery_ratio=gallery_ratio, val_ratio=0.0, seed=seed)
-        num_classes = len(train_label_map)
+    # ── Smartphone: test only (gallery + probe) ───────────────────────────
+    print("Scanning smartphone data (test) …")
+    phone_id2paths = parse_smartphone_data(test_data_root)
+    n_phone_ids  = len(phone_id2paths)
+    n_phone_imgs = sum(len(v) for v in phone_id2paths.values())
+    print(f"  Found {n_phone_ids} identities, {n_phone_imgs} images.\n")
 
-        train_dataset  = CASIAMSDataset(train_samples, img_side=img_side,
-                                        train=True, augment_factor=augment_factor)
-        gallery_loader = DataLoader(
-            CASIAMSDatasetSingle(gallery_samples, img_side=img_side),
-            batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
-        probe_loader   = DataLoader(
-            CASIAMSDatasetSingle(probe_samples,   img_side=img_side),
-            batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
+    gallery_samples, probe_samples, phone_label_map = split_smartphone_eval(
+        phone_id2paths, gallery_ratio=test_gallery_ratio, seed=seed)
 
-        print(f"  [open-set] #train_classes={num_classes} | "
-              f"train={len(train_samples)} (+aug→{len(train_samples)*augment_factor}) | "
-              f"gallery={len(gallery_samples)} | probe={len(probe_samples)}\n")
+    gallery_loader = DataLoader(
+        CASIAMSDatasetSingle(gallery_samples, img_side=img_side),
+        batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
+    probe_loader   = DataLoader(
+        CASIAMSDatasetSingle(probe_samples, img_side=img_side),
+        batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size,
-                              shuffle=True, num_workers=nw, pin_memory=True)
+    print(f"  Gallery        : {len(gallery_samples)} samples")
+    print(f"  Probe          : {len(probe_samples)} samples\n")
 
-    # ---------- model ----------
+    # ── model ─────────────────────────────────────────────────────────────
     print(f"Building CO3Net — num_classes={num_classes} …")
     net = co3net(num_classes=num_classes, dropout=dropout,
                  arcface_s=arcface_s, arcface_m=arcface_m)
@@ -1041,7 +1085,7 @@ def main():
     optimizer     = optim.Adam(net.parameters(), lr=lr)
     scheduler     = lr_scheduler.StepLR(optimizer, step_size=lr_step, gamma=lr_gamma)
 
-    # ---------- training loop ----------
+    # ── training loop ─────────────────────────────────────────────────────
     train_losses = []
     train_accs   = []
     best_eer     = 1.0
@@ -1049,7 +1093,7 @@ def main():
     last_rank1   = float("nan")
 
     print(f"\nStarting training for {num_epochs} epochs …")
-    print(f"  EER / Rank-1 computed every {eval_every} epochs.\n")
+    print(f"  EER / Rank-1 evaluated every {eval_every} epochs.\n")
 
     for epoch in range(num_epochs):
         t_loss, t_acc = run_one_epoch(
@@ -1063,9 +1107,9 @@ def main():
 
         _net = net.module if isinstance(net, DataParallel) else net
 
-        # ── periodic evaluation ───────────────────────────────────────────────
+        # ── periodic evaluation on smartphone data ────────────────────────
         if epoch % eval_every == 0 or epoch == num_epochs - 1:
-            tag = f"ep{epoch:04d}_{protocol.replace('-','')}"
+            tag = f"ep{epoch:04d}_smartphone"
             cur_eer, cur_aggr_eer, cur_rank1 = evaluate(
                 _net, probe_loader, gallery_loader,
                 device, out_dir=rst_eval, tag=tag)
@@ -1078,7 +1122,7 @@ def main():
                            os.path.join(results_dir, "net_params_best_eer.pth"))
                 print(f"  *** New best EER: {best_eer*100:.4f}% ***")
 
-        # ── periodic console print ────────────────────────────────────────────
+        # ── periodic console print ────────────────────────────────────────
         if epoch % 10 == 0 or epoch == num_epochs - 1:
             ts        = time.strftime("%H:%M:%S")
             eer_str   = f"{last_eer*100:.4f}%"  if not math.isnan(last_eer)   else "N/A"
@@ -1088,27 +1132,24 @@ def main():
                 f"loss={t_loss:.5f} | cls-acc={t_acc:.2f}% | "
                 f"EER={eer_str}  Rank-1={rank1_str}")
 
-        # ── periodic checkpoint ───────────────────────────────────────────────
+        # ── periodic checkpoint + training curves ─────────────────────────
         if epoch % save_every == 0 or epoch == num_epochs - 1:
             torch.save(_net.state_dict(),
                        os.path.join(results_dir, "net_params.pth"))
-            # loss / acc plot (train only)
             try:
                 fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-                axes[0].plot(train_losses, 'b', label='train loss')
-                axes[0].set_xlabel('epoch'); axes[0].set_ylabel('loss')
-                axes[0].legend(); axes[0].grid(True)
-                axes[1].plot(train_accs, 'b', label='train acc')
-                axes[1].set_xlabel('epoch'); axes[1].set_ylabel('accuracy (%)')
-                axes[1].legend(); axes[1].grid(True)
+                axes[0].plot(train_losses, 'b'); axes[0].set_title("Train Loss")
+                axes[0].set_xlabel("epoch"); axes[0].grid(True)
+                axes[1].plot(train_accs,   'b'); axes[1].set_title("Train Acc (%)")
+                axes[1].set_xlabel("epoch"); axes[1].grid(True)
                 fig.tight_layout()
                 fig.savefig(os.path.join(results_dir, "train_curves.png"))
                 plt.close(fig)
             except Exception:
                 pass
 
-    # ---------- final evaluation ----------
-    print("\n=== Final evaluation with best EER model ===")
+    # ── final evaluation ──────────────────────────────────────────────────
+    print("\n=== Final evaluation on smartphone data (best EER model) ===")
     best_model_path = os.path.join(results_dir, "net_params_best_eer.pth")
     if not os.path.exists(best_model_path):
         best_model_path = os.path.join(results_dir, "net_params.pth")
@@ -1122,11 +1163,11 @@ def main():
 
     final_eer, final_aggr_eer, final_rank1 = evaluate(
         eval_net, probe_loader, gallery_loader,
-        device, out_dir=rst_eval,
-        tag=f"FINAL_{protocol.replace('-','')}")
+        device, out_dir=rst_eval, tag="FINAL_smartphone")
 
     print(f"\n{'='*60}")
-    print(f"  PROTOCOL : {protocol}")
+    print(f"  Train set            : CASIA-MS ({n_casia_ids} IDs)")
+    print(f"  Test set             : Smartphone ({n_phone_ids} IDs)")
     print(f"  FINAL Pairwise EER   : {final_eer*100:.4f}%")
     print(f"  FINAL Aggregated EER : {final_aggr_eer*100:.4f}%")
     print(f"  FINAL Rank-1         : {final_rank1:.3f}%")
@@ -1134,16 +1175,18 @@ def main():
     print(f"{'='*60}\n")
 
     with open(os.path.join(results_dir, "summary.txt"), "w") as f:
-        f.write(f"Protocol        : {protocol}\n")
-        f.write(f"Data root       : {data_root}\n")
-        f.write(f"Identities      : {n_total_ids}\n")
-        f.write(f"Images          : {n_total_imgs}\n")
-        f.write(f"Classes (train) : {num_classes}\n")
+        f.write(f"Train set       : CASIA-MS\n")
+        f.write(f"Train IDs       : {n_casia_ids}\n")
+        f.write(f"Train images    : {n_casia_imgs}\n")
         f.write(f"Augment factor  : {augment_factor}x\n")
+        f.write(f"Test set        : Smartphone\n")
+        f.write(f"Test IDs        : {n_phone_ids}\n")
+        f.write(f"Test images     : {n_phone_imgs}\n")
+        f.write(f"Gallery samples : {len(gallery_samples)}\n")
+        f.write(f"Probe samples   : {len(probe_samples)}\n")
         f.write(f"Final Pairwise EER : {final_eer*100:.6f}%\n")
         f.write(f"Final Aggreg. EER  : {final_aggr_eer*100:.6f}%\n")
         f.write(f"Final Rank-1       : {final_rank1:.3f}%\n")
-
 
 if __name__ == "__main__":
     main()
