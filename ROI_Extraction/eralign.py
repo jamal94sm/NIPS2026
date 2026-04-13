@@ -65,8 +65,8 @@ DATASET_CONFIGS = {
         "BLUR_SIGMA_ROTATE"       : 1.5,
         "BI_THRESHOLD_SEG_ROTATE" : False,
         "THRESHOLD_SEG_ROTATE"    : 0,
-        "ratio_rotate"            : 2.0,
-        "ratio"                   : 1.0,
+        "ratio_rotate"            : 4.0,
+        "ratio"                   : 2.0,
     },
 
     # CASIA-MS: controlled lab, multi-spectral, clean dark background
@@ -97,8 +97,8 @@ DATASET_CONFIGS = {
         "BLUR_SIGMA_ROTATE"       : 1.0,
         "BI_THRESHOLD_SEG_ROTATE" : False,
         "THRESHOLD_SEG_ROTATE"    : 0,
-        "ratio_rotate"            : 2.0,
-        "ratio"                   : 1.0,
+        "ratio_rotate"            : 4.0,
+        "ratio"                   : 2.0,
     },
 
     # Generic: safe defaults for unknown datasets
@@ -169,7 +169,8 @@ import cv2
 import numpy as np
 from skimage.morphology import skeletonize
 import networkx as nx
-
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # ──────────────────────────────────────────────────────────────
 #  Gabor filter
@@ -296,41 +297,54 @@ class PalmBasic:
 
     def find_farthest_point(self, path, th):
         lp   = len(path)
-        path = np.array(path)[:, [1,0]]
-        li, ri = int(lp/5*2), lp-1
+        path = np.array(path)[:, [1, 0]]   # swap to (x, y)
+        li, ri = int(lp / 5 * 2), lp - 1
         ln, rn = path[li], path[ri]
+
+        def _cross2d(vecs, v):
+            """Scalar cross product for each row of vecs against vector v.
+            For 2-D vectors: cross(a, b) = a[0]*b[1] - a[1]*b[0]
+            Avoids np.cross which is deprecated for 2-D inputs in NumPy 2.0.
+            """
+            return vecs[:, 0] * v[1] - vecs[:, 1] * v[0]
+
+        def _dot2d(vecs, v):
+            """Dot product of each row of vecs against vector v."""
+            return vecs @ v                 # shape (N,)
 
         def _flag(li, ri, ln, rn):
             fv  = ln - rn
-            est = path[li+1:ri] - rn
+            est = path[li + 1:ri] - rn
             if len(est) == 0:
                 return False
-            cp  = np.cross(est, fv)
-            dp  = np.dot(est, fv)
+            cp  = _cross2d(est, fv)         # (N,)  — replaces np.cross
+            dp  = _dot2d(est, fv)           # (N,)  — replaces np.dot
             ang = np.degrees(np.arctan2(cp, dp))
-            return np.abs(np.abs(np.mean(ang)) - np.mean(np.abs(ang))) > 1.5
+            return np.abs(np.abs(np.mean(ang)) -
+                          np.mean(np.abs(ang))) > 1.5
 
         flag = _flag(li, ri, ln, rn)
-        while flag and li < lp-1 and ri > 0:
-            if li < lp//3:
+        while flag and li < lp - 1 and ri > 0:
+            if li < lp // 3:
                 li += 2; ln = path[li]
-            elif ri > int(lp/5*4):
+            elif ri > int(lp / 5 * 4):
                 ri -= 2; rn = path[ri]
             else:
                 break
             flag = _flag(li, ri, ln, rn)
 
-        pv   = path[li:ri+1]
+        pv = path[li:ri + 1]
         if len(pv) < 3:
             return pv
-        x1,y1 = pv[0]; x2,y2 = pv[-1]
-        A,B   = y2-y1, x1-x2
-        C     = x2*y1 - x1*y2
-        inner = pv[1:-1]
-        dist  = np.abs(A*inner[:,0]+B*inner[:,1]+C) / (np.sqrt(A**2+B**2)+1e-9)
-        mx    = int(np.argmax(dist))
+        x1, y1 = pv[0]; x2, y2 = pv[-1]
+        A, B   = y2 - y1, x1 - x2
+        C      = x2 * y1 - x1 * y2
+        inner  = pv[1:-1]
+        dist   = np.abs(A * inner[:, 0] + B * inner[:, 1] + C) / \
+                 (np.sqrt(A ** 2 + B ** 2) + 1e-9)
+        mx = int(np.argmax(dist))
         if dist[mx] > th:
-            pv = pv[:mx+4]
+            pv = pv[:mx + 4]
         return pv
 
     def find_closest_white_point(self, image, point):
