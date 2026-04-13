@@ -35,7 +35,7 @@ CONFIG = {
     "n_casia_samples"      : 2776,   # S — total images across all selected identities
     "data_root"            : "/home/pai-ng/Jamal/CASIA-MS-ROI",   # train only
     "test_data_root"       : "/home/pai-ng/Jamal/smartphone_data", # test only
-    "swap_datasets"        : "False"
+    "swap_datasets"        : "False",
     "test_gallery_ratio"   : 0.3,   # fraction of each identity's samples → gallery
     "results_dir"          : "./rst_co3net_casia_ms",
     "img_side"             : 128,
