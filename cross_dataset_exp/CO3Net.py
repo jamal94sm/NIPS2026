@@ -29,10 +29,11 @@ Architecture: CO3Net (unchanged from official repo)
 #  CONFIG  — edit this block only
 # ==============================================================
 CONFIG = {
-    "train_data"           : "CASIA-MS",   # "Smartphone" | "CASIA-MS"
-    "test_data"            : "CASIA-MS",     # "Smartphone" | "CASIA-MS"
+    "train_data"           : "MPDv2",     # "Smartphone" | "CASIA-MS" | "MPDv2"
+    "test_data"            : "Smartphone",  # "Smartphone" | "CASIA-MS" | "MPDv2"
     "data_root"            : "/home/pai-ng/Jamal/CASIA-MS-ROI",
     "test_data_root"       : "/home/pai-ng/Jamal/smartphone_data",
+    "mpd_data_root"        : "/home/pai-ng/Jamal/MPDv2_mediapipe_roi",
     "train_subject_ratio"  : 0.80,   # 70% of subjects → train
     "test_gallery_ratio"   : 0.50,   # 30% of test-subject images → gallery
     "results_dir"          : "./rst_co3net_casia_ms",
@@ -50,6 +51,8 @@ CONFIG = {
     "temperature"          : 0.07,
     "n_casia_subjects"     : 190,
     "n_casia_samples"      : 2776,
+    "n_mpd_subjects"       : 190,         # N — how many MPDv2 IDs to use
+    "n_mpd_samples"        : 2776,        # S — total images across selected IDs
     "augment_factor"       : 4,      # ← increase to 3 to compensate small dataset
     "random_seed"          : 42,
     "save_every"           : 50,
@@ -498,6 +501,115 @@ class NormSingleROI(object):
 # ══════════════════════════════════════════════════════════════
 #  DATASET  — paired & single, for CASIA-MS-ROI
 # ══════════════════════════════════════════════════════════════
+def parse_mpd_data(data_root, n_subjects=190, n_total_samples=2776, seed=42):
+    """
+    Select n_subjects identities from MPDv2 with near-uniform sample counts.
+
+    Filename format : {subject}_{session}_{device}_{handSide}_{iter}.jpg
+                      e.g.  191_1_h_l_02.jpg
+    Identity key    : subject + "_" + handSide  (e.g. "191_l", "191_r")
+                      → up to 400 IDs (200 subjects × 2 hands)
+    Grouping key    : device ("h" or "m")  — analogous to spectrum in CASIA-MS
+    Sessions        : both merged into one identity (not separated)
+
+    Distribution (same logic as parse_casia_ms):
+      - S // N images per ID; first (S % N) IDs get one extra
+      - within each ID: base images split equally across devices;
+        first (target % n_devices) devices get one extra
+
+    Returns dict  {identity_key: [path1, path2, …]}
+    """
+    rng = random.Random(seed)
+
+    # ── Step 1: index all files by (identity, device) ─────────────────────
+    # id_dev[(identity, device)] = [path, …]
+    id_dev = defaultdict(lambda: defaultdict(list))
+
+    for fname in sorted(os.listdir(data_root)):
+        if not fname.lower().endswith((".jpg", ".jpeg", ".bmp", ".png")):
+            continue
+        stem  = os.path.splitext(fname)[0]      # "191_1_h_l_02"
+        parts = stem.split("_")
+        if len(parts) != 5:
+            continue
+        subject, session, device, hand_side, iteration = parts
+        if device not in ("h", "m") or hand_side not in ("l", "r"):
+            continue
+        identity = subject + "_" + hand_side    # "191_l"
+        id_dev[identity][device].append(os.path.join(data_root, fname))
+
+    all_identities = sorted(id_dev.keys())
+    if n_subjects > len(all_identities):
+        raise ValueError(
+            f"Requested {n_subjects} subjects but only "
+            f"{len(all_identities)} available in {data_root}.")
+
+    # ── Step 2: randomly select N identities ──────────────────────────────
+    selected = sorted(rng.sample(all_identities, n_subjects))
+
+    # ── Step 3: assign per-ID sample targets ──────────────────────────────
+    base_per_id   = n_total_samples // n_subjects
+    remainder_ids = n_total_samples %  n_subjects
+
+    id_list = list(selected)
+    rng.shuffle(id_list)
+    id_target = {
+        ident: base_per_id + (1 if i < remainder_ids else 0)
+        for i, ident in enumerate(id_list)
+    }
+
+    # ── Step 4: distribute target across devices ───────────────────────────
+    id2paths     = {}
+    actual_total = 0
+
+    for ident in selected:
+        target  = id_target[ident]
+        devices = sorted(id_dev[ident].keys())   # ["h", "m"] or subset
+        n_dev   = len(devices)
+
+        if n_dev == 0:
+            id2paths[ident] = []
+            continue
+
+        base_per_dev = target // n_dev
+        rem_dev      = target %  n_dev
+
+        dev_list = list(devices)
+        rng.shuffle(dev_list)                    # randomise which device gets extra
+
+        chosen = []
+        for j, device in enumerate(dev_list):
+            k         = base_per_dev + (1 if j < rem_dev else 0)
+            available = id_dev[ident][device]
+            k         = min(k, len(available))   # never exceed available
+            chosen.extend(rng.sample(available, k))
+
+        id2paths[ident] = chosen
+        actual_total   += len(chosen)
+
+    # ── Step 5: summary ───────────────────────────────────────────────────
+    counts     = [len(v) for v in id2paths.values()]
+    dev_counts = []
+    for ident in selected:
+        for device in id_dev[ident]:
+            chosen_from_dev = [
+                p for p in id2paths[ident]
+                if f"_{device}_" in os.path.basename(p)
+            ]
+            dev_counts.append(len(chosen_from_dev))
+
+    print(f"  Selected  : {len(id2paths)} identities")
+    print(f"  Total     : {actual_total} images  (target={n_total_samples}, "
+          f"diff={actual_total - n_total_samples})")
+    print(f"  Per-ID    : min={min(counts)}  max={max(counts)}  "
+          f"mean={sum(counts)/len(counts):.2f}")
+    if dev_counts:
+        print(f"  Per-device: min={min(dev_counts)}  max={max(dev_counts)}  "
+              f"mean={sum(dev_counts)/len(dev_counts):.2f}")
+
+    return id2paths
+
+
 def parse_smartphone_data(data_root):
     """
     Scan smartphone_data folder.
@@ -654,25 +766,29 @@ def parse_casia_ms(data_root, n_subjects=190, n_total_samples=2776, seed=42):
     return id2paths
 
 
-def get_parser(dataset_name, casia_root, smartphone_root,
-               n_subjects, n_samples, seed):
-    """
-    Returns (parse_fn, root_path) for the requested dataset name.
-    parse_fn() → id2paths dict.
-    """
+def get_parser(dataset_name, casia_root, smartphone_root, mpd_root,
+               n_casia_subjects, n_casia_samples,
+               n_mpd_subjects, n_mpd_samples, seed):
     name = dataset_name.strip().lower().replace("-", "").replace("_", "")
+
     if name == "casiams":
         return (lambda: parse_casia_ms(casia_root,
-                                       n_subjects=n_subjects,
-                                       n_total_samples=n_samples,
+                                       n_subjects=n_casia_subjects,
+                                       n_total_samples=n_casia_samples,
                                        seed=seed),
                 casia_root)
     elif name == "smartphone":
         return (lambda: parse_smartphone_data(smartphone_root),
                 smartphone_root)
+    elif name == "mpdv2":
+        return (lambda: parse_mpd_data(mpd_root,
+                                       n_subjects=n_mpd_subjects,
+                                       n_total_samples=n_mpd_samples,
+                                       seed=seed),
+                mpd_root)
     else:
         raise ValueError(f"Unknown dataset name: '{dataset_name}'. "
-                         f"Use 'CASIA-MS' or 'Smartphone'.")
+                         f"Use 'CASIA-MS', 'Smartphone', or 'MPDv2'.")
 
 
 def split_same_dataset(id2paths, train_subject_ratio=0.70,
@@ -1146,7 +1262,11 @@ def main():
     augment_factor      = CONFIG["augment_factor"]
     n_subjects          = CONFIG["n_casia_subjects"]
     n_samples           = CONFIG["n_casia_samples"]
+    mpd_root            = CONFIG["mpd_data_root"]
+    n_mpd_subjects      = CONFIG["n_mpd_subjects"]
+    n_mpd_samples       = CONFIG["n_mpd_samples"]
 
+  
     same_dataset = (train_data.strip().lower().replace("-", "") ==
                     test_data.strip().lower().replace("-", ""))
 
@@ -1169,10 +1289,13 @@ def main():
     print(f"{'='*60}\n")
 
     # ── get parsers ───────────────────────────────────────────────────────
-    train_parser, train_root = get_parser(train_data, data_root, test_data_root,
-                                          n_subjects, n_samples, seed)
-    test_parser,  test_root  = get_parser(test_data,  data_root, test_data_root,
-                                          n_subjects, n_samples, seed)
+    train_parser, train_root = get_parser(
+        train_data, data_root, test_data_root, mpd_root,
+        n_subjects, n_samples, n_mpd_subjects, n_mpd_samples, seed)
+
+    test_parser, test_root = get_parser(
+        test_data, data_root, test_data_root, mpd_root,
+        n_subjects, n_samples, n_mpd_subjects, n_mpd_samples, seed)
 
     # ══════════════════════════════════════════════════════════════════════
     #  CASE 1 — different datasets
