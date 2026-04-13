@@ -29,7 +29,7 @@ Architecture: CO3Net (unchanged from official repo)
 #  CONFIG  — edit this block only
 # ==============================================================
 CONFIG = {
-    "swap_datasets"        : True,
+    "swap_datasets"        : False,
     "data_root"            : "/home/pai-ng/Jamal/CASIA-MS-ROI",
     "test_data_root"       : "/home/pai-ng/Jamal/smartphone_data",
     "test_gallery_ratio"   : 0.3,
