@@ -72,6 +72,9 @@ def main():
     eval_every          = CONFIG["eval_every"]
     nw                  = CONFIG["num_workers"]
     augment_factor      = CONFIG["augment_factor"]
+    use_triplet         = CONFIG.get("use_triplet",     False)
+    triplet_weight      = CONFIG.get("triplet_weight",  0.10)
+    triplet_margin      = CONFIG.get("triplet_margin",  0.25)
 
     same_dataset = (train_data.strip().lower().replace("-", "") ==
                     test_data.strip().lower().replace("-", ""))
@@ -202,8 +205,10 @@ def main():
             t_loss, t_acc = run_one_epoch(
                 net, train_loader, criterion, con_criterion,
                 optimizer, device, "training",
-                ce_weight=ce_weight, con_weight=con_weight)
-            scheduler.step()
+                ce_weight=ce_weight, con_weight=con_weight,
+                use_triplet=use_triplet,
+                triplet_weight=triplet_weight,
+                triplet_margin=triplet_margin)
 
             train_losses.append(t_loss)
             train_accs.append(t_acc)
