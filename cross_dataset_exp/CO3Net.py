@@ -503,109 +503,96 @@ class NormSingleROI(object):
 # ══════════════════════════════════════════════════════════════
 def parse_mpd_data(data_root, n_subjects=190, n_total_samples=2776, seed=42):
     """
-    Select n_subjects identities from MPDv2 with near-uniform sample counts.
+    Select n_subjects identities from MPDv2, each with exactly
+    images_per_id = ceil(n_total_samples / n_subjects) = 15 images.
+
+    Eligibility : ID must have >= min_per_device images on EACH device.
+    Sampling    : draw 7 or 8 from each device so the total = 15.
+                  e.g. h→8, m→7  or  h→7, m→8  (randomised per ID)
 
     Filename format : {subject}_{session}_{device}_{handSide}_{iter}.jpg
-                      e.g.  191_1_h_l_02.jpg
-    Identity key    : subject + "_" + handSide  (e.g. "191_l", "191_r")
-                      → up to 400 IDs (200 subjects × 2 hands)
-    Grouping key    : device ("h" or "m")  — analogous to spectrum in CASIA-MS
-    Sessions        : both merged into one identity (not separated)
-
-    Distribution (same logic as parse_casia_ms):
-      - S // N images per ID; first (S % N) IDs get one extra
-      - within each ID: base images split equally across devices;
-        first (target % n_devices) devices get one extra
-
-    Returns dict  {identity_key: [path1, path2, …]}
+    Identity key    : subject + "_" + handSide  (e.g. "191_l")
     """
     rng = random.Random(seed)
 
+    images_per_id  = math.ceil(n_total_samples / n_subjects)  # 15
+    min_per_device = 8     # both "h" and "m" must have at least this many
+
     # ── Step 1: index all files by (identity, device) ─────────────────────
-    # id_dev[(identity, device)] = [path, …]
     id_dev = defaultdict(lambda: defaultdict(list))
 
     for fname in sorted(os.listdir(data_root)):
         if not fname.lower().endswith((".jpg", ".jpeg", ".bmp", ".png")):
             continue
-        stem  = os.path.splitext(fname)[0]      # "191_1_h_l_02"
+        stem  = os.path.splitext(fname)[0]
         parts = stem.split("_")
         if len(parts) != 5:
             continue
         subject, session, device, hand_side, iteration = parts
         if device not in ("h", "m") or hand_side not in ("l", "r"):
             continue
-        identity = subject + "_" + hand_side    # "191_l"
+        identity = subject + "_" + hand_side
         id_dev[identity][device].append(os.path.join(data_root, fname))
 
-    all_identities = sorted(id_dev.keys())
-    if n_subjects > len(all_identities):
-        raise ValueError(
-            f"Requested {n_subjects} subjects but only "
-            f"{len(all_identities)} available in {data_root}.")
-
-    # ── Step 2: randomly select N identities ──────────────────────────────
-    selected = sorted(rng.sample(all_identities, n_subjects))
-
-    # ── Step 3: assign per-ID sample targets ──────────────────────────────
-    base_per_id   = n_total_samples // n_subjects
-    remainder_ids = n_total_samples %  n_subjects
-
-    id_list = list(selected)
-    rng.shuffle(id_list)
-    id_target = {
-        ident: base_per_id + (1 if i < remainder_ids else 0)
-        for i, ident in enumerate(id_list)
+    # ── Step 2: keep only IDs that have >= min_per_device on EACH device ──
+    eligible = {
+        ident: devs
+        for ident, devs in id_dev.items()
+        if all(len(devs.get(d, [])) >= min_per_device for d in ("h", "m"))
     }
 
-    # ── Step 4: distribute target across devices ───────────────────────────
+    print(f"  Eligible IDs (≥{min_per_device} images on each device): "
+          f"{len(eligible)} / {len(id_dev)} total")
+
+    if n_subjects > len(eligible):
+        raise ValueError(
+            f"Requested {n_subjects} IDs but only {len(eligible)} qualify "
+            f"(need ≥{min_per_device} images per device) in {data_root}.")
+
+    # ── Step 3: randomly select N eligible identities ─────────────────────
+    selected = sorted(rng.sample(sorted(eligible.keys()), n_subjects))
+
+    # ── Step 4: sample exactly images_per_id split across h and m ─────────
+    # Split 15 into two parts that sum to 15, each between 7 and 8.
+    # Randomise which device gets the extra image per ID.
     id2paths     = {}
     actual_total = 0
 
     for ident in selected:
-        target  = id_target[ident]
-        devices = sorted(id_dev[ident].keys())   # ["h", "m"] or subset
-        n_dev   = len(devices)
+        devs = eligible[ident]
 
-        if n_dev == 0:
-            id2paths[ident] = []
-            continue
-
-        base_per_dev = target // n_dev
-        rem_dev      = target %  n_dev
-
-        dev_list = list(devices)
-        rng.shuffle(dev_list)                    # randomise which device gets extra
+        # Decide the split: one device gets 8, the other gets 7
+        if rng.random() < 0.5:
+            alloc = {"h": 8, "m": 7}
+        else:
+            alloc = {"h": 7, "m": 8}
 
         chosen = []
-        for j, device in enumerate(dev_list):
-            k         = base_per_dev + (1 if j < rem_dev else 0)
-            available = id_dev[ident][device]
-            k         = min(k, len(available))   # never exceed available
+        for device, k in alloc.items():
+            available = devs[device]
             chosen.extend(rng.sample(available, k))
 
-        id2paths[ident] = chosen
-        actual_total   += len(chosen)
+        id2paths[ident]  = chosen
+        actual_total    += len(chosen)
 
     # ── Step 5: summary ───────────────────────────────────────────────────
     counts     = [len(v) for v in id2paths.values()]
-    dev_counts = []
+    dev_counts = {"h": [], "m": []}
     for ident in selected:
-        for device in id_dev[ident]:
-            chosen_from_dev = [
-                p for p in id2paths[ident]
-                if f"_{device}_" in os.path.basename(p)
-            ]
-            dev_counts.append(len(chosen_from_dev))
+        for device in ("h", "m"):
+            n = sum(1 for p in id2paths[ident]
+                    if f"_{device}_" in os.path.basename(p))
+            dev_counts[device].append(n)
 
     print(f"  Selected  : {len(id2paths)} identities")
-    print(f"  Total     : {actual_total} images  (target={n_total_samples}, "
-          f"diff={actual_total - n_total_samples})")
+    print(f"  Total     : {actual_total} images  "
+          f"(target={n_subjects * images_per_id})")
     print(f"  Per-ID    : min={min(counts)}  max={max(counts)}  "
           f"mean={sum(counts)/len(counts):.2f}")
-    if dev_counts:
-        print(f"  Per-device: min={min(dev_counts)}  max={max(dev_counts)}  "
-              f"mean={sum(dev_counts)/len(dev_counts):.2f}")
+    for d in ("h", "m"):
+        dc = dev_counts[d]
+        print(f"  Device {d}  : min={min(dc)}  max={max(dc)}  "
+              f"mean={sum(dc)/len(dc):.2f}")
 
     return id2paths
 
