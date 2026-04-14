@@ -1,5 +1,5 @@
 
-
+'''
 import os
 from collections import Counter
 
@@ -61,11 +61,11 @@ if scanner_counts:
     print(f"    Distribution        : { {k: dist[k] for k in sorted(dist)} }")
 
 print(f"{'='*40}\n")
-
-
-
-
 '''
+
+
+
+
 # ── MPDv2 samples-per-ID diagnostic ──────────────────────────
 import os, math
 from collections import defaultdict
@@ -123,8 +123,33 @@ def qualifies(devs):
 eligible = {k: v for k, v in id_dev.items() if qualifies(v)}
 print(f"\nEligible IDs (≥7 on one device, ≥8 on other): "
       f"{len(eligible)} / {len(id_dev)}")
-'''
 
+# ── Top-190 IDs by total sample count ────────────────────────
+N = 190
+
+# Build (identity, total_count) pairs and sort descending
+id_totals = [
+    (ident, len(devs.get("h", [])) + len(devs.get("m", [])))
+    for ident, devs in id_dev.items()
+]
+id_totals.sort(key=lambda x: -x[1])
+
+top_n       = id_totals[:N]
+top_counts  = [c for _, c in top_n]
+top_sum     = sum(top_counts)
+top_min     = min(top_counts)
+top_max     = max(top_counts)
+top_mean    = top_sum / len(top_counts)
+
+print(f"\nTop {N} IDs by total sample count:")
+print(f"  Sum of samples : {top_sum}")
+print(f"  Min / Max / Mean per ID : {top_min} / {top_max} / {top_mean:.1f}")
+print(f"  Cutoff (samples in ID #{N}) : {top_counts[-1]}")
+
+# Show how many IDs were tied at the cutoff boundary
+cutoff = top_counts[-1]
+tied   = sum(1 for _, c in id_totals if c == cutoff)
+print(f"  IDs with exactly {cutoff} samples (boundary ties) : {tied}")
 
 
 ########################################################################################################
