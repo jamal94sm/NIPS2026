@@ -25,7 +25,7 @@ CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
     # Choices: "CASIA-MS" | "Smartphone" | "MPDv2"
     "train_data"           : "Smartphone",
-    "test_data"            : "CASIA-MS",
+    "test_data"            : "MPDv2",
 
     # ── Dataset paths ──────────────────────────────────────────
     "casiams_data_root"    : "/home/pai-ng/Jamal/CASIA-MS-ROI",
@@ -34,7 +34,7 @@ CONFIG = {
 
     # ── Splitting ──────────────────────────────────────────────
     "train_subject_ratio"  : 0.80,   # same-dataset mode: fraction of subjects → train
-    "test_gallery_ratio"   : 0.50,   # fraction of test-subject images → gallery
+    "test_gallery_ratio"   : 0.20,   # fraction of test-subject images → gallery
 
     # ── CASIA-MS sampling ──────────────────────────────────────
     "n_casia_subjects"     : 190,
