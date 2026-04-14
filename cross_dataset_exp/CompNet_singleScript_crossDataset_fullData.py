@@ -40,7 +40,7 @@ CONFIG = {
     # ── Smartphone toggle ──────────────────────────────────────
     # False → roi_perspective only
     # True  → roi_perspective + roi_scanner (if the ID has it)
-    "use_scanner"          : False,
+    "use_scanner"          : True,
 
     # ── Model ──────────────────────────────────────────────────
     "img_side"             : 128,
