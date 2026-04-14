@@ -25,7 +25,7 @@ CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
     # Choices: "CASIA-MS" | "Smartphone" | "MPDv2"
     "train_data"           : "Smartphone",
-    "test_data"            : "MPDv2",
+    "test_data"            : "Smartphone",
 
     # ── Dataset paths ──────────────────────────────────────────
     "casiams_data_root"    : "/home/pai-ng/Jamal/CASIA-MS-ROI",
@@ -53,7 +53,7 @@ CONFIG = {
 
     # ── Training ───────────────────────────────────────────────
     "batch_size"           : 128,
-    "num_epochs"           : 200,
+    "num_epochs"           : 100,
     "lr"                   : 0.001,
     "lr_step"              : 30,
     "lr_gamma"             : 0.8,
