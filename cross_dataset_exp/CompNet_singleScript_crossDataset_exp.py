@@ -24,7 +24,7 @@ Experiment modes
 CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
     # Choices: "CASIA-MS" | "Smartphone" | "MPDv2"
-    "train_data"           : "CASIA-MS",
+    "train_data"           : "Smartphone",
     "test_data"            : "MPDv2",
 
     # ── Dataset paths ──────────────────────────────────────────
@@ -34,7 +34,7 @@ CONFIG = {
 
     # ── Splitting ──────────────────────────────────────────────
     "train_subject_ratio"  : 0.80,   # same-dataset mode: fraction of subjects → train
-    "test_gallery_ratio"   : 0.20,   # fraction of test-subject images → gallery
+    "test_gallery_ratio"   : 0.50,   # fraction of test-subject images → gallery
 
     # ── CASIA-MS sampling ──────────────────────────────────────
     "n_casia_subjects"     : 190,
