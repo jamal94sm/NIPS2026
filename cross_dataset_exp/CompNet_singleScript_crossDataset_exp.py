@@ -24,8 +24,8 @@ Experiment modes
 CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
     # Choices: "CASIA-MS" | "Smartphone" | "MPDv2"
-    "train_data"           : "CASIA-MS",
-    "test_data"            : "MPDv2",
+    "train_data"           : "MPDv2",
+    "test_data"            : "CASIA-MS",
 
     # ── Dataset paths ──────────────────────────────────────────
     "casiams_data_root"    : "/home/pai-ng/Jamal/CASIA-MS-ROI",
