@@ -1,3 +1,71 @@
+
+
+import os
+from collections import Counter
+
+DATA_ROOT  = "/home/pai-ng/Jamal/smartphone_data"
+IMG_EXTS   = {".jpg", ".jpeg", ".png", ".bmp"}
+
+def count_images(folder):
+    if not os.path.isdir(folder):
+        return None          # folder does not exist
+    return sum(1 for f in os.listdir(folder)
+               if os.path.splitext(f)[1].lower() in IMG_EXTS)
+
+persp_counts   = []
+scanner_counts = []
+rows           = []
+
+for subject_id in sorted(os.listdir(DATA_ROOT), key=lambda x: int(x) if x.isdigit() else float("inf")):
+    subject_dir = os.path.join(DATA_ROOT, subject_id)
+    if not os.path.isdir(subject_dir):
+        continue
+
+    n_persp   = count_images(os.path.join(subject_dir, "roi_perspective"))
+    n_scanner = count_images(os.path.join(subject_dir, "roi_scanner"))
+
+    persp_str   = str(n_persp)   if n_persp   is not None else "—"
+    scanner_str = str(n_scanner) if n_scanner is not None else "—"
+
+    rows.append((subject_id, persp_str, scanner_str))
+    if n_persp   is not None: persp_counts.append(n_persp)
+    if n_scanner is not None: scanner_counts.append(n_scanner)
+
+# ── Print table ───────────────────────────────────────────────
+print(f"\n{'ID':<8} {'roi_perspective':>16} {'roi_scanner':>12}")
+print("-" * 40)
+for sid, p, s in rows:
+    print(f"{sid:<8} {p:>16} {s:>12}")
+
+# ── Summary ───────────────────────────────────────────────────
+n_has_persp   = len(persp_counts)
+n_has_scanner = len(scanner_counts)
+total_ids     = len(rows)
+
+print(f"\n{'='*40}")
+print(f"  Total subject folders : {total_ids}")
+print(f"\n  roi_perspective")
+print(f"    IDs with folder     : {n_has_persp}")
+if persp_counts:
+    print(f"    Min / Max / Mean    : {min(persp_counts)} / {max(persp_counts)} / {sum(persp_counts)/n_has_persp:.1f}")
+    print(f"    Total images        : {sum(persp_counts)}")
+    dist = Counter(persp_counts)
+    print(f"    Distribution        : { {k: dist[k] for k in sorted(dist)} }")
+
+print(f"\n  roi_scanner")
+print(f"    IDs with folder     : {n_has_scanner}")
+if scanner_counts:
+    print(f"    Min / Max / Mean    : {min(scanner_counts)} / {max(scanner_counts)} / {sum(scanner_counts)/n_has_scanner:.1f}")
+    print(f"    Total images        : {sum(scanner_counts)}")
+    dist = Counter(scanner_counts)
+    print(f"    Distribution        : { {k: dist[k] for k in sorted(dist)} }")
+
+print(f"{'='*40}\n")
+
+
+
+
+'''
 # ── MPDv2 samples-per-ID diagnostic ──────────────────────────
 import os, math
 from collections import defaultdict
@@ -55,6 +123,12 @@ def qualifies(devs):
 eligible = {k: v for k, v in id_dev.items() if qualifies(v)}
 print(f"\nEligible IDs (≥7 on one device, ≥8 on other): "
       f"{len(eligible)} / {len(id_dev)}")
+'''
+
+
+
+########################################################################################################
+
 
 
 
