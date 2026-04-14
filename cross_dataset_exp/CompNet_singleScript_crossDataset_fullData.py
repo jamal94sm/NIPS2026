@@ -309,14 +309,6 @@ def parse_casia_ms(data_root, n_subjects=190, n_total_samples=6000, seed=42):
 
 
 def parse_smartphone_data(data_root, use_scanner=False):
-    """
-    Load smartphone ROI images.
-
-    use_scanner=False : roi_perspective only
-    use_scanner=True  : roi_perspective + roi_scanner (for IDs that have it)
-
-    Identity key: "{ID}_{hand}"  e.g. "35_left", "35_right"
-    """
     IMG_EXTS = {".jpg", ".jpeg", ".bmp", ".png"}
     id2paths  = defaultdict(list)
 
@@ -325,15 +317,11 @@ def parse_smartphone_data(data_root, use_scanner=False):
         if not os.path.isdir(subject_dir):
             continue
 
-        # folders to scan for this subject
-        roi_folders = ["roi_perspective"]
-        if use_scanner:
-            roi_folders.append("roi_scanner")
-
-        for folder_name in roi_folders:
-            roi_dir = os.path.join(subject_dir, folder_name)
-            if not os.path.isdir(roi_dir):
-                continue
+        # ── roi_perspective ───────────────────────────────────
+        # filename: {id}_{hand}_{condition}.jpg
+        # e.g. 35_left_bf.jpg → parts[0]="35", parts[1]="left"
+        roi_dir = os.path.join(subject_dir, "roi_perspective")
+        if os.path.isdir(roi_dir):
             for fname in sorted(os.listdir(roi_dir)):
                 if os.path.splitext(fname)[1].lower() not in IMG_EXTS:
                     continue
@@ -343,6 +331,24 @@ def parse_smartphone_data(data_root, use_scanner=False):
                 identity = parts[0] + "_" + parts[1]   # "35_left"
                 id2paths[identity].append(os.path.join(roi_dir, fname))
 
+        # ── roi_scanner ───────────────────────────────────────
+        # filename: {id}_{session}_{hand}_{color}.jpg
+        # e.g. 035_S2_Left_magenta.jpg → parts[0]="035", parts[2]="Left"
+        # identity must match the perspective identity: subject_id + "_" + hand.lower()
+        if use_scanner:
+            scan_dir = os.path.join(subject_dir, "roi_scanner")
+            if os.path.isdir(scan_dir):
+                for fname in sorted(os.listdir(scan_dir)):
+                    if os.path.splitext(fname)[1].lower() not in IMG_EXTS:
+                        continue
+                    parts = os.path.splitext(fname)[0].split("_")
+                    if len(parts) < 4:
+                        continue
+                    # parts[2] = "Left" or "Right"
+                    hand     = parts[2].lower()          # "left" or "right"
+                    identity = subject_id + "_" + hand   # "35_left"
+                    id2paths[identity].append(os.path.join(scan_dir, fname))
+
     result = dict(id2paths)
     counts = [len(v) for v in result.values()]
     mode   = "perspective + scanner" if use_scanner else "perspective only"
@@ -351,7 +357,6 @@ def parse_smartphone_data(data_root, use_scanner=False):
           f"per-id min/max/mean={min(counts)}/{max(counts)}"
           f"/{sum(counts)/len(counts):.1f}")
     return result
-
 
 def parse_mpd_data(data_root, n_subjects=190, seed=42):
     """
