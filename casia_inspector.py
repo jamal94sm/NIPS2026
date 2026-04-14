@@ -1,19 +1,64 @@
-"""
-CASIA-MS-ROI Dataset Inspector
-================================
-Run this in Google Colab (or locally) to get a full breakdown of:
-  - How many images each identity has (subjectID + hand side)
-  - How many images exist per spectrum
-  - A cross-table: identity × spectrum counts
-  - Which identities are incomplete (missing spectra / iterations)
+# ── MPDv2 samples-per-ID diagnostic ──────────────────────────
+import os, math
+from collections import defaultdict
 
-Note: Left and Right hands are treated as separate identities.
+data_root = "/home/pai-ng/Jamal/MPDv2_mediapipe_manual_roi"
 
-Usage in Colab:
-    1. Mount Drive or upload your dataset folder
-    2. Set DATA_ROOT to your folder path
-    3. Run All
-"""
+id_dev = defaultdict(lambda: defaultdict(list))
+for fname in sorted(os.listdir(data_root)):
+    if not fname.lower().endswith((".jpg",".jpeg",".bmp",".png")):
+        continue
+    stem  = os.path.splitext(fname)[0]
+    parts = stem.split("_")
+    if len(parts) != 5:
+        continue
+    subject, session, device, hand_side, iteration = parts
+    if device not in ("h","m") or hand_side not in ("l","r"):
+        continue
+    identity = subject + "_" + hand_side
+    id_dev[identity][device].append(fname)
+
+print(f"Total IDs found : {len(id_dev)}\n")
+
+# Per-ID summary
+counts_total = []
+counts_h     = []
+counts_m     = []
+for ident, devs in sorted(id_dev.items()):
+    nh = len(devs.get("h", []))
+    nm = len(devs.get("m", []))
+    counts_h.append(nh)
+    counts_m.append(nm)
+    counts_total.append(nh + nm)
+
+print(f"{'Metric':<25} {'h':>6} {'m':>6} {'total':>6}")
+print("-" * 45)
+print(f"{'Min':<25} {min(counts_h):>6} {min(counts_m):>6} {min(counts_total):>6}")
+print(f"{'Max':<25} {max(counts_h):>6} {max(counts_m):>6} {max(counts_total):>6}")
+print(f"{'Mean':<25} {sum(counts_h)/len(counts_h):>6.1f} "
+      f"{sum(counts_m)/len(counts_m):>6.1f} "
+      f"{sum(counts_total)/len(counts_total):>6.1f}")
+print()
+
+# Distribution of total samples per ID
+from collections import Counter
+dist = Counter(counts_total)
+print("Distribution of total samples per ID:")
+for n in sorted(dist):
+    print(f"  {n:>3} samples : {dist[n]:>4} IDs")
+
+# Eligibility breakdown (7+8 or 8+7 threshold)
+def qualifies(devs):
+    h = len(devs.get("h", [])); m = len(devs.get("m", []))
+    return (h >= 8 and m >= 7) or (h >= 7 and m >= 8)
+
+eligible = {k: v for k, v in id_dev.items() if qualifies(v)}
+print(f"\nEligible IDs (≥7 on one device, ≥8 on other): "
+      f"{len(eligible)} / {len(id_dev)}")
+
+
+
+'''
 
 # ── Set this to your dataset path ────────────────────────────────────────────
 DATA_ROOT = "/home/pai-ng/Jamal/CASIA-MS-ROI"
@@ -259,3 +304,4 @@ print(f"  Safe K (= min - Q)               : {safe_k}")
 print(f"  Identities viable for episodes   : {viable32} / {len(per_identity)}")
 print(f"  → With N=32, need ≥32 viable classes. "
       f"{'✓ OK' if viable32 >= 32 else '✗ TOO FEW — lower N'}")
+'''
