@@ -33,7 +33,7 @@ CONFIG = {
     "test_data"            : "MPDv2",  # "Smartphone" | "CASIA-MS" | "MPDv2"
     "data_root"            : "/home/pai-ng/Jamal/CASIA-MS-ROI",
     "test_data_root"       : "/home/pai-ng/Jamal/smartphone_data",
-    "mpd_data_root"        : "/home/pai-ng/Jamal/MPDv2_mediapipe_roi",
+    "mpd_data_root"        : "/home/pai-ng/Jamal/MPDv2_mediapipe_roi_basic",
     "train_subject_ratio"  : 0.80,   # 70% of subjects → train
     "test_gallery_ratio"   : 0.50,   # 30% of test-subject images → gallery
     "results_dir"          : "./rst_co3net_casia_ms",
