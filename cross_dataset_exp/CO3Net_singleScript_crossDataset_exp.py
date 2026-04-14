@@ -608,7 +608,7 @@ def parse_mpd_data(data_root, n_subjects=190, n_total_samples=2776, seed=42):
 def parse_smartphone_data(data_root):
     """
     Scan smartphone_data folder.
-    Structure : {data_root}/{ID}/roi_square/{ID}_{hand}_{condition}.jpg
+    Structure : {data_root}/{ID}/roi_perspective/{ID}_{hand}_{condition}.jpg
     Identity key = "{ID}_{hand}"  e.g. "1_left", "1_right"
     Returns dict  {identity_key: [path1, path2, …]}
     """
