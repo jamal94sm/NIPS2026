@@ -41,8 +41,8 @@ CONFIG = {
     "n_casia_samples"      : 2776,
 
     # ── MPDv2 sampling ─────────────────────────────────────────
-    "n_mpd_subjects"       : 184,
-    "n_mpd_samples"        : 2760,   # 184 × 15
+    "n_mpd_subjects"       : 190,
+    "n_mpd_samples"        : 2850,   # 190 × 15
 
     # ── Model ──────────────────────────────────────────────────
     "img_side"             : 128,
