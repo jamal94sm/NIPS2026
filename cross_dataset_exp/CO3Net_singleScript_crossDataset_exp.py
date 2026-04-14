@@ -29,7 +29,7 @@ Architecture: CO3Net (unchanged from official repo)
 #  CONFIG  — edit this block only
 # ==============================================================
 CONFIG = {
-    "train_data"           : "Smartphone",     # "Smartphone" | "CASIA-MS" | "MPDv2"
+    "train_data"           : "MPDv2",     # "Smartphone" | "CASIA-MS" | "MPDv2"
     "test_data"            : "MPDv2",  # "Smartphone" | "CASIA-MS" | "MPDv2"
     "data_root"            : "/home/pai-ng/Jamal/CASIA-MS-ROI",
     "test_data_root"       : "/home/pai-ng/Jamal/smartphone_data",
@@ -39,7 +39,7 @@ CONFIG = {
     "results_dir"          : "./rst_co3net_casia_ms",
     "img_side"             : 128,
     "batch_size"           : 256,    # ← was 1024
-    "num_epochs"           : 200,    # ← was 150
+    "num_epochs"           : 100,    # ← was 150
     "lr"                   : 0.001,
     "lr_step"              : 30,     # ← was 500
     "lr_gamma"             : 0.6,    # ← was 0.8
