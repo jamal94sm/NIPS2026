@@ -342,11 +342,12 @@ def parse_smartphone_data(data_root, use_scanner=False):
                     if os.path.splitext(fname)[1].lower() not in IMG_EXTS:
                         continue
                     parts = os.path.splitext(fname)[0].split("_")
+                    # scanner format: {id}_{Hand}_{color}_{num}.jpg
+                    # e.g. 50_Left_green_1.jpg → parts[1] = "Left"
                     if len(parts) < 4:
                         continue
-                    # parts[2] = "Left" or "Right"
-                    hand     = parts[2].lower()          # "left" or "right"
-                    identity = subject_id + "_" + hand   # "35_left"
+                    hand     = parts[1].lower()          # "left" or "right"
+                    identity = subject_id + "_" + hand   # "50_left"
                     id2paths[identity].append(os.path.join(scan_dir, fname))
 
     result = dict(id2paths)
