@@ -55,7 +55,7 @@ CONFIG = {
     "lr"                   : 0.001,
     "lr_step"              : 30,
     "lr_gamma"             : 0.8,
-    "augment_factor"       : 4,
+    "augment_factor"       : 2,
 
     # ── Misc ───────────────────────────────────────────────────
     "results_dir"          : "./rst_compnet",
