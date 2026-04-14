@@ -16,7 +16,7 @@ Changes vs previous version:
 CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
     # Choices: "CASIA-MS" | "Smartphone" | "MPDv2"
-    "train_data"           : "Smartphone",
+    "train_data"           : "CASIA-MS",
     "test_data"            : "MPDv2",
 
     # ── Dataset paths ──────────────────────────────────────────
