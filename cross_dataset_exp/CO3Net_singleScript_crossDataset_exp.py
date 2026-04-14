@@ -51,7 +51,7 @@ CONFIG = {
     "temperature"          : 0.07,
     "n_casia_subjects"     : 190,
     "n_casia_samples"      : 2776,
-    "n_mpd_subjects"       : 184,         # N — how many MPDv2 IDs to use
+    "n_mpd_subjects"       : 190,         # N — how many MPDv2 IDs to use
     "n_mpd_samples"        : 2776,        # S — total images across selected IDs
     "augment_factor"       : 4,      # ← increase to 3 to compensate small dataset
     "random_seed"          : 42,
