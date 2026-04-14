@@ -19,7 +19,7 @@ CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
     # Choices: "CASIA-MS" | "Smartphone" | "MPDv2"
     "train_data"           : "Smartphone",
-    "test_data"            : "Smartphone",
+    "test_data"            : "MPDv2",
 
     # ── Dataset paths ──────────────────────────────────────────
     "casiams_data_root"    : "/home/pai-ng/Jamal/CASIA-MS-ROI",
