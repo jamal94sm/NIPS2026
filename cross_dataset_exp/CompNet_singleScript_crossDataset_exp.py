@@ -24,7 +24,7 @@ CONFIG = {
     # ── Dataset paths ──────────────────────────────────────────
     "casiams_data_root"    : "/home/pai-ng/Jamal/CASIA-MS-ROI",
     "smartphone_data_root" : "/home/pai-ng/Jamal/smartphone_data",
-    "mpd_data_root"        : "/home/pai-ng/Jamal/MPDv2_mediapipe_roi",
+    "mpd_data_root"        : "/home/pai-ng/Jamal/MPDv2_mediapipe_manual_roi",
 
     # ── Splitting ──────────────────────────────────────────────
     "train_subject_ratio"  : 0.80,
