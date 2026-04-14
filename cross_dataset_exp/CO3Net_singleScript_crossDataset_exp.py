@@ -33,7 +33,7 @@ CONFIG = {
     "test_data"            : "MPDv2",  # "Smartphone" | "CASIA-MS" | "MPDv2"
     "data_root"            : "/home/pai-ng/Jamal/CASIA-MS-ROI",
     "test_data_root"       : "/home/pai-ng/Jamal/smartphone_data",
-    "mpd_data_root"        : "/home/pai-ng/Jamal/MPDv2_mediapipe_roi_basic",
+    "mpd_data_root"        : "/home/pai-ng/Jamal/MPDv2_mediapipe_manual_roi",
     "train_subject_ratio"  : 0.80,   # 70% of subjects → train
     "test_gallery_ratio"   : 0.50,   # 30% of test-subject images → gallery
     "results_dir"          : "./rst_co3net_casia_ms",
@@ -51,8 +51,8 @@ CONFIG = {
     "temperature"          : 0.07,
     "n_casia_subjects"     : 190,
     "n_casia_samples"      : 2776,
-    "n_mpd_subjects"       : 108,         # N — how many MPDv2 IDs to use
-    "n_mpd_samples"        : 1620,        # S — total images across selected IDs
+    "n_mpd_subjects"       : 190,         # N — how many MPDv2 IDs to use
+    "n_mpd_samples"        : 2850,        # S — total images across selected IDs
     "augment_factor"       : 4,      # ← increase to 3 to compensate small dataset
     "random_seed"          : 42,
     "save_every"           : 50,
