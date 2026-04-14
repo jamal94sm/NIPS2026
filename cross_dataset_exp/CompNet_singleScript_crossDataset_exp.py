@@ -315,7 +315,7 @@ def parse_casia_ms(data_root, n_subjects=190, n_total_samples=2776, seed=42):
 def parse_smartphone_data(data_root):
     id2paths = defaultdict(list)
     for subject_id in sorted(os.listdir(data_root)):
-        roi_dir = os.path.join(data_root, subject_id, "roi_square")
+        roi_dir = os.path.join(data_root, subject_id, "roi_perspective")
         if not os.path.isdir(roi_dir):
             continue
         for fname in sorted(os.listdir(roi_dir)):
