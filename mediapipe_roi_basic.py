@@ -37,9 +37,7 @@ base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
 options = vision.HandLandmarkerOptions(
     base_options=base_options,
     num_hands=1,
-    min_hand_detection_confidence=0.1,   # was 0.2 — try 0.1 or even 0.05
-    min_hand_presence_confidence=0.1,    # add this — default is 0.5, very aggressive
-    min_tracking_confidence=0.1,         # add this — default is 0.5
+    min_hand_detection_confidence=0.2,  
     running_mode=vision.RunningMode.IMAGE,
 )
 detector = vision.HandLandmarker.create_from_options(options)
