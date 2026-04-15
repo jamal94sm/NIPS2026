@@ -42,7 +42,7 @@ CONFIG = {
     # True  → select 190 IDs from each dataset, hold out 20% of each,
     #         merge into one combined eval set with new global labels.
     # False → standard per-dataset test split.
-    "combined_evaluation_set" : False,
+    "combined_evaluation_set" : True,
     "combined_gallery_ratio"  : 0.50,
 
     # ── Model ──────────────────────────────────────────────────
