@@ -78,7 +78,7 @@ CONFIG = {
     "lr"                   : 0.001,
     "lr_step"              : 30,
     "lr_gamma"             : 0.6,
-    "augment_factor"       : 2,
+    "augment_factor"       : 4,
 
     # ── Misc ───────────────────────────────────────────────────
     "results_dir"          : "./rst_co3net",
