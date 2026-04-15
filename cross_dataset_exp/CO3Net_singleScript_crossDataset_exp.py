@@ -136,8 +136,8 @@ TARGET_LOW  = 15
 # XJTU-specific targets (4 variations × ~7 = 28–29 for high group)
 XJTU_N_TOTAL      = 200   # available IDs in the dataset
 XJTU_N_SELECT     = 190   # how many to use
-XJTU_TARGET_HIGH  = 31    # images per ID in high group
-XJTU_TARGET_LOW   = 14    # images per ID in low group
+XJTU_TARGET_HIGH  = 30    # images per ID in high group
+XJTU_TARGET_LOW   = 15    # images per ID in low group
 # 4 variations: Flash-iPhone | Nature-iPhone | Flash-Huawei | Nature-Huawei
 XJTU_VARIATIONS   = [
     ("iPhone",  "Flash"),
