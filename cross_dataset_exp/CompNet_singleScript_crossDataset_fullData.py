@@ -102,8 +102,9 @@ ALLOWED_SPECTRA = {"green", "ir", "yellow", "pink", "white"}
 # Two-group sampling parameters (shared across all datasets)
 N_HIGH      = 150   # number of IDs in the high-sample group
 N_LOW       = 40    # number of IDs in the low-sample group
-TARGET_HIGH = 30    # target images per ID in the high group
-TARGET_LOW  = 15    # target images per ID in the low group
+TARGET_HIGH_CASIA = 30
+TARGET_HIGH_MPD   = 33
+TARGET_LOW        = 15
 
 
 # ══════════════════════════════════════════════════════════════
@@ -306,7 +307,7 @@ def parse_casia_ms(data_root, seed=42):
 
     id2paths = {}
     for ident in high_ids:
-        id2paths[ident] = _sample_spectra(ident, TARGET_HIGH)
+        id2paths[ident] = _sample_spectra(ident, TARGET_HIGH_CASIA)
     for ident in low_ids:
         id2paths[ident] = _sample_spectra(ident, TARGET_LOW)
 
@@ -439,7 +440,7 @@ def parse_mpd_data(data_root, seed=42):
 
     id2paths = {}
     for ident in high_ids:
-        id2paths[ident] = _sample_mpd(ident, TARGET_HIGH)
+        id2paths[ident] = _sample_mpd(ident, TARGET_HIGH_MPD)
     for ident in low_ids:
         id2paths[ident] = _sample_mpd(ident, TARGET_LOW)
 
@@ -749,8 +750,8 @@ def main():
                   f"(spectra: {', '.join(sorted(ALLOWED_SPECTRA))})")
         else:
             print(f"  Scanner data   : OFF (perspective only)")
-    print(f"  Sampling       : high={N_HIGH}×{TARGET_HIGH}  "
-          f"low={N_LOW}×{TARGET_LOW}")
+    print(f"  Sampling       : high casia={TARGET_HIGH_CASIA}  "
+      f"high mpd={TARGET_HIGH_MPD}  low={TARGET_LOW}")
     print(f"  Loss           : CrossEntropy")
     print(f"  Augment factor : {augment_factor}×")
     print(f"{'='*60}\n")
@@ -943,7 +944,7 @@ def main():
         f.write(f"Scanner data       : {use_scanner}\n")
         if use_scanner:
             f.write(f"Scanner spectra    : {', '.join(sorted(ALLOWED_SPECTRA))}\n")
-        f.write(f"Sampling           : high={N_HIGH}×{TARGET_HIGH} "
+        f.write(f"Sampling           : high={N_HIGH}×{TARGET_HIGH_CASIA} "
                 f"low={N_LOW}×{TARGET_LOW}\n")
         f.write(f"Num classes        : {num_classes}\n")
         f.write(f"Test dataset       : {test_data}\n")
