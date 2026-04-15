@@ -611,69 +611,82 @@ def extract_features(model, loader, device):
 
 
 def compute_eer(scores_array):
-    ins  = scores_array[scores_array[:,1] ==  1, 0]
-    outs = scores_array[scores_array[:,1] == -1, 0]
-    if len(ins) == 0 or len(outs) == 0: return 1.0, 0.0
-    flipped = ins.mean() < outs.mean()
-    if flipped: ins, outs = -ins, -outs
+    """
+    scores_array : (N, 2)
+        col 0 = matching score  (dot product, higher = more similar)
+        col 1 = +1 (genuine) | -1 (impostor)
+    Returns (eer, threshold).
+    """
+    ins  = scores_array[scores_array[:, 1] ==  1, 0]   # genuine scores
+    outs = scores_array[scores_array[:, 1] == -1, 0]   # impostor scores
+    if len(ins) == 0 or len(outs) == 0:
+        return 1.0, 0.0
+
+    # dot product: genuine scores are larger (more similar)
+    # roc_curve expects higher score = positive class, which holds here
     y   = np.concatenate([np.ones(len(ins)), np.zeros(len(outs))])
     s   = np.concatenate([ins, outs])
     fpr, tpr, thresholds = roc_curve(y, s, pos_label=1)
     eer    = brentq(lambda x: 1.0 - x - interp1d(fpr, tpr)(x), 0.0, 1.0)
     thresh = float(interp1d(fpr, thresholds)(eer))
-    return eer, (-thresh if flipped else thresh)
+    return eer, thresh
 
 
 def evaluate(model, probe_loader, gallery_loader, device,
              out_dir=".", tag="eval"):
-    probe_feats,   probe_labels   = extract_features(model, probe_loader, device)
+    probe_feats,   probe_labels   = extract_features(model, probe_loader,   device)
     gallery_feats, gallery_labels = extract_features(model, gallery_loader, device)
+
     n_probe   = len(probe_feats)
     n_gallery = len(gallery_feats)
 
-    scores_list, labels_list = [], []
-    dist_matrix = np.zeros((n_probe, n_gallery))
+    # ── similarity matrix via dot product ────────────────────────────────
+    # Both embeddings are L2-normalised so dot product = cosine similarity ∈ [-1, 1]
+    # Shape: (n_probe, n_gallery)
+    sim_matrix = probe_feats @ gallery_feats.T
 
+    # ── EER ──────────────────────────────────────────────────────────────
+    # Genuine pairs  : probe i and gallery j share the same label
+    # Impostor pairs : probe i and gallery j have different labels
+    scores_list = []
+    labels_list = []
     for i in range(n_probe):
-        cos_sim        = np.dot(gallery_feats, probe_feats[i])
-        dists          = np.arccos(np.clip(cos_sim, -1, 1)) / np.pi
-        dist_matrix[i] = dists
         for j in range(n_gallery):
-            scores_list.append(dists[j])
+            scores_list.append(sim_matrix[i, j])
             labels_list.append(1 if probe_labels[i] == gallery_labels[j] else -1)
 
     scores_arr  = np.column_stack([scores_list, labels_list])
     pair_eer, _ = compute_eer(scores_arr)
 
-    aggr_s, aggr_l = [], []
-    for i in range(n_probe - 1):
-        for j in range(i + 1, n_probe):
-            d = np.arccos(np.clip(np.dot(probe_feats[i], probe_feats[j]), -1, 1)) / np.pi
-            aggr_s.append(d); aggr_l.append(1 if probe_labels[i] == probe_labels[j] else -1)
-    aggr_eer = compute_eer(np.column_stack([aggr_s, aggr_l]))[0] if aggr_s else 1.0
+    # ── Rank-1 ───────────────────────────────────────────────────────────
+    # For each probe, find the gallery image with the highest similarity.
+    # If that image belongs to the same identity, count it as correct.
+    nn_idx  = np.argmax(sim_matrix, axis=1)          # (n_probe,)
+    correct = sum(probe_labels[i] == gallery_labels[nn_idx[i]]
+                  for i in range(n_probe))
+    rank1   = 100.0 * correct / max(n_probe, 1)
 
-    correct  = sum(probe_labels[i] == gallery_labels[np.argmin(dist_matrix[i])]
-                   for i in range(n_probe))
-    rank1    = 100.0 * correct / max(n_probe, 1)
-
+    # ── save scores + plots ───────────────────────────────────────────────
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, f"scores_{tag}.txt"), "w") as f:
-        for s, l in zip(scores_list, labels_list): f.write(f"{s} {l}\n")
+        for s, l in zip(scores_list, labels_list):
+            f.write(f"{s} {l}\n")
     _save_roc_det(scores_arr, out_dir, tag)
 
-    print(f"  [{tag}]  pairEER={pair_eer*100:.4f}%  "
-          f"aggrEER={aggr_eer*100:.4f}%  Rank-1={rank1:.2f}%")
-    return pair_eer, aggr_eer, rank1
+    print(f"  [{tag}]  EER={pair_eer*100:.4f}%  Rank-1={rank1:.2f}%")
+    return pair_eer, rank1
 
 
 def _save_roc_det(scores_arr, out_dir, tag):
-    ins  = scores_arr[scores_arr[:,1] ==  1, 0]
-    outs = scores_arr[scores_arr[:,1] == -1, 0]
-    if len(ins) == 0 or len(outs) == 0: return
-    if ins.mean() < outs.mean(): ins, outs = -ins, -outs
+    ins  = scores_arr[scores_arr[:, 1] ==  1, 0]
+    outs = scores_arr[scores_arr[:, 1] == -1, 0]
+    if len(ins) == 0 or len(outs) == 0:
+        return
+    # dot product: no negation needed, genuine > impostor already
     y   = np.concatenate([np.ones(len(ins)), np.zeros(len(outs))])
     s   = np.concatenate([ins, outs])
-    fpr, tpr, thr = roc_curve(y, s, pos_label=1); fnr = 1 - tpr
+    fpr, tpr, thr = roc_curve(y, s, pos_label=1)
+    fnr = 1 - tpr
     try:
         pdf = PdfPages(os.path.join(out_dir, f"roc_det_{tag}.pdf"))
         for (xd, yd, xl, yl, title, xlim, ylim) in [
@@ -874,7 +887,7 @@ def main():
 
             if epoch % eval_every == 0 or epoch == num_epochs - 1:
                 tag = f"ep{epoch:04d}_{test_data.replace('-','')}"
-                cur_eer, _, cur_rank1 = evaluate(
+                cur_eer, cur_rank1 = evaluate(
                     _net, probe_loader, gallery_loader,
                     device, out_dir=rst_eval, tag=tag)
                 last_eer, last_rank1 = cur_eer, cur_rank1
@@ -922,7 +935,8 @@ def main():
     torch.save(eval_net.state_dict(), os.path.join(results_dir, saved_name))
     print(f"  Model saved as {saved_name}")
 
-    final_eer, final_aggr_eer, final_rank1 = evaluate(
+    # was:  final_eer, final_aggr_eer, final_rank1 = evaluate(...)
+    final_eer, final_rank1 = evaluate(
         eval_net, probe_loader, gallery_loader,
         device, out_dir=rst_eval,
         tag=f"FINAL_{test_data.replace('-','')}")
@@ -931,7 +945,6 @@ def main():
     print(f"  Train  : {train_data} ({n_train_ids} subjects, {n_train_imgs} imgs)")
     print(f"  Test   : {test_data}  ({n_test_ids} subjects, {n_test_imgs} imgs)")
     print(f"  FINAL Pairwise EER   : {final_eer*100:.4f}%")
-    print(f"  FINAL Aggregated EER : {final_aggr_eer*100:.4f}%")
     print(f"  FINAL Rank-1         : {final_rank1:.3f}%")
     print(f"  Results saved to     : {results_dir}")
     print(f"{'='*60}\n")
@@ -953,7 +966,6 @@ def main():
         f.write(f"Gallery samples    : {len(gallery_samples)}\n")
         f.write(f"Probe samples      : {len(probe_samples)}\n")
         f.write(f"Final Pairwise EER : {final_eer*100:.6f}%\n")
-        f.write(f"Final Aggreg. EER  : {final_aggr_eer*100:.6f}%\n")
         f.write(f"Final Rank-1       : {final_rank1:.3f}%\n")
 
 
