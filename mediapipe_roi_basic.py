@@ -11,8 +11,8 @@ from tqdm import tqdm
 # ============================================================
 # PATHS  — edit these lines
 # ============================================================
-SRC_ROOT        = "/home/pai-ng/Jamal/MPDv2"
-DST_ROOT        = "/home/pai-ng/Jamal/MPDv2_mediapipe_roi_basic"
+SRC_ROOT        = "/home/pai-ng/Jamal/CASIA_Palmprint_V1"
+DST_ROOT        = "/home/pai-ng/Jamal/CASIA_mediapipe_roi"
 MODEL_PATH      = "/home/pai-ng/Jamal/NIPS2026/ROI_Extraction/hand_landmarker.task"
 ROI_SIZE        = 224
 SAVE_FAILED     = False   # True → save resized full image for failed samples
