@@ -14,7 +14,10 @@ When combined_evaluation_set = True:
   3. Merge the held-out IDs into a single eval set with new sequential labels.
   4. Split each eval ID's samples by combined_gallery_ratio (0.50).
   5. The remaining ~152 IDs of the TRAINING dataset are used for training.
-  The standard test_data split is replaced by this combined set.
+
+  The combined eval set is cached to combined_eval_cache_path on first build
+  and reloaded identically on every subsequent run — guaranteeing the same
+  evaluation set regardless of which train_data is selected.
 """
 
 # ==============================================================
@@ -23,7 +26,7 @@ When combined_evaluation_set = True:
 CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
     # Choices: "CASIA-MS" | "Palm-Auth" | "MPDv2"
-    "train_data"           : "MPDv2",
+    "train_data"           : "Palm-Auth",
     "test_data"            : "MPDv2",      # used only when combined_evaluation_set=False
 
     # ── Dataset paths ──────────────────────────────────────────
@@ -39,11 +42,14 @@ CONFIG = {
     "use_scanner"          : True,
 
     # ── Combined evaluation set ────────────────────────────────
-    # True  → select 190 IDs from each dataset, hold out 20% of each,
-    #         merge into one combined eval set with new global labels.
+    # True  → build (or load cached) combined eval set from all 3 datasets.
     # False → standard per-dataset test split.
-    "combined_evaluation_set" : True,
+    "combined_evaluation_set" : False,
     "combined_gallery_ratio"  : 0.50,
+
+    # Path where the combined eval set JSON is cached.
+    # All experiments that share this path will use the identical eval set.
+    "combined_eval_cache_path" : "./combined_eval_cache.json",
 
     # ── Model ──────────────────────────────────────────────────
     "img_side"             : 128,
@@ -72,6 +78,7 @@ CONFIG = {
 # ==============================================================
 
 import os
+import json
 import math
 import time
 import random
@@ -389,34 +396,55 @@ def _ds_key(name):
 
 
 # ══════════════════════════════════════════════════════════════
-#  COMBINED EVALUATION SET
+#  COMBINED EVALUATION SET  (with cache)
 # ══════════════════════════════════════════════════════════════
 
 def build_combined_eval_set(cfg, seed=42):
     """
-    For each of the three datasets:
-      1. Run the standard parser → get the 190 selected IDs with their sampled images.
-      2. Hold out 20% of those 190 IDs (~38) for evaluation.
-      3. Keep the remaining ~152 IDs available for training.
+    Build (or reload from cache) the combined evaluation set.
 
-    Merge held-out IDs from all three datasets into one eval set
-    with new global sequential labels.
-    Split each eval ID's images by combined_gallery_ratio.
+    On first call:
+      1. Parse all three datasets → 190 selected IDs each.
+      2. Hold out 20% (~38) of each dataset's 190 IDs for evaluation.
+      3. Merge held-out IDs with new global sequential labels.
+      4. Split each eval ID's images by combined_gallery_ratio.
+      5. Save everything to combined_eval_cache_path as JSON.
+
+    On subsequent calls:
+      Load the JSON and return identical gallery/probe/train_remaining,
+      guaranteeing the same evaluation set across ALL experiments.
 
     Returns
     -------
-    gallery_samples : list of (path, global_label)
-    probe_samples   : list of (path, global_label)
-    train_remaining : dict { ds_key : id2paths }
-                      — the non-held-out IDs for each dataset,
-                        ready to be used directly as training data.
+    gallery_samples  : list of (path, global_label)
+    probe_samples    : list of (path, global_label)
+    train_remaining  : dict { ds_key : {ident: [paths]} }
+                       — non-held-out IDs for each dataset.
     """
+    cache_path = cfg.get("combined_eval_cache_path", "./combined_eval_cache.json")
+
+    # ── load from cache if it exists ─────────────────────────────────────
+    if os.path.exists(cache_path):
+        print(f"  Loading cached combined eval set from:\n    {cache_path}")
+        with open(cache_path, "r") as f:
+            data = json.load(f)
+        gallery_samples = [tuple(x) for x in data["gallery"]]
+        probe_samples   = [tuple(x) for x in data["probe"]]
+        train_remaining = {k: {ident: paths
+                               for ident, paths in v.items()}
+                           for k, v in data["train_remaining"].items()}
+        print(f"  [combined eval] total eval IDs={data['n_eval_ids']}  "
+              f"gallery={len(gallery_samples)}  probe={len(probe_samples)}\n")
+        return gallery_samples, probe_samples, train_remaining
+
+    # ── build fresh ───────────────────────────────────────────────────────
+    print("  Building combined evaluation set for the first time …")
     rng           = random.Random(seed)
     gallery_ratio = cfg.get("combined_gallery_ratio", 0.50)
     use_scanner   = cfg.get("use_scanner", False)
 
-    # ── parse all three datasets to get the selected 190 IDs each ─────────
-    print("  Parsing datasets for combined evaluation set …")
+    # Use a FIXED seed for each dataset's parser so the 190-ID selection
+    # is identical no matter when or how many times this function is called.
     parsed = {
         "casiams":  parse_casia_ms(cfg["casiams_data_root"], seed=seed),
         "palmauth": parse_palm_auth_data(cfg["palm_auth_data_root"],
@@ -426,47 +454,59 @@ def build_combined_eval_set(cfg, seed=42):
 
     gallery_samples = []
     probe_samples   = []
-    train_remaining = {}   # ds_key → id2paths dict (non-held-out IDs)
+    train_remaining = {}
     label_offset    = 0
 
     for ds_key, id2paths in parsed.items():
         all_ids = sorted(id2paths.keys())
         n_held  = max(1, int(len(all_ids) * 0.20))
 
-        # deterministic per-dataset shuffle for reproducibility
+        # Deterministic per-dataset shuffle — completely independent of
+        # any global RNG state so held-out IDs never change between runs.
         rng_ds   = random.Random(seed + abs(hash(ds_key)) % 100000)
         shuffled = list(all_ids); rng_ds.shuffle(shuffled)
         held_ids = set(shuffled[:n_held])
 
-        # split into held-out (eval) and remaining (train)
         train_remaining[ds_key] = {k: v for k, v in id2paths.items()
                                    if k not in held_ids}
 
-        # build gallery + probe from held-out IDs
+        # Build gallery + probe — use a per-dataset RNG seeded from ds_key
+        # so the gallery/probe split is also stable across runs.
+        rng_split = random.Random(seed + abs(hash(ds_key + "_split")) % 100000)
         held_sorted = sorted(held_ids)
+        n_gal_ds = 0; n_prob_ds = 0
         for local_idx, ident in enumerate(held_sorted):
             global_label = label_offset + local_idx
-            paths = list(id2paths[ident]); rng.shuffle(paths)
+            paths = list(id2paths[ident]); rng_split.shuffle(paths)
             n_gal = max(1, int(len(paths) * gallery_ratio))
             for p in paths[:n_gal]:
-                gallery_samples.append((p, global_label))
+                gallery_samples.append((p, global_label)); n_gal_ds += 1
             for p in paths[n_gal:]:
-                probe_samples.append((p, global_label))
+                probe_samples.append((p, global_label));   n_prob_ds += 1
 
-        n_gal_ds  = sum(1 for _, l in gallery_samples
-                        if label_offset <= l < label_offset + n_held)
-        n_prob_ds = sum(1 for _, l in probe_samples
-                        if label_offset <= l < label_offset + n_held)
         print(f"  [{ds_key}] total={len(all_ids)} IDs  "
               f"held-out={n_held}  train={len(train_remaining[ds_key])}  "
               f"gallery={n_gal_ds}  probe={n_prob_ds}")
-
         label_offset += n_held
 
-    total_eval_ids = label_offset
-    print(f"  [combined eval] total eval IDs={total_eval_ids}  "
-          f"gallery={len(gallery_samples)}  probe={len(probe_samples)}\n")
+    print(f"  [combined eval] total eval IDs={label_offset}  "
+          f"gallery={len(gallery_samples)}  probe={len(probe_samples)}")
 
+    # ── save to cache ─────────────────────────────────────────────────────
+    os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
+    with open(cache_path, "w") as f:
+        json.dump({
+            "gallery":         [[p, l] for p, l in gallery_samples],
+            "probe":           [[p, l] for p, l in probe_samples],
+            "train_remaining": {k: {ident: paths
+                                    for ident, paths in v.items()}
+                                for k, v in train_remaining.items()},
+            "n_eval_ids":      label_offset,
+            "seed":            seed,
+            "use_scanner":     use_scanner,
+            "gallery_ratio":   gallery_ratio,
+        }, f, indent=2)
+    print(f"  Eval set cached to:\n    {cache_path}\n")
     return gallery_samples, probe_samples, train_remaining
 
 
@@ -503,14 +543,6 @@ def split_cross_dataset_test(id2paths, gallery_ratio=0.50, seed=42):
         for p in paths[:n_gal]: gallery_samples.append((p, label_map[ident]))
         for p in paths[n_gal:]: probe_samples.append((p, label_map[ident]))
     return gallery_samples, probe_samples, label_map
-
-
-def id2paths_to_samples(id2paths):
-    """Convert id2paths dict to flat (path, label) list with sequential labels."""
-    label_map = {k: i for i, k in enumerate(sorted(id2paths.keys()))}
-    return [(p, label_map[ident])
-            for ident, paths in id2paths.items()
-            for p in paths], label_map
 
 
 # ══════════════════════════════════════════════════════════════
@@ -610,12 +642,12 @@ def evaluate(model, probe_loader, gallery_loader, device,
              out_dir=".", tag="eval"):
     probe_feats,   probe_labels   = extract_features(model, probe_loader, device)
     gallery_feats, gallery_labels = extract_features(model, gallery_loader, device)
-    n_probe   = len(probe_feats)
+    n_probe = len(probe_feats)
 
     # dot-product similarity (both embeddings are L2-normalised)
     sim_matrix = probe_feats @ gallery_feats.T   # (n_probe, n_gallery)
 
-    # genuine/impostor pairs
+    # genuine (+1) / impostor (-1) pairs: all probe vs all gallery
     scores_list, labels_list = [], []
     for i in range(n_probe):
         for j in range(sim_matrix.shape[1]):
@@ -625,7 +657,7 @@ def evaluate(model, probe_loader, gallery_loader, device,
     scores_arr = np.column_stack([scores_list, labels_list])
     eer, _     = compute_eer(scores_arr)
 
-    # Rank-1
+    # Rank-1: nearest gallery neighbour by highest similarity
     nn_idx  = np.argmax(sim_matrix, axis=1)
     correct = sum(probe_labels[i] == gallery_labels[nn_idx[i]]
                   for i in range(n_probe))
@@ -711,9 +743,10 @@ def main():
     print(f"  CompNet Palmprint Recognition")
     print(f"  Device         : {device}")
     print(f"  Train dataset  : {train_data}")
-    print(f"  Evaluation     : {'combined (all 3 datasets)' if use_combined_eval else test_data}")
+    print(f"  Evaluation     : "
+          f"{'combined (all 3 datasets, cached)' if use_combined_eval else test_data}")
     if use_combined_eval:
-        print(f"  Combined eval  : 20% of each dataset's 190 selected IDs")
+        print(f"  Cache path     : {CONFIG.get('combined_eval_cache_path','')}")
     if same_dataset:
         print(f"  Mode           : same-dataset split "
               f"({int(train_subject_ratio*100)}% train / "
@@ -725,10 +758,9 @@ def main():
     print(f"  Augment factor : {augment_factor}×")
     print(f"{'='*60}\n")
 
-    # ── combined evaluation set ───────────────────────────────────────────
-    train_remaining = {}   # ds_key → id2paths (non-held-out IDs)
+    # ── combined evaluation set (load cache or build once) ────────────────
+    train_remaining = {}
     if use_combined_eval:
-        print("Building combined evaluation set …")
         gallery_samples, probe_samples, train_remaining = \
             build_combined_eval_set(CONFIG, seed=seed)
         eval_tag_base = "combined"
@@ -737,10 +769,9 @@ def main():
 
     # ── training data ─────────────────────────────────────────────────────
     if use_combined_eval:
-        # Use the non-held-out portion of the training dataset
+        # Use the non-held-out portion returned by the combined eval builder
         train_id2paths = train_remaining[_ds_key(train_data)]
-        print(f"Training on {train_data} "
-              f"(after removing held-out eval IDs) …")
+        print(f"Scanning {train_data} (training portion after eval hold-out) …")
         n_train_ids  = len(train_id2paths)
         n_train_imgs = sum(len(v) for v in train_id2paths.values())
         print(f"  {n_train_ids} identities, {n_train_imgs} images.\n")
@@ -925,6 +956,8 @@ def main():
         if use_scanner:
             f.write(f"Scanner spectra    : {', '.join(sorted(ALLOWED_SPECTRA))}\n")
         f.write(f"Combined eval      : {use_combined_eval}\n")
+        if use_combined_eval:
+            f.write(f"Eval cache         : {CONFIG.get('combined_eval_cache_path','')}\n")
         f.write(f"Sampling           : high={N_HIGH}×{TARGET_HIGH} low={N_LOW}×{TARGET_LOW}\n")
         f.write(f"Num classes        : {num_classes}\n")
         f.write(f"Eval set           : {'combined' if use_combined_eval else test_data}\n")
