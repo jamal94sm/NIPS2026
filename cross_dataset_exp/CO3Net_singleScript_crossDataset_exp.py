@@ -40,7 +40,7 @@ Combined evaluation set  (combined_evaluation_set = True)
 CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
     # Choices: "CASIA-MS" | "Palm-Auth" | "MPDv2" | "XJTU"
-    "train_data"           : "XJTU",
+    "train_data"           : "Palm-Auth",
     "test_data"            : "MPDv2",   # used only when combined_evaluation_set=False
 
     # ── Dataset paths ──────────────────────────────────────────
@@ -78,7 +78,7 @@ CONFIG = {
     "lr"                   : 0.001,
     "lr_step"              : 30,
     "lr_gamma"             : 0.6,
-    "augment_factor"       : 4,
+    "augment_factor"       : 2,
 
     # ── Misc ───────────────────────────────────────────────────
     "results_dir"          : "./rst_co3net",
