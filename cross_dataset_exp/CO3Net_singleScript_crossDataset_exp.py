@@ -130,8 +130,10 @@ ALLOWED_SPECTRA = {"green", "ir", "yellow", "pink", "white"}
 # Two-group sampling constants (CASIA-MS / MPDv2 / Palm-Auth)
 N_HIGH      = 150
 N_LOW       = 40
-TARGET_HIGH = 29
-TARGET_LOW  = 15
+TARGET_HIGH_CASIA = 29
+TARGET_LOW_CASIA  = 15
+TARGET_HIGH_MPD = 33
+TARGET_LOW_MPD  = 16
 
 # XJTU-specific targets (4 variations × ~7 = 28–29 for high group)
 XJTU_N_TOTAL      = 200   # available IDs in the dataset
@@ -441,8 +443,8 @@ def parse_casia_ms(data_root, seed=42):
         return chosen
 
     id2paths = {}
-    for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH)
-    for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW)
+    for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH_CASIA)
+    for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW_CASIA)
 
     actual = sum(len(v) for v in id2paths.values())
     hc = [len(id2paths[i]) for i in high_ids]
@@ -521,8 +523,8 @@ def parse_mpd_data(data_root, seed=42):
         return rng.sample(paths, min(target, len(paths)))
 
     id2paths = {}
-    for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH+4)
-    for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW+1)
+    for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH_MPD)
+    for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW_MPD)
 
     actual   = sum(len(v) for v in id2paths.values())
     hc = [len(id2paths[i]) for i in high_ids]
