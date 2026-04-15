@@ -20,7 +20,7 @@ Datasets
 CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
     # Choices: "CASIA-MS" | "Palm-Auth" | "MPDv2"
-    "train_data"           : "Palm-Auth",
+    "train_data"           : "CASIA-MS",
     "test_data"            : "MPDv2",
 
     # ── Dataset paths ──────────────────────────────────────────
