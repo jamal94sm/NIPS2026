@@ -639,14 +639,14 @@ def build_combined_eval_set(cfg, seed=42):
 # ══════════════════════════════════════════════════════════════
 
 def get_or_create_init_weights(net, cfg, num_classes, device):
-    """
-    Save init weights on first run, load them on every subsequent run.
-    File: init_weights_nc{num_classes}.pth  (alongside the JSON cache).
-    Eliminates CUDA-RNG divergence at epoch 0.
-    """
     cache_path   = cfg.get("combined_eval_cache_path", "./combined_eval_cache.json")
     cache_dir    = os.path.dirname(os.path.abspath(cache_path))
-    weights_path = os.path.join(cache_dir, f"init_weights_nc{num_classes}.pth")
+
+    # ── include model name to avoid cross-model conflicts ─────
+    model_name   = type(net.module if isinstance(net, DataParallel) else net).__name__
+    weights_path = os.path.join(cache_dir,
+                                f"init_weights_{model_name}_nc{num_classes}.pth")
+
     _net = net.module if isinstance(net, DataParallel) else net
 
     if os.path.exists(weights_path):
