@@ -451,7 +451,7 @@ def parse_mpd_data(data_root, seed=42):
     cutoff_low   = len(id_dev[low_ids[-1]].get("h",[])) + len(id_dev[low_ids[-1]].get("m",[]))
 
     print(f"  [MPDv2] ids={len(id2paths)}  total={actual_total}")
-    print(f"    High group ({N_HIGH} IDs × ~{TARGET_HIGH}): "
+    print(f"    High group ({N_HIGH} IDs × ~{TARGET_HIGH_MPD}): "
           f"min={min(high_counts)}  max={max(high_counts)}  "
           f"mean={sum(high_counts)/N_HIGH:.1f}  "
           f"cutoff={cutoff_high} raw")
