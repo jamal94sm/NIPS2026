@@ -521,7 +521,7 @@ def parse_mpd_data(data_root, seed=42):
         return rng.sample(paths, min(target, len(paths)))
 
     id2paths = {}
-    for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH+3)
+    for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH+4)
     for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW+1)
 
     actual   = sum(len(v) for v in id2paths.values())
