@@ -102,7 +102,7 @@ ALLOWED_SPECTRA = {"green", "ir", "yellow", "pink", "white"}
 # Two-group sampling parameters (shared across all datasets)
 N_HIGH      = 150   # number of IDs in the high-sample group
 N_LOW       = 40    # number of IDs in the low-sample group
-TARGET_HIGH_CASIA = 30
+TARGET_HIGH_CASIA = 29
 TARGET_HIGH_MPD   = 34
 TARGET_LOW        = 16
 
