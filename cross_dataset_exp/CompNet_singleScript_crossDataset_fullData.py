@@ -1,13 +1,17 @@
 """
 CompNet — Cross-Dataset Palmprint Recognition
 ==================================================
-Changes vs previous version:
-  1. MPDv2     — selects 190 IDs with the HIGHEST total sample count
-  2. CASIA-MS  — loads 6000 images from 190 IDs
-  3. Palm-Auth — toggle "use_scanner":
-       False → roi_perspective only
-       True  → roi_perspective + roi_scanner (allowed spectra only:
-                green, ir, yellow, pink, white)
+Dataset sampling mirrors Palm-Auth distribution:
+  High group : 150 IDs × ~30 samples
+  Low  group :  40 IDs × ~15 samples
+  Total      : 190 IDs
+
+Datasets
+--------
+  CASIA-MS  : {subjectID}_{handSide}_{spectrum}_{iter}.jpg
+  Palm-Auth : {ID}/roi_perspective/{ID}_{hand}_{condition}.jpg
+              {ID}/roi_scanner/{ID}_{Hand}_{spectrum}_{num}.jpg
+  MPDv2     : {subject}_{session}_{device}_{handSide}_{iter}.jpg
 """
 
 # ==============================================================
@@ -17,7 +21,7 @@ CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
     # Choices: "CASIA-MS" | "Palm-Auth" | "MPDv2"
     "train_data"           : "Palm-Auth",
-    "test_data"            : "Palm-Auth",
+    "test_data"            : "MPDv2",
 
     # ── Dataset paths ──────────────────────────────────────────
     "casiams_data_root"    : "/home/pai-ng/Jamal/CASIA-MS-ROI",
@@ -27,13 +31,6 @@ CONFIG = {
     # ── Splitting ──────────────────────────────────────────────
     "train_subject_ratio"  : 0.80,
     "test_gallery_ratio"   : 0.50,
-
-    # ── CASIA-MS sampling ──────────────────────────────────────
-    "n_casia_subjects"     : 190,
-    "n_casia_samples"      : 6000,
-
-    # ── MPDv2 sampling ─────────────────────────────────────────
-    "n_mpd_subjects"       : 190,
 
     # ── Palm-Auth toggle ───────────────────────────────────────
     # False → roi_perspective only
@@ -99,8 +96,14 @@ SEED = CONFIG["random_seed"]
 random.seed(SEED); np.random.seed(SEED)
 torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 
-# Scanner spectra to include (others such as red, orange, magenta are excluded)
+# Scanner spectra to include (red, orange, magenta are excluded)
 ALLOWED_SPECTRA = {"green", "ir", "yellow", "pink", "white"}
+
+# Two-group sampling parameters (shared across all datasets)
+N_HIGH      = 150   # number of IDs in the high-sample group
+N_LOW       = 40    # number of IDs in the low-sample group
+TARGET_HIGH = 30    # target images per ID in the high group
+TARGET_LOW  = 15    # target images per ID in the low group
 
 
 # ══════════════════════════════════════════════════════════════
@@ -257,7 +260,13 @@ class NormSingleROI:
 #  DATASET PARSERS
 # ══════════════════════════════════════════════════════════════
 
-def parse_casia_ms(data_root, n_subjects=190, n_total_samples=6000, seed=42):
+def parse_casia_ms(data_root, seed=42):
+    """
+    Two-group sampling to mirror Palm-Auth distribution:
+      High group : 150 IDs × 30 samples (distributed evenly across spectra)
+      Low  group :  40 IDs × 15 samples (distributed evenly across spectra)
+    Total: 190 IDs, ~5100 samples.
+    """
     rng     = random.Random(seed)
     id_spec = defaultdict(lambda: defaultdict(list))
 
@@ -273,35 +282,45 @@ def parse_casia_ms(data_root, n_subjects=190, n_total_samples=6000, seed=42):
         id_spec[identity][spectrum].append(os.path.join(data_root, fname))
 
     all_ids = sorted(id_spec.keys())
-    if n_subjects > len(all_ids):
-        raise ValueError(f"Requested {n_subjects} but only {len(all_ids)} available.")
+    if len(all_ids) < N_HIGH + N_LOW:
+        raise ValueError(f"Need {N_HIGH + N_LOW} IDs but only {len(all_ids)} available.")
 
-    selected      = sorted(rng.sample(all_ids, n_subjects))
-    base_per_id   = n_total_samples // n_subjects
-    rem_ids       = n_total_samples %  n_subjects
-    id_list       = list(selected); rng.shuffle(id_list)
-    id_target     = {ident: base_per_id + (1 if i < rem_ids else 0)
-                     for i, ident in enumerate(id_list)}
+    selected = sorted(rng.sample(all_ids, N_HIGH + N_LOW))
+    rng.shuffle(selected)
+    high_ids = selected[:N_HIGH]
+    low_ids  = selected[N_HIGH:]
 
-    id2paths     = {}
-    actual_total = 0
-    for ident in selected:
-        target    = id_target[ident]
-        spec_list = list(sorted(id_spec[ident].keys())); rng.shuffle(spec_list)
-        n_spec    = len(spec_list)
-        base_s    = target // n_spec; rem_s = target % n_spec
-        chosen    = []
+    def _sample_spectra(ident, target):
+        """Sample `target` images from `ident`, distributed across spectra."""
+        spec_list = list(sorted(id_spec[ident].keys()))
+        rng.shuffle(spec_list)
+        n_spec  = len(spec_list)
+        base_s  = target // n_spec
+        rem_s   = target %  n_spec
+        chosen  = []
         for j, sp in enumerate(spec_list):
-            k = base_s + (1 if j < rem_s else 0)
-            k = min(k, len(id_spec[ident][sp]))
+            k = min(base_s + (1 if j < rem_s else 0),
+                    len(id_spec[ident][sp]))
             chosen.extend(rng.sample(id_spec[ident][sp], k))
-        id2paths[ident]  = chosen
-        actual_total    += len(chosen)
+        return chosen
 
-    counts = [len(v) for v in id2paths.values()]
-    print(f"  [CASIA-MS] ids={len(id2paths)}  total={actual_total}  "
-          f"per-id min/max/mean={min(counts)}/{max(counts)}"
-          f"/{sum(counts)/len(counts):.1f}")
+    id2paths = {}
+    for ident in high_ids:
+        id2paths[ident] = _sample_spectra(ident, TARGET_HIGH)
+    for ident in low_ids:
+        id2paths[ident] = _sample_spectra(ident, TARGET_LOW)
+
+    actual_total = sum(len(v) for v in id2paths.values())
+    high_counts  = [len(id2paths[i]) for i in high_ids]
+    low_counts   = [len(id2paths[i]) for i in low_ids]
+
+    print(f"  [CASIA-MS] ids={len(id2paths)}  total={actual_total}")
+    print(f"    High group ({N_HIGH} IDs × ~{TARGET_HIGH}): "
+          f"min={min(high_counts)}  max={max(high_counts)}  "
+          f"mean={sum(high_counts)/N_HIGH:.1f}")
+    print(f"    Low  group ({N_LOW} IDs × ~{TARGET_LOW}): "
+          f"min={min(low_counts)}  max={max(low_counts)}  "
+          f"mean={sum(low_counts)/N_LOW:.1f}")
     return id2paths
 
 
@@ -314,9 +333,7 @@ def parse_palm_auth_data(data_root, use_scanner=False):
                         (only ALLOWED_SPECTRA: green, ir, yellow, pink, white)
 
     roi_perspective filename : {id}_{hand}_{condition}.jpg
-                               e.g. 50_left_bf.jpg
     roi_scanner filename     : {id}_{Hand}_{spectrum}_{num}.jpg
-                               e.g. 50_Left_green_1.jpg
     Identity key             : "{id}_{hand_lower}"  e.g. "50_left"
     """
     IMG_EXTS = {".jpg", ".jpeg", ".bmp", ".png"}
@@ -336,8 +353,7 @@ def parse_palm_auth_data(data_root, use_scanner=False):
                 parts = os.path.splitext(fname)[0].split("_")
                 if len(parts) < 3:
                     continue
-                # parts[0]=id, parts[1]=hand ("left"/"right")
-                identity = parts[0] + "_" + parts[1]
+                identity = parts[0] + "_" + parts[1]   # "50_left"
                 id2paths[identity].append(os.path.join(roi_dir, fname))
 
         # ── roi_scanner (filtered by ALLOWED_SPECTRA) ─────────
@@ -348,14 +364,13 @@ def parse_palm_auth_data(data_root, use_scanner=False):
                     if os.path.splitext(fname)[1].lower() not in IMG_EXTS:
                         continue
                     parts = os.path.splitext(fname)[0].split("_")
-                    # parts[0]=id, parts[1]=Hand, parts[2]=spectrum, parts[3]=num
-                    # e.g. 50_Left_green_1  →  spectrum="green"
+                    # format: {id}_{Hand}_{spectrum}_{num}.jpg
                     if len(parts) < 4:
                         continue
                     spectrum = parts[2].lower()
                     if spectrum not in ALLOWED_SPECTRA:
-                        continue               # skip red, orange, magenta, etc.
-                    hand     = parts[1].lower()          # "left" or "right"
+                        continue
+                    hand     = parts[1].lower()
                     identity = subject_id + "_" + hand   # "50_left"
                     id2paths[identity].append(os.path.join(scan_dir, fname))
 
@@ -372,10 +387,12 @@ def parse_palm_auth_data(data_root, use_scanner=False):
     return result
 
 
-def parse_mpd_data(data_root, n_subjects=190, seed=42):
+def parse_mpd_data(data_root, seed=42):
     """
-    Select the n_subjects IDs with the HIGHEST total image count.
-    All images of each selected ID are used.
+    Two-group sampling to mirror Palm-Auth distribution:
+      High group : top 150 IDs by total count, sample min(30, available) each
+      Low  group : next 40 IDs with ≥15 samples, sample min(15, available) each
+    Total: 190 IDs.
     """
     rng    = random.Random(seed)
     id_dev = defaultdict(lambda: defaultdict(list))
@@ -393,41 +410,54 @@ def parse_mpd_data(data_root, n_subjects=190, seed=42):
         identity = subject + "_" + hand_side
         id_dev[identity][device].append(os.path.join(data_root, fname))
 
+    # Sort descending by total count; random shuffle for tie-breaking
     all_ids = list(id_dev.keys())
-    rng.shuffle(all_ids)                           # random for tie-breaking
+    rng.shuffle(all_ids)
     all_ids.sort(
-        key=lambda ident: len(id_dev[ident].get("h", []))
-                        + len(id_dev[ident].get("m", [])),
+        key=lambda i: len(id_dev[i].get("h",[])) + len(id_dev[i].get("m",[])),
         reverse=True)
 
-    if n_subjects > len(all_ids):
+    if len(all_ids) < N_HIGH:
+        raise ValueError(f"Need {N_HIGH} IDs for high group but only {len(all_ids)} found.")
+
+    high_ids = all_ids[:N_HIGH]
+
+    # Low group: from remaining IDs, take those with >= TARGET_LOW samples
+    low_candidates = [
+        i for i in all_ids[N_HIGH:]
+        if len(id_dev[i].get("h",[])) + len(id_dev[i].get("m",[])) >= TARGET_LOW
+    ]
+    if len(low_candidates) < N_LOW:
         raise ValueError(
-            f"Requested {n_subjects} IDs but only {len(all_ids)} found.")
+            f"Not enough IDs with ≥{TARGET_LOW} samples for low group: "
+            f"found {len(low_candidates)}, need {N_LOW}.")
+    low_ids = low_candidates[:N_LOW]
 
-    selected = all_ids[:n_subjects]
-    cutoff   = (len(id_dev[selected[-1]].get("h", []))
-              + len(id_dev[selected[-1]].get("m", [])))
+    def _sample_mpd(ident, target):
+        all_paths = id_dev[ident].get("h",[]) + id_dev[ident].get("m",[])
+        return rng.sample(all_paths, min(target, len(all_paths)))
 
-    id2paths     = {}
-    actual_total = 0
-    for ident in selected:
-        paths = (id_dev[ident].get("h", []) + id_dev[ident].get("m", []))
-        id2paths[ident]  = paths
-        actual_total    += len(paths)
+    id2paths = {}
+    for ident in high_ids:
+        id2paths[ident] = _sample_mpd(ident, TARGET_HIGH)
+    for ident in low_ids:
+        id2paths[ident] = _sample_mpd(ident, TARGET_LOW)
 
-    counts   = [len(v) for v in id2paths.values()]
-    counts_h = [len(id_dev[i].get("h",[])) for i in selected]
-    counts_m = [len(id_dev[i].get("m",[])) for i in selected]
+    actual_total = sum(len(v) for v in id2paths.values())
+    high_counts  = [len(id2paths[i]) for i in high_ids]
+    low_counts   = [len(id2paths[i]) for i in low_ids]
+    cutoff_high  = len(id_dev[high_ids[-1]].get("h",[])) + len(id_dev[high_ids[-1]].get("m",[]))
+    cutoff_low   = len(id_dev[low_ids[-1]].get("h",[])) + len(id_dev[low_ids[-1]].get("m",[]))
 
-    print(f"  [MPDv2] Selected top-{n_subjects} IDs by sample count")
-    print(f"    Cutoff (samples in ID #{n_subjects}) : {cutoff}")
-    print(f"    Total images  : {actual_total}")
-    print(f"    Per-ID  min/max/mean : "
-          f"{min(counts)}/{max(counts)}/{sum(counts)/len(counts):.1f}")
-    print(f"    Device h min/max/mean: "
-          f"{min(counts_h)}/{max(counts_h)}/{sum(counts_h)/len(counts_h):.1f}")
-    print(f"    Device m min/max/mean: "
-          f"{min(counts_m)}/{max(counts_m)}/{sum(counts_m)/len(counts_m):.1f}")
+    print(f"  [MPDv2] ids={len(id2paths)}  total={actual_total}")
+    print(f"    High group ({N_HIGH} IDs × ~{TARGET_HIGH}): "
+          f"min={min(high_counts)}  max={max(high_counts)}  "
+          f"mean={sum(high_counts)/N_HIGH:.1f}  "
+          f"cutoff={cutoff_high} raw")
+    print(f"    Low  group ({N_LOW} IDs × ~{TARGET_LOW}): "
+          f"min={min(low_counts)}  max={max(low_counts)}  "
+          f"mean={sum(low_counts)/N_LOW:.1f}  "
+          f"cutoff={cutoff_low} raw")
     return id2paths
 
 
@@ -437,8 +467,6 @@ def get_parser(dataset_name, cfg):
     if name == "casiams":
         return lambda: parse_casia_ms(
             cfg["casiams_data_root"],
-            n_subjects=cfg["n_casia_subjects"],
-            n_total_samples=cfg["n_casia_samples"],
             seed=seed)
     elif name == "palmauth":
         return lambda: parse_palm_auth_data(
@@ -447,7 +475,6 @@ def get_parser(dataset_name, cfg):
     elif name == "mpdv2":
         return lambda: parse_mpd_data(
             cfg["mpd_data_root"],
-            n_subjects=cfg["n_mpd_subjects"],
             seed=seed)
     else:
         raise ValueError(f"Unknown dataset: '{dataset_name}'. "
@@ -722,6 +749,8 @@ def main():
                   f"(spectra: {', '.join(sorted(ALLOWED_SPECTRA))})")
         else:
             print(f"  Scanner data   : OFF (perspective only)")
+    print(f"  Sampling       : high={N_HIGH}×{TARGET_HIGH}  "
+          f"low={N_LOW}×{TARGET_LOW}")
     print(f"  Loss           : CrossEntropy")
     print(f"  Augment factor : {augment_factor}×")
     print(f"{'='*60}\n")
@@ -914,6 +943,8 @@ def main():
         f.write(f"Scanner data       : {use_scanner}\n")
         if use_scanner:
             f.write(f"Scanner spectra    : {', '.join(sorted(ALLOWED_SPECTRA))}\n")
+        f.write(f"Sampling           : high={N_HIGH}×{TARGET_HIGH} "
+                f"low={N_LOW}×{TARGET_LOW}\n")
         f.write(f"Num classes        : {num_classes}\n")
         f.write(f"Test dataset       : {test_data}\n")
         f.write(f"Test subjects      : {n_test_ids}\n")
