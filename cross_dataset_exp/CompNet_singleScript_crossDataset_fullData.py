@@ -23,7 +23,7 @@ When combined_evaluation_set = True:
 CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
     # Choices: "CASIA-MS" | "Palm-Auth" | "MPDv2"
-    "train_data"           : "Palm-Auth",
+    "train_data"           : "MPDv2",
     "test_data"            : "MPDv2",      # used only when combined_evaluation_set=False
 
     # ── Dataset paths ──────────────────────────────────────────
