@@ -1,5 +1,68 @@
+import os
+from collections import Counter, defaultdict
+
+DATA_ROOT = "/home/pai-ng/Jamal/CASIA-MS-ROI"
+IMG_EXTS  = {".jpg", ".jpeg", ".png", ".bmp"}
+
+# filename: {subjectID}_{gender}_{handSide}_{iter}.jpg
+# e.g. 0048_m_r_04.jpg → subject="0048"  gender="m"  hand="r"  iter="04"
+# identity key: "0048_r"
+
+id2count   = defaultdict(int)   # identity → total images
+id2gender  = {}                 # identity → gender (m/f)
+hand_count = defaultdict(int)   # "l" / "r" → how many IDs
+
+for fname in sorted(os.listdir(DATA_ROOT)):
+    if os.path.splitext(fname)[1].lower() not in IMG_EXTS:
+        continue
+    parts = os.path.splitext(fname)[0].split("_")
+    if len(parts) < 4:
+        continue
+    subject, gender, hand, iteration = parts[0], parts[1], parts[2], parts[3]
+    identity = subject + "_" + hand
+    id2count[identity]  += 1
+    id2gender[identity]  = gender
+
+all_ids = sorted(id2count.keys())
+
+# ── Print table ────────────────────────────────────────────────
+print(f"\n{'Identity':<14} {'Gender':>8} {'Hand':>6} {'Images':>8}")
+print("-" * 40)
+for ident in all_ids:
+    subject, hand = ident.rsplit("_", 1)
+    gender = id2gender[ident]
+    print(f"{ident:<14} {gender:>8} {hand:>6} {id2count[ident]:>8}")
+
+# ── Summary ────────────────────────────────────────────────────
+counts = list(id2count.values())
+n_male   = sum(1 for g in id2gender.values() if g == "m")
+n_female = sum(1 for g in id2gender.values() if g == "f")
+n_left   = sum(1 for i in all_ids if i.endswith("_l"))
+n_right  = sum(1 for i in all_ids if i.endswith("_r"))
+
+print(f"\n{'='*40}")
+print(f"  Total identities    : {len(all_ids)}")
+print(f"    Male              : {n_male}")
+print(f"    Female            : {n_female}")
+print(f"    Left hand         : {n_left}")
+print(f"    Right hand        : {n_right}")
+print(f"\n  Images per identity")
+print(f"    Min / Max / Mean  : {min(counts)} / {max(counts)} / {sum(counts)/len(counts):.1f}")
+print(f"    Total images      : {sum(counts)}")
+dist = Counter(counts)
+print(f"    Distribution      : { {k: dist[k] for k in sorted(dist)} }")
+
+# IDs where both hands are present
+subjects = defaultdict(set)
+for ident in all_ids:
+    subject, hand = ident.rsplit("_", 1)
+    subjects[subject].add(hand)
+both_hands = sum(1 for hands in subjects.values() if len(hands) == 2)
+print(f"\n  Subjects with both hands : {both_hands} / {len(subjects)}")
+print(f"{'='*40}\n")
 
 
+'''
 import os
 from collections import Counter
 
@@ -90,6 +153,9 @@ if scanner_counts:
     dist = Counter(scanner_counts)
     print(f"    Distribution        : { {k: dist[k] for k in sorted(dist)} }")
 print(f"{'='*40}\n")
+'''
+
+
 
 
 
