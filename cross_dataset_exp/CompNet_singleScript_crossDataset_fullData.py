@@ -51,7 +51,7 @@ CONFIG = {
     "use_scanner"          : True,
 
     # ── Combined evaluation set ────────────────────────────────
-    "combined_evaluation_set"  : True,
+    "combined_evaluation_set"  : False,
     "combined_gallery_ratio"   : 0.50,
 
     # Both cache files live next to this path:
