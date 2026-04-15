@@ -35,8 +35,8 @@ Combined evaluation set  (combined_evaluation_set = True)
 CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
     # Choices: "CASIA-MS" | "Palm-Auth" | "MPDv2"
-    "train_data"           : "MPDv2",
-    "test_data"            : "CASIA-MS",      # used only when combined_evaluation_set=False
+    "train_data"           : "CASIA-MS",
+    "test_data"            : "Palm-Auth",      # used only when combined_evaluation_set=False
 
     # ── Dataset paths ──────────────────────────────────────────
     "casiams_data_root"    : "/home/pai-ng/Jamal/CASIA-MS-ROI",
