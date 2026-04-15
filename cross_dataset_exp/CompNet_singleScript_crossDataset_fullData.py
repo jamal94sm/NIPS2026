@@ -2,12 +2,12 @@
 CompNet — Cross-Dataset Palmprint Recognition
 ==================================================
 Changes vs previous version:
-  1. MPDv2  — selects 190 IDs with the HIGHEST total sample count
-               (no 7/8 eligibility threshold; uses all images of each selected ID)
-  2. CASIA-MS — loads 6000 images from 190 IDs
-  3. Smartphone — toggle "use_scanner":
-       False → roi_perspective only  (original behaviour)
-       True  → roi_perspective + roi_scanner (for IDs that have it)
+  1. MPDv2     — selects 190 IDs with the HIGHEST total sample count
+  2. CASIA-MS  — loads 6000 images from 190 IDs
+  3. Palm-Auth — toggle "use_scanner":
+       False → roi_perspective only
+       True  → roi_perspective + roi_scanner (allowed spectra only:
+                green, ir, yellow, pink, white)
 """
 
 # ==============================================================
@@ -15,13 +15,13 @@ Changes vs previous version:
 # ==============================================================
 CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
-    # Choices: "CASIA-MS" | "Smartphone" | "MPDv2"
-    "train_data"           : "Smartphone",
-    "test_data"            : "Smartphone",
+    # Choices: "CASIA-MS" | "Palm-Auth" | "MPDv2"
+    "train_data"           : "Palm-Auth",
+    "test_data"            : "Palm-Auth",
 
     # ── Dataset paths ──────────────────────────────────────────
     "casiams_data_root"    : "/home/pai-ng/Jamal/CASIA-MS-ROI",
-    "smartphone_data_root" : "/home/pai-ng/Jamal/smartphone_data",
+    "palm_auth_data_root"  : "/home/pai-ng/Jamal/smartphone_data",
     "mpd_data_root"        : "/home/pai-ng/Jamal/MPDv2_mediapipe_manual_roi",
 
     # ── Splitting ──────────────────────────────────────────────
@@ -30,16 +30,14 @@ CONFIG = {
 
     # ── CASIA-MS sampling ──────────────────────────────────────
     "n_casia_subjects"     : 190,
-    "n_casia_samples"      : 6000,   # ← changed from 2776
+    "n_casia_samples"      : 6000,
 
     # ── MPDv2 sampling ─────────────────────────────────────────
-    # Selects n_mpd_subjects IDs with the highest total sample count.
-    # All images of each selected ID are used (no fixed per-ID cap).
     "n_mpd_subjects"       : 190,
 
-    # ── Smartphone toggle ──────────────────────────────────────
+    # ── Palm-Auth toggle ───────────────────────────────────────
     # False → roi_perspective only
-    # True  → roi_perspective + roi_scanner (if the ID has it)
+    # True  → roi_perspective + roi_scanner (allowed spectra only)
     "use_scanner"          : True,
 
     # ── Model ──────────────────────────────────────────────────
@@ -100,6 +98,9 @@ warnings.filterwarnings("ignore")
 SEED = CONFIG["random_seed"]
 random.seed(SEED); np.random.seed(SEED)
 torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
+
+# Scanner spectra to include (others such as red, orange, magenta are excluded)
+ALLOWED_SPECTRA = {"green", "ir", "yellow", "pink", "white"}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -257,10 +258,6 @@ class NormSingleROI:
 # ══════════════════════════════════════════════════════════════
 
 def parse_casia_ms(data_root, n_subjects=190, n_total_samples=6000, seed=42):
-    """
-    Select n_subjects identities and sample n_total_samples images
-    distributed evenly across subjects and spectra.
-    """
     rng     = random.Random(seed)
     id_spec = defaultdict(lambda: defaultdict(list))
 
@@ -308,7 +305,20 @@ def parse_casia_ms(data_root, n_subjects=190, n_total_samples=6000, seed=42):
     return id2paths
 
 
-def parse_smartphone_data(data_root, use_scanner=False):
+def parse_palm_auth_data(data_root, use_scanner=False):
+    """
+    Load Palm-Auth (smartphone_data) ROI images.
+
+    use_scanner=False : roi_perspective only
+    use_scanner=True  : roi_perspective + roi_scanner
+                        (only ALLOWED_SPECTRA: green, ir, yellow, pink, white)
+
+    roi_perspective filename : {id}_{hand}_{condition}.jpg
+                               e.g. 50_left_bf.jpg
+    roi_scanner filename     : {id}_{Hand}_{spectrum}_{num}.jpg
+                               e.g. 50_Left_green_1.jpg
+    Identity key             : "{id}_{hand_lower}"  e.g. "50_left"
+    """
     IMG_EXTS = {".jpg", ".jpeg", ".bmp", ".png"}
     id2paths  = defaultdict(list)
 
@@ -318,8 +328,6 @@ def parse_smartphone_data(data_root, use_scanner=False):
             continue
 
         # ── roi_perspective ───────────────────────────────────
-        # filename: {id}_{hand}_{condition}.jpg
-        # e.g. 35_left_bf.jpg → parts[0]="35", parts[1]="left"
         roi_dir = os.path.join(subject_dir, "roi_perspective")
         if os.path.isdir(roi_dir):
             for fname in sorted(os.listdir(roi_dir)):
@@ -328,13 +336,11 @@ def parse_smartphone_data(data_root, use_scanner=False):
                 parts = os.path.splitext(fname)[0].split("_")
                 if len(parts) < 3:
                     continue
-                identity = parts[0] + "_" + parts[1]   # "35_left"
+                # parts[0]=id, parts[1]=hand ("left"/"right")
+                identity = parts[0] + "_" + parts[1]
                 id2paths[identity].append(os.path.join(roi_dir, fname))
 
-        # ── roi_scanner ───────────────────────────────────────
-        # filename: {id}_{session}_{hand}_{color}.jpg
-        # e.g. 035_S2_Left_magenta.jpg → parts[0]="035", parts[2]="Left"
-        # identity must match the perspective identity: subject_id + "_" + hand.lower()
+        # ── roi_scanner (filtered by ALLOWED_SPECTRA) ─────────
         if use_scanner:
             scan_dir = os.path.join(subject_dir, "roi_scanner")
             if os.path.isdir(scan_dir):
@@ -342,31 +348,34 @@ def parse_smartphone_data(data_root, use_scanner=False):
                     if os.path.splitext(fname)[1].lower() not in IMG_EXTS:
                         continue
                     parts = os.path.splitext(fname)[0].split("_")
-                    # scanner format: {id}_{Hand}_{color}_{num}.jpg
-                    # e.g. 50_Left_green_1.jpg → parts[1] = "Left"
+                    # parts[0]=id, parts[1]=Hand, parts[2]=spectrum, parts[3]=num
+                    # e.g. 50_Left_green_1  →  spectrum="green"
                     if len(parts) < 4:
                         continue
+                    spectrum = parts[2].lower()
+                    if spectrum not in ALLOWED_SPECTRA:
+                        continue               # skip red, orange, magenta, etc.
                     hand     = parts[1].lower()          # "left" or "right"
                     identity = subject_id + "_" + hand   # "50_left"
                     id2paths[identity].append(os.path.join(scan_dir, fname))
 
     result = dict(id2paths)
     counts = [len(v) for v in result.values()]
-    mode   = "perspective + scanner" if use_scanner else "perspective only"
-    print(f"  [Smartphone/{mode}] ids={len(result)}  "
+    if use_scanner:
+        mode = f"perspective + scanner ({', '.join(sorted(ALLOWED_SPECTRA))})"
+    else:
+        mode = "perspective only"
+    print(f"  [Palm-Auth/{mode}] ids={len(result)}  "
           f"total={sum(counts)}  "
           f"per-id min/max/mean={min(counts)}/{max(counts)}"
           f"/{sum(counts)/len(counts):.1f}")
     return result
 
+
 def parse_mpd_data(data_root, n_subjects=190, seed=42):
     """
-    Select the n_subjects IDs with the HIGHEST total image count
-    (h + m combined). No minimum-per-device threshold is applied.
-    All images of each selected ID are used — no fixed per-ID cap.
-
-    Filename: {subject}_{session}_{device}_{handSide}_{iter}.jpg
-    Identity: subject + "_" + handSide  (e.g. "191_l")
+    Select the n_subjects IDs with the HIGHEST total image count.
+    All images of each selected ID are used.
     """
     rng    = random.Random(seed)
     id_dev = defaultdict(lambda: defaultdict(list))
@@ -384,18 +393,16 @@ def parse_mpd_data(data_root, n_subjects=190, seed=42):
         identity = subject + "_" + hand_side
         id_dev[identity][device].append(os.path.join(data_root, fname))
 
-    # Sort all IDs by total count descending, break ties randomly
     all_ids = list(id_dev.keys())
-    rng.shuffle(all_ids)                           # random shuffle for tie-breaking
+    rng.shuffle(all_ids)                           # random for tie-breaking
     all_ids.sort(
         key=lambda ident: len(id_dev[ident].get("h", []))
                         + len(id_dev[ident].get("m", [])),
-        reverse=True
-    )
+        reverse=True)
 
     if n_subjects > len(all_ids):
         raise ValueError(
-            f"Requested {n_subjects} IDs but only {len(all_ids)} found in {data_root}.")
+            f"Requested {n_subjects} IDs but only {len(all_ids)} found.")
 
     selected = all_ids[:n_subjects]
     cutoff   = (len(id_dev[selected[-1]].get("h", []))
@@ -404,8 +411,7 @@ def parse_mpd_data(data_root, n_subjects=190, seed=42):
     id2paths     = {}
     actual_total = 0
     for ident in selected:
-        paths = (id_dev[ident].get("h", []) +
-                 id_dev[ident].get("m", []))
+        paths = (id_dev[ident].get("h", []) + id_dev[ident].get("m", []))
         id2paths[ident]  = paths
         actual_total    += len(paths)
 
@@ -434,9 +440,9 @@ def get_parser(dataset_name, cfg):
             n_subjects=cfg["n_casia_subjects"],
             n_total_samples=cfg["n_casia_samples"],
             seed=seed)
-    elif name == "smartphone":
-        return lambda: parse_smartphone_data(
-            cfg["smartphone_data_root"],
+    elif name == "palmauth":
+        return lambda: parse_palm_auth_data(
+            cfg["palm_auth_data_root"],
             use_scanner=cfg.get("use_scanner", False))
     elif name == "mpdv2":
         return lambda: parse_mpd_data(
@@ -445,7 +451,7 @@ def get_parser(dataset_name, cfg):
             seed=seed)
     else:
         raise ValueError(f"Unknown dataset: '{dataset_name}'. "
-                         f"Use 'CASIA-MS', 'Smartphone', or 'MPDv2'.")
+                         f"Use 'CASIA-MS', 'Palm-Auth', or 'MPDv2'.")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -710,8 +716,12 @@ def main():
         print(f"  Mode           : same-dataset split "
               f"({int(train_subject_ratio*100)}% train / "
               f"{int((1-train_subject_ratio)*100)}% test)")
-    if "smartphone" in train_data.lower() or "smartphone" in test_data.lower():
-        print(f"  Scanner data   : {'ON  (perspective + scanner)' if use_scanner else 'OFF (perspective only)'}")
+    if "palm-auth" in train_data.lower() or "palm-auth" in test_data.lower():
+        if use_scanner:
+            print(f"  Scanner data   : ON  "
+                  f"(spectra: {', '.join(sorted(ALLOWED_SPECTRA))})")
+        else:
+            print(f"  Scanner data   : OFF (perspective only)")
     print(f"  Loss           : CrossEntropy")
     print(f"  Augment factor : {augment_factor}×")
     print(f"{'='*60}\n")
@@ -797,7 +807,6 @@ def main():
         print(f"  Using {torch.cuda.device_count()} GPUs")
         net = DataParallel(net)
 
-    # ── resume ────────────────────────────────────────────────
     if CONFIG.get("resume", False):
         for ckpt in ["net_params_best_eer.pth", "net_params_best.pth",
                      "net_params.pth"]:
@@ -903,6 +912,8 @@ def main():
         f.write(f"Train images       : {n_train_imgs}\n")
         f.write(f"Augment factor     : {augment_factor}×\n")
         f.write(f"Scanner data       : {use_scanner}\n")
+        if use_scanner:
+            f.write(f"Scanner spectra    : {', '.join(sorted(ALLOWED_SPECTRA))}\n")
         f.write(f"Num classes        : {num_classes}\n")
         f.write(f"Test dataset       : {test_data}\n")
         f.write(f"Test subjects      : {n_test_ids}\n")
