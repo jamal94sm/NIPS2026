@@ -137,7 +137,7 @@ TARGET_LOW  = 15
 XJTU_N_TOTAL      = 200   # available IDs in the dataset
 XJTU_N_SELECT     = 190   # how many to use
 XJTU_TARGET_HIGH  = 30    # images per ID in high group
-XJTU_TARGET_LOW   = 15    # images per ID in low group
+XJTU_TARGET_LOW   = 14    # images per ID in low group
 # 4 variations: Flash-iPhone | Nature-iPhone | Flash-Huawei | Nature-Huawei
 XJTU_VARIATIONS   = [
     ("iPhone",  "Flash"),
@@ -521,8 +521,8 @@ def parse_mpd_data(data_root, seed=42):
         return rng.sample(paths, min(target, len(paths)))
 
     id2paths = {}
-    for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH)
-    for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW)
+    for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH+2)
+    for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW+1)
 
     actual   = sum(len(v) for v in id2paths.values())
     hc = [len(id2paths[i]) for i in high_ids]
