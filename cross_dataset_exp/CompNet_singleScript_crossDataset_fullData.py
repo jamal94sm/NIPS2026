@@ -44,7 +44,7 @@ CONFIG = {
     # ── Combined evaluation set ────────────────────────────────
     # True  → build (or load cached) combined eval set from all 3 datasets.
     # False → standard per-dataset test split.
-    "combined_evaluation_set" : False,
+    "combined_evaluation_set" : True,
     "combined_gallery_ratio"  : 0.50,
 
     # Path where the combined eval set JSON is cached.
