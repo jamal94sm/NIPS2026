@@ -1,28 +1,57 @@
 
-'''
+
 import os
 from collections import Counter
 
-DATA_ROOT  = "/home/pai-ng/Jamal/smartphone_data"
-IMG_EXTS   = {".jpg", ".jpeg", ".png", ".bmp"}
+DATA_ROOT       = "/home/pai-ng/Jamal/smartphone_data"
+IMG_EXTS        = {".jpg", ".jpeg", ".png", ".bmp"}
+ALLOWED_SPECTRA = {"green", "ir", "yellow", "pink", "white"}
+
 
 def count_images(folder):
+    """Count all images in a folder (used for roi_perspective)."""
     if not os.path.isdir(folder):
-        return None          # folder does not exist
+        return None
     return sum(1 for f in os.listdir(folder)
                if os.path.splitext(f)[1].lower() in IMG_EXTS)
+
+
+def count_scanner_images(folder):
+    """
+    Count scanner images whose spectrum is in ALLOWED_SPECTRA.
+    Filename format: {id}_{Hand}_{spectrum}_{num}.jpg
+    e.g. 50_Left_green_1.jpg  → spectrum = "green"  ✓
+         50_Right_red_1.jpg   → spectrum = "red"     ✗ (excluded)
+    Returns None if the folder does not exist.
+    """
+    if not os.path.isdir(folder):
+        return None
+    count = 0
+    for f in os.listdir(folder):
+        if os.path.splitext(f)[1].lower() not in IMG_EXTS:
+            continue
+        parts = os.path.splitext(f)[0].split("_")
+        # parts: [id, Hand, spectrum, num]
+        if len(parts) < 4:
+            continue
+        spectrum = parts[2].lower()
+        if spectrum in ALLOWED_SPECTRA:
+            count += 1
+    return count
+
 
 persp_counts   = []
 scanner_counts = []
 rows           = []
 
-for subject_id in sorted(os.listdir(DATA_ROOT), key=lambda x: int(x) if x.isdigit() else float("inf")):
+for subject_id in sorted(os.listdir(DATA_ROOT),
+                          key=lambda x: int(x) if x.isdigit() else float("inf")):
     subject_dir = os.path.join(DATA_ROOT, subject_id)
     if not os.path.isdir(subject_dir):
         continue
 
     n_persp   = count_images(os.path.join(subject_dir, "roi_perspective"))
-    n_scanner = count_images(os.path.join(subject_dir, "roi_scanner"))
+    n_scanner = count_scanner_images(os.path.join(subject_dir, "roi_scanner"))
 
     persp_str   = str(n_persp)   if n_persp   is not None else "—"
     scanner_str = str(n_scanner) if n_scanner is not None else "—"
@@ -33,6 +62,7 @@ for subject_id in sorted(os.listdir(DATA_ROOT), key=lambda x: int(x) if x.isdigi
 
 # ── Print table ───────────────────────────────────────────────
 print(f"\n{'ID':<8} {'roi_perspective':>16} {'roi_scanner':>12}")
+print(f"         (spectra: {', '.join(sorted(ALLOWED_SPECTRA))})")
 print("-" * 40)
 for sid, p, s in rows:
     print(f"{sid:<8} {p:>16} {s:>12}")
@@ -52,20 +82,19 @@ if persp_counts:
     dist = Counter(persp_counts)
     print(f"    Distribution        : { {k: dist[k] for k in sorted(dist)} }")
 
-print(f"\n  roi_scanner")
+print(f"\n  roi_scanner  (allowed: {', '.join(sorted(ALLOWED_SPECTRA))})")
 print(f"    IDs with folder     : {n_has_scanner}")
 if scanner_counts:
     print(f"    Min / Max / Mean    : {min(scanner_counts)} / {max(scanner_counts)} / {sum(scanner_counts)/n_has_scanner:.1f}")
     print(f"    Total images        : {sum(scanner_counts)}")
     dist = Counter(scanner_counts)
     print(f"    Distribution        : { {k: dist[k] for k in sorted(dist)} }")
-
 print(f"{'='*40}\n")
+
+
+
+
 '''
-
-
-
-
 # ── MPDv2 samples-per-ID diagnostic ──────────────────────────
 import os, math
 from collections import defaultdict
@@ -150,7 +179,7 @@ print(f"  Cutoff (samples in ID #{N}) : {top_counts[-1]}")
 cutoff = top_counts[-1]
 tied   = sum(1 for _, c in id_totals if c == cutoff)
 print(f"  IDs with exactly {cutoff} samples (boundary ties) : {tied}")
-
+'''
 
 ########################################################################################################
 
