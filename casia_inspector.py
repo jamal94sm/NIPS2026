@@ -1,7 +1,7 @@
 import os
 from collections import Counter, defaultdict
 
-DATA_ROOT = "/home/pai-ng/Jamal/CASIA-MS-ROI"
+DATA_ROOT = "/home/pai-ng/Jamal/CASIA_Palmprint_V1"
 IMG_EXTS  = {".jpg", ".jpeg", ".png", ".bmp"}
 
 # filename: {subjectID}_{gender}_{handSide}_{iter}.jpg
