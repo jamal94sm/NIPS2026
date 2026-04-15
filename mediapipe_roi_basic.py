@@ -33,6 +33,7 @@ FAILED_JSON_PATH = os.path.join(
 # ============================================================
 # Initialize MediaPipe Tasks Detector
 # ============================================================
+base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
 options = vision.HandLandmarkerOptions(
     base_options=base_options,
     num_hands=1,
