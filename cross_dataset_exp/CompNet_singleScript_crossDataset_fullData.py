@@ -1,32 +1,25 @@
 """
 CompNet — Cross-Dataset Palmprint Recognition
 ==================================================
-Dataset sampling mirrors Palm-Auth distribution:
-  High group : 150 IDs × ~30 samples
-  Low  group :  40 IDs × ~15 samples
-  Total      : 190 IDs
+Dataset sampling constants (per-dataset, mirrors natural distributions):
+  CASIA-MS  : 150 IDs × 29  +  40 IDs × 15  =  190 IDs
+  Palm-Auth : natural distribution (no fixed cap)
+  MPDv2     : 150 IDs × 33  +  40 IDs × 16  =  190 IDs
+  XJTU      : 150 IDs × 29  +  40 IDs × 15  =  190 IDs
+              images drawn near-uniformly across 4 variations:
+              Flash-iPhone | Nature-iPhone | Flash-Huawei | Nature-Huawei
 
 Combined evaluation set  (combined_evaluation_set = True)
 ---------------------------------------------------------
-  1. Parse all three datasets → 190 selected IDs each.
+  1. Parse all four datasets → 190 selected IDs each.
   2. Hold out 20% (~38) from each dataset's 190 IDs for evaluation.
   3. Merge held-out IDs with new global sequential labels.
   4. Split each eval ID's images by combined_gallery_ratio (0.50).
   5. Remaining ~152 IDs of the TRAINING dataset → training.
 
-  TWO CACHES are written on the first run and reused on every
-  subsequent run, guaranteeing identical conditions across all
-  train-dataset combinations:
-
-    combined_eval_cache_path  (JSON)
-        • gallery sample paths + labels
-        • probe sample paths + labels
-        • train_remaining paths for each dataset
-
-    init_weights_nc{N}.pth   (alongside the JSON)
-        • initial CompNet weights for num_classes = N
-        • all runs with the same N start from identical weights
-        • completely eliminates CUDA-RNG divergence at epoch 0
+  TWO CACHES guarantee identical conditions across all experiments:
+    combined_eval_cache_path           (JSON)
+    init_weights_{model}_nc{N}.pth    (alongside the JSON)
 """
 
 # ==============================================================
@@ -34,14 +27,15 @@ Combined evaluation set  (combined_evaluation_set = True)
 # ==============================================================
 CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
-    # Choices: "CASIA-MS" | "Palm-Auth" | "MPDv2"
+    # Choices: "CASIA-MS" | "Palm-Auth" | "MPDv2" | "XJTU"
     "train_data"           : "CASIA-MS",
-    "test_data"            : "Palm-Auth",      # used only when combined_evaluation_set=False
+    "test_data"            : "Palm-Auth",   # used only when combined_evaluation_set=False
 
     # ── Dataset paths ──────────────────────────────────────────
     "casiams_data_root"    : "/home/pai-ng/Jamal/CASIA-MS-ROI",
     "palm_auth_data_root"  : "/home/pai-ng/Jamal/smartphone_data",
     "mpd_data_root"        : "/home/pai-ng/Jamal/MPDv2_mediapipe_manual_roi",
+    "xjtu_data_root"       : "/home/pai-ng/Jamal/XJTU-UP",
 
     # ── Splitting ──────────────────────────────────────────────
     "train_subject_ratio"  : 0.80,
@@ -53,10 +47,6 @@ CONFIG = {
     # ── Combined evaluation set ────────────────────────────────
     "combined_evaluation_set"  : False,
     "combined_gallery_ratio"   : 0.50,
-
-    # Both cache files live next to this path:
-    #   combined_eval_cache.json          ← gallery / probe / train_remaining
-    #   init_weights_nc{N}.pth           ← fixed initial model weights
     "combined_eval_cache_path" : "./combined_eval_cache.json",
 
     # ── Model ──────────────────────────────────────────────────
@@ -121,11 +111,29 @@ torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 
 ALLOWED_SPECTRA = {"green", "ir", "yellow", "pink", "white"}
 
-# Two-group sampling constants — shared across all three dataset parsers
-N_HIGH      = 150   # number of IDs in the high-sample group
-N_LOW       = 40    # number of IDs in the low-sample group
-TARGET_HIGH = 30    # target images per ID in the high group
-TARGET_LOW  = 15    # target images per ID in the low group
+# ── Two-group sampling — shared group sizes ────────────────────
+N_HIGH = 150
+N_LOW  = 40
+
+# ── Per-dataset sampling targets ──────────────────────────────
+TARGET_HIGH_CASIA = 29
+TARGET_LOW_CASIA  = 15
+
+# Palm-Auth has no fixed cap — uses all available images per ID
+
+TARGET_HIGH_MPD = 33
+TARGET_LOW_MPD  = 16
+
+TARGET_HIGH_XJTU = 29    # 4 variations × ~7 = 28–29
+TARGET_LOW_XJTU  = 15
+
+# XJTU variation folders: (device, condition)
+XJTU_VARIATIONS = [
+    ("iPhone", "Flash"),
+    ("iPhone", "Nature"),
+    ("huawei", "Flash"),
+    ("huawei", "Nature"),
+]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -272,7 +280,10 @@ class NormSingleROI:
 # ══════════════════════════════════════════════════════════════
 
 def parse_casia_ms(data_root, seed=42):
-    """150 IDs × TARGET_HIGH  +  40 IDs × TARGET_LOW."""
+    """
+    150 IDs × TARGET_HIGH_CASIA (29)  +  40 IDs × TARGET_LOW_CASIA (15).
+    Images distributed evenly across spectra per ID.
+    """
     rng     = random.Random(seed)
     id_spec = defaultdict(lambda: defaultdict(list))
     for fname in sorted(os.listdir(data_root)):
@@ -300,15 +311,17 @@ def parse_casia_ms(data_root, seed=42):
         return chosen
 
     id2paths = {}
-    for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH)
-    for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW)
+    for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH_CASIA)
+    for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW_CASIA)
 
     actual = sum(len(v) for v in id2paths.values())
     hc = [len(id2paths[i]) for i in high_ids]
     lc = [len(id2paths[i]) for i in low_ids]
     print(f"  [CASIA-MS] ids={len(id2paths)}  total={actual}")
-    print(f"    High ({N_HIGH}×~{TARGET_HIGH}): min={min(hc)} max={max(hc)} mean={sum(hc)/N_HIGH:.1f}")
-    print(f"    Low  ({N_LOW}×~{TARGET_LOW}):  min={min(lc)} max={max(lc)} mean={sum(lc)/N_LOW:.1f}")
+    print(f"    High ({N_HIGH}×~{TARGET_HIGH_CASIA}): "
+          f"min={min(hc)} max={max(hc)} mean={sum(hc)/N_HIGH:.1f}")
+    print(f"    Low  ({N_LOW}×~{TARGET_LOW_CASIA}):  "
+          f"min={min(lc)} max={max(lc)} mean={sum(lc)/N_LOW:.1f}")
     return id2paths
 
 
@@ -334,8 +347,7 @@ def parse_palm_auth_data(data_root, use_scanner=False):
                     parts = os.path.splitext(fname)[0].split("_")
                     if len(parts) < 4: continue
                     if parts[2].lower() not in ALLOWED_SPECTRA: continue
-                    # format: {id}_{Hand}_{spectrum}_{num}.jpg
-                    hand = parts[1].lower()           # "left" / "right"
+                    hand = parts[1].lower()
                     identity = subject_id + "_" + hand
                     id2paths[identity].append(os.path.join(scan_dir, fname))
     result = dict(id2paths)
@@ -349,7 +361,10 @@ def parse_palm_auth_data(data_root, use_scanner=False):
 
 
 def parse_mpd_data(data_root, seed=42):
-    """Top-150 IDs × TARGET_HIGH  +  next-40 IDs (≥TARGET_LOW) × TARGET_LOW."""
+    """
+    Top-150 IDs × TARGET_HIGH_MPD (33)  +  next-40 IDs × TARGET_LOW_MPD (16).
+    IDs sorted descending by total sample count; tie-breaking is random.
+    """
     rng    = random.Random(seed)
     id_dev = defaultdict(lambda: defaultdict(list))
     for fname in sorted(os.listdir(data_root)):
@@ -360,7 +375,6 @@ def parse_mpd_data(data_root, seed=42):
         if device not in ("h","m") or hand_side not in ("l","r"): continue
         id_dev[subject+"_"+hand_side][device].append(os.path.join(data_root, fname))
 
-    # Sort descending by total count; random shuffle first for tie-breaking
     all_ids = list(id_dev.keys()); rng.shuffle(all_ids)
     all_ids.sort(
         key=lambda i: len(id_dev[i].get("h",[])) + len(id_dev[i].get("m",[])),
@@ -372,9 +386,9 @@ def parse_mpd_data(data_root, seed=42):
 
     low_cands = [i for i in all_ids[N_HIGH:]
                  if (len(id_dev[i].get("h",[])) +
-                     len(id_dev[i].get("m",[]))) >= TARGET_LOW]
+                     len(id_dev[i].get("m",[]))) >= TARGET_LOW_MPD]
     if len(low_cands) < N_LOW:
-        raise ValueError(f"Not enough IDs with ≥{TARGET_LOW} samples: "
+        raise ValueError(f"Not enough IDs with ≥{TARGET_LOW_MPD} samples: "
                          f"found {len(low_cands)}, need {N_LOW}.")
     low_ids = low_cands[:N_LOW]
 
@@ -383,8 +397,8 @@ def parse_mpd_data(data_root, seed=42):
         return rng.sample(paths, min(target, len(paths)))
 
     id2paths = {}
-    for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH)
-    for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW)
+    for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH_MPD)
+    for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW_MPD)
 
     actual   = sum(len(v) for v in id2paths.values())
     hc = [len(id2paths[i]) for i in high_ids]
@@ -394,10 +408,83 @@ def parse_mpd_data(data_root, seed=42):
     cutoff_l = (len(id_dev[low_ids[-1]].get("h",[])) +
                 len(id_dev[low_ids[-1]].get("m",[])))
     print(f"  [MPDv2] ids={len(id2paths)}  total={actual}")
-    print(f"    High ({N_HIGH}×~{TARGET_HIGH}): "
+    print(f"    High ({N_HIGH}×~{TARGET_HIGH_MPD}): "
           f"min={min(hc)} max={max(hc)} mean={sum(hc)/N_HIGH:.1f} cutoff={cutoff_h}")
-    print(f"    Low  ({N_LOW}×~{TARGET_LOW}):  "
+    print(f"    Low  ({N_LOW}×~{TARGET_LOW_MPD}):  "
           f"min={min(lc)} max={max(lc)} mean={sum(lc)/N_LOW:.1f} cutoff={cutoff_l}")
+    return id2paths
+
+
+def parse_xjtu_data(data_root, seed=42):
+    """
+    XJTU-UP: 200 IDs (L_001…L_100, R_001…R_100), 4 variations each.
+    Structure: {data_root}/{device}/{condition}/{hand}_{id}/*.jpg
+
+    Select 190 IDs from 200, then:
+      High group : 150 IDs × TARGET_HIGH_XJTU (29) images
+      Low  group :  40 IDs × TARGET_LOW_XJTU  (15) images
+    Images sampled near-uniformly across 4 variations.
+
+    Identity key: folder name e.g. "L_001", "R_100"
+    """
+    rng      = random.Random(seed)
+    IMG_EXTS = {".jpg",".jpeg",".bmp",".png"}
+
+    # id_var[identity][(device, condition)] = [path, ...]
+    id_var = defaultdict(lambda: defaultdict(list))
+
+    for device, condition in XJTU_VARIATIONS:
+        var_dir = os.path.join(data_root, device, condition)
+        if not os.path.isdir(var_dir):
+            print(f"  [XJTU] WARNING: variation folder not found: {var_dir}")
+            continue
+        for id_folder in sorted(os.listdir(var_dir)):
+            id_dir = os.path.join(var_dir, id_folder)
+            if not os.path.isdir(id_dir): continue
+            parts = id_folder.split("_")
+            if len(parts) < 2 or parts[0].upper() not in ("L","R"): continue
+            for fname in sorted(os.listdir(id_dir)):
+                if os.path.splitext(fname)[1].lower() not in IMG_EXTS: continue
+                id_var[id_folder][(device, condition)].append(
+                    os.path.join(id_dir, fname))
+
+    all_ids = sorted(id_var.keys())
+    print(f"  [XJTU] Total IDs found: {len(all_ids)}")
+    if len(all_ids) < N_HIGH + N_LOW:
+        raise ValueError(f"Need {N_HIGH+N_LOW} IDs but only {len(all_ids)} found "
+                         f"in {data_root}")
+
+    selected = sorted(rng.sample(all_ids, N_HIGH + N_LOW))
+    rng.shuffle(selected)
+    high_ids = selected[:N_HIGH]; low_ids = selected[N_HIGH:]
+
+    def _sample_variations(ident, target):
+        """Sample `target` images near-uniformly across 4 variations."""
+        var_keys = list(XJTU_VARIATIONS); rng.shuffle(var_keys)
+        n_var    = len(var_keys)
+        base_v   = target // n_var; rem_v = target % n_var
+        chosen   = []
+        for j, vk in enumerate(var_keys):
+            k         = base_v + (1 if j < rem_v else 0)
+            available = id_var[ident].get(vk, [])
+            k         = min(k, len(available))
+            if k > 0:
+                chosen.extend(rng.sample(available, k))
+        return chosen
+
+    id2paths = {}
+    for ident in high_ids: id2paths[ident] = _sample_variations(ident, TARGET_HIGH_XJTU)
+    for ident in low_ids:  id2paths[ident] = _sample_variations(ident, TARGET_LOW_XJTU)
+
+    actual = sum(len(v) for v in id2paths.values())
+    hc = [len(id2paths[i]) for i in high_ids]
+    lc = [len(id2paths[i]) for i in low_ids]
+    print(f"  [XJTU] ids={len(id2paths)}  total={actual}")
+    print(f"    High ({N_HIGH}×~{TARGET_HIGH_XJTU}): "
+          f"min={min(hc)} max={max(hc)} mean={sum(hc)/N_HIGH:.1f}")
+    print(f"    Low  ({N_LOW}×~{TARGET_LOW_XJTU}):  "
+          f"min={min(lc)} max={max(lc)} mean={sum(lc)/N_LOW:.1f}")
+    print(f"    Variations: {[f'{d}/{c}' for d,c in XJTU_VARIATIONS]}")
     return id2paths
 
 
@@ -411,9 +498,11 @@ def get_parser(dataset_name, cfg):
                                             use_scanner=cfg.get("use_scanner", False))
     elif name == "mpdv2":
         return lambda: parse_mpd_data(cfg["mpd_data_root"], seed=seed)
+    elif name == "xjtu":
+        return lambda: parse_xjtu_data(cfg["xjtu_data_root"], seed=seed)
     else:
         raise ValueError(f"Unknown dataset: '{dataset_name}'. "
-                         f"Use 'CASIA-MS', 'Palm-Auth', or 'MPDv2'.")
+                         f"Use 'CASIA-MS', 'Palm-Auth', 'MPDv2', or 'XJTU'.")
 
 
 def _ds_key(name):
@@ -426,64 +515,47 @@ def _ds_key(name):
 
 def build_combined_eval_set(cfg, seed=42):
     """
-    Build or reload the combined evaluation set.
+    Build or reload the combined evaluation set from ALL FOUR datasets.
 
-    FIRST RUN  → parses all three datasets, holds out 20% of each
-                 dataset's 190 selected IDs, writes JSON cache.
-    LATER RUNS → loads JSON cache directly; no parsing, no RNG consumed.
-
-    The gallery/probe split for each ID uses a per-dataset RNG seeded
-    from (seed + hash(ds_key)) so it is independent of global RNG state.
-
-    Returns
-    -------
-    gallery_samples  : list of (path, int_label)
-    probe_samples    : list of (path, int_label)
-    train_remaining  : {ds_key: {ident: [paths]}}
+    FIRST RUN  → parses all four datasets, holds out 20% of each
+                 dataset's selected IDs, writes JSON cache.
+    LATER RUNS → loads JSON cache; no parsing, no RNG consumed.
     """
     cache_path = cfg.get("combined_eval_cache_path", "./combined_eval_cache.json")
 
-    # ── load from cache ───────────────────────────────────────
     if os.path.exists(cache_path):
         print(f"  Loading cached combined eval set from:\n    {cache_path}")
         with open(cache_path, "r") as f:
             data = json.load(f)
         gallery_samples = [(row[0], int(row[1])) for row in data["gallery"]]
         probe_samples   = [(row[0], int(row[1])) for row in data["probe"]]
-        train_remaining = {
-            k: {ident: paths for ident, paths in v.items()}
-            for k, v in data["train_remaining"].items()
-        }
+        train_remaining = {k: {ident: paths for ident, paths in v.items()}
+                           for k, v in data["train_remaining"].items()}
         print(f"  [combined eval] eval IDs={data['n_eval_ids']}  "
               f"gallery={len(gallery_samples)}  probe={len(probe_samples)}\n")
         return gallery_samples, probe_samples, train_remaining
 
-    # ── build fresh ───────────────────────────────────────────
     print("  Building combined evaluation set for the first time …")
     use_scanner   = cfg.get("use_scanner", False)
     gallery_ratio = cfg.get("combined_gallery_ratio", 0.50)
 
-    # Parse all three datasets with the global seed so sampling is
-    # deterministic and identical whenever the cache is rebuilt.
     parsed = {
         "casiams":  parse_casia_ms(cfg["casiams_data_root"], seed=seed),
         "palmauth": parse_palm_auth_data(cfg["palm_auth_data_root"],
                                          use_scanner=use_scanner),
         "mpdv2":    parse_mpd_data(cfg["mpd_data_root"], seed=seed),
+        "xjtu":     parse_xjtu_data(cfg["xjtu_data_root"], seed=seed),
     }
 
-    gallery_samples = []
-    probe_samples   = []
-    train_remaining = {}
+    gallery_samples = []; probe_samples = []; train_remaining = {}
     label_offset    = 0
 
     for ds_key, id2paths in parsed.items():
         all_ids = sorted(id2paths.keys())
         n_held  = max(1, int(len(all_ids) * 0.20))
 
-        # Independent per-dataset RNG — completely isolated from global state
-        rng_hold  = random.Random(seed + abs(hash(ds_key))          % 100000)
-        rng_split = random.Random(seed + abs(hash(ds_key + "_split"))% 100000)
+        rng_hold  = random.Random(seed + abs(hash(ds_key))           % 100000)
+        rng_split = random.Random(seed + abs(hash(ds_key + "_split")) % 100000)
 
         shuffled = list(all_ids); rng_hold.shuffle(shuffled)
         held_ids = set(shuffled[:n_held])
@@ -509,7 +581,6 @@ def build_combined_eval_set(cfg, seed=42):
     print(f"  [combined eval] total eval IDs={label_offset}  "
           f"gallery={len(gallery_samples)}  probe={len(probe_samples)}")
 
-    # ── save JSON cache ───────────────────────────────────────
     cache_dir = os.path.dirname(os.path.abspath(cache_path))
     os.makedirs(cache_dir, exist_ok=True)
     with open(cache_path, "w") as f:
@@ -533,22 +604,15 @@ def build_combined_eval_set(cfg, seed=42):
 
 def get_or_create_init_weights(net, cfg, num_classes, device):
     """
-    Ensure all experiments start from IDENTICAL initial weights.
-
-    The weights file is stored alongside the eval JSON cache:
-        init_weights_nc{num_classes}.pth
-
-    FIRST CALL  → saves the freshly-constructed net's state_dict.
-    LATER CALLS → loads those saved weights into net, overwriting
-                  whatever xavier_uniform_ produced this time.
-
-    Because all training datasets produce the same num_classes
-    (152 in combined-eval mode), one file covers every experiment.
+    Save init weights on first run, load on every subsequent run.
+    Filename includes model class name to avoid cross-model conflicts:
+        init_weights_{ModelName}_nc{num_classes}.pth
     """
-    cache_path = cfg.get("combined_eval_cache_path", "./combined_eval_cache.json")
-    cache_dir  = os.path.dirname(os.path.abspath(cache_path))
-    weights_path = os.path.join(cache_dir, f"init_weights_nc{num_classes}.pth")
-
+    cache_path   = cfg.get("combined_eval_cache_path", "./combined_eval_cache.json")
+    cache_dir    = os.path.dirname(os.path.abspath(cache_path))
+    model_name   = type(net.module if isinstance(net, DataParallel) else net).__name__
+    weights_path = os.path.join(cache_dir,
+                                f"init_weights_{model_name}_nc{num_classes}.pth")
     _net = net.module if isinstance(net, DataParallel) else net
 
     if os.path.exists(weights_path):
@@ -557,12 +621,11 @@ def get_or_create_init_weights(net, cfg, num_classes, device):
     else:
         print(f"  Saving init weights to:\n    {weights_path}")
         torch.save(_net.state_dict(), weights_path)
-
     return net
 
 
 # ══════════════════════════════════════════════════════════════
-#  SPLITS  (standard mode — not used when combined_eval=True)
+#  SPLITS  (standard mode)
 # ══════════════════════════════════════════════════════════════
 
 def split_same_dataset(id2paths, train_subject_ratio=0.80,
@@ -670,7 +733,6 @@ def run_one_epoch(model, loader, criterion, optimizer, device, phase):
 
 @torch.no_grad()
 def extract_features(model, loader, device):
-    """Deterministic: model.eval(), no_grad, shuffle=False in loader."""
     model.eval(); feats, labels = [], []
     for imgs, labs in loader:
         feats.append(model.get_embedding(imgs.to(device)).cpu().numpy())
@@ -679,11 +741,7 @@ def extract_features(model, loader, device):
 
 
 def compute_eer(scores_array):
-    """
-    scores_array[:,0] = dot-product similarity  (higher → more similar)
-    scores_array[:,1] = +1 genuine | -1 impostor
-    No negation needed: roc_curve expects higher score = positive class.
-    """
+    """dot-product similarity: genuine scores are higher, no negation needed."""
     ins  = scores_array[scores_array[:, 1] ==  1, 0]
     outs = scores_array[scores_array[:, 1] == -1, 0]
     if len(ins) == 0 or len(outs) == 0: return 1.0, 0.0
@@ -701,10 +759,8 @@ def evaluate(model, probe_loader, gallery_loader, device,
     gallery_feats, gallery_labels = extract_features(model, gallery_loader, device)
     n_probe = len(probe_feats)
 
-    # L2-normalised embeddings → dot product = cosine similarity ∈ [-1,1]
-    sim_matrix = probe_feats @ gallery_feats.T    # (n_probe, n_gallery)
+    sim_matrix = probe_feats @ gallery_feats.T
 
-    # All probe-vs-gallery pairs
     scores_list, labels_list = [], []
     for i in range(n_probe):
         for j in range(sim_matrix.shape[1]):
@@ -714,7 +770,6 @@ def evaluate(model, probe_loader, gallery_loader, device,
     scores_arr = np.column_stack([scores_list, labels_list])
     eer, _     = compute_eer(scores_arr)
 
-    # Rank-1: nearest gallery neighbour by highest dot-product similarity
     nn_idx  = np.argmax(sim_matrix, axis=1)
     correct = sum(probe_labels[i] == gallery_labels[nn_idx[i]]
                   for i in range(n_probe))
@@ -801,7 +856,7 @@ def main():
     print(f"  Device         : {device}")
     print(f"  Train dataset  : {train_data}")
     print(f"  Evaluation     : "
-          f"{'combined (all 3 datasets, cached)' if use_combined_eval else test_data}")
+          f"{'combined (4 datasets, cached)' if use_combined_eval else test_data}")
     if use_combined_eval:
         print(f"  Cache path     : {CONFIG.get('combined_eval_cache_path','')}")
     if same_dataset:
@@ -811,11 +866,13 @@ def main():
     if "palm-auth" in train_data.lower() or use_combined_eval:
         print(f"  Scanner data   : "
               f"{'ON  ('+', '.join(sorted(ALLOWED_SPECTRA))+')' if use_scanner else 'OFF'}")
-    print(f"  Sampling       : high={N_HIGH}×{TARGET_HIGH}  low={N_LOW}×{TARGET_LOW}")
+    print(f"  Sampling       : CASIA {N_HIGH}×{TARGET_HIGH_CASIA}+{N_LOW}×{TARGET_LOW_CASIA}  "
+          f"MPD {N_HIGH}×{TARGET_HIGH_MPD}+{N_LOW}×{TARGET_LOW_MPD}  "
+          f"XJTU {N_HIGH}×{TARGET_HIGH_XJTU}+{N_LOW}×{TARGET_LOW_XJTU}")
     print(f"  Augment factor : {augment_factor}×")
     print(f"{'='*60}\n")
 
-    # ── combined evaluation set (load cache or build once) ────────────────
+    # ── combined evaluation set ───────────────────────────────────────────
     train_remaining = {}
     if use_combined_eval:
         gallery_samples, probe_samples, train_remaining = \
@@ -826,13 +883,11 @@ def main():
 
     # ── training data ─────────────────────────────────────────────────────
     if use_combined_eval:
-        # The non-held-out portion was returned by build_combined_eval_set
         train_id2paths = train_remaining[_ds_key(train_data)]
         print(f"Scanning {train_data} (training portion, eval IDs excluded) …")
         n_train_ids  = len(train_id2paths)
         n_train_imgs = sum(len(v) for v in train_id2paths.values())
         print(f"  {n_train_ids} identities, {n_train_imgs} images.\n")
-
         train_label_map = {k: i for i, k in enumerate(sorted(train_id2paths))}
         train_samples   = [(p, train_label_map[ident])
                            for ident, paths in train_id2paths.items()
@@ -847,12 +902,10 @@ def main():
         n_total_ids  = len(all_id2paths)
         n_total_imgs = sum(len(v) for v in all_id2paths.values())
         print(f"  Found {n_total_ids} identities, {n_total_imgs} images.\n")
-
         (train_samples, gallery_samples, probe_samples,
          train_label_map, _) = split_same_dataset(
             all_id2paths, train_subject_ratio=train_subject_ratio,
             gallery_ratio=test_gallery_ratio, seed=seed)
-
         num_classes  = len(train_label_map)
         n_train_ids  = num_classes
         n_train_imgs = len(train_samples)
@@ -865,19 +918,16 @@ def main():
         n_train_ids    = len(train_id2paths)
         n_train_imgs   = sum(len(v) for v in train_id2paths.values())
         print(f"  Found {n_train_ids} identities, {n_train_imgs} images.\n")
-
         train_label_map = {k: i for i, k in enumerate(sorted(train_id2paths))}
         train_samples   = [(p, train_label_map[ident])
                            for ident, paths in train_id2paths.items()
                            for p in paths]
         num_classes = len(train_label_map)
-
         print(f"Scanning {test_data} (test) …")
         test_id2paths = get_parser(test_data, CONFIG)()
         n_test_ids    = len(test_id2paths)
         n_test_imgs   = sum(len(v) for v in test_id2paths.values())
         print(f"  Found {n_test_ids} identities, {n_test_imgs} images.\n")
-
         gallery_samples, probe_samples, _ = split_cross_dataset_test(
             test_id2paths, gallery_ratio=test_gallery_ratio, seed=seed)
 
@@ -886,7 +936,6 @@ def main():
         AugmentedDataset(train_samples, img_side, augment_factor),
         batch_size=batch_size, shuffle=True, num_workers=nw, pin_memory=True)
 
-    # shuffle=False is essential for deterministic feature extraction
     gallery_loader = DataLoader(
         SingleDataset(gallery_samples, img_side),
         batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
@@ -910,13 +959,12 @@ def main():
         print(f"  Using {torch.cuda.device_count()} GPUs")
         net = DataParallel(net)
 
-    # ── fixed initialisation (save on first run, load on all others) ───────
+    # ── fixed initialisation ──────────────────────────────────────────────
     if use_combined_eval:
         net = get_or_create_init_weights(net, CONFIG, num_classes, device)
     else:
         print("  Training from scratch (random init).")
 
-    # ── optional checkpoint resume ─────────────────────────────────────────
     if CONFIG.get("resume", False):
         for ckpt in ["net_params_best_eer.pth", "net_params_best.pth",
                      "net_params.pth"]:
@@ -942,6 +990,17 @@ def main():
     if CONFIG.get("eval_only", False):
         print("  eval_only=True — skipping training.\n")
     else:
+        # ── pre-training evaluation (true zero-shot baseline) ─────────────
+        _net = net.module if isinstance(net, DataParallel) else net
+        print("  Pre-training evaluation (before any gradient update) …")
+        cur_eer, cur_rank1 = evaluate(
+            _net, probe_loader, gallery_loader,
+            device, out_dir=rst_eval, tag=f"ep-001_pretrain_{eval_tag_base}")
+        best_eer = cur_eer; last_eer = cur_eer; last_rank1 = cur_rank1
+        torch.save(_net.state_dict(),
+                   os.path.join(results_dir, "net_params_best_eer.pth"))
+        print(f"  *** Initial best EER: {best_eer*100:.4f}% ***\n")
+
         for epoch in range(num_epochs):
             t_loss, t_acc = run_one_epoch(
                 net, train_loader, criterion, optimizer, device, "training")
@@ -950,7 +1009,8 @@ def main():
             train_losses.append(t_loss); train_accs.append(t_acc)
             _net = net.module if isinstance(net, DataParallel) else net
 
-            if epoch % eval_every == 0 or epoch == num_epochs - 1:
+            # Skip epoch 0 eval — already done as pre-training baseline
+            if (epoch % eval_every == 0 and epoch > 0) or epoch == num_epochs - 1:
                 tag = f"ep{epoch:04d}_{eval_tag_base}"
                 cur_eer, cur_rank1 = evaluate(
                     _net, probe_loader, gallery_loader,
@@ -1007,7 +1067,7 @@ def main():
     print(f"\n{'='*60}")
     print(f"  Train  : {train_data} ({n_train_ids} subjects, {n_train_imgs} imgs)")
     print(f"  Eval   : "
-          f"{'combined (CASIA-MS + Palm-Auth + MPDv2)' if use_combined_eval else test_data}")
+          f"{'combined (CASIA-MS + Palm-Auth + MPDv2 + XJTU)' if use_combined_eval else test_data}")
     print(f"  FINAL EER    : {final_eer*100:.4f}%")
     print(f"  FINAL Rank-1 : {final_rank1:.3f}%")
     print(f"  Results      : {results_dir}")
@@ -1025,8 +1085,12 @@ def main():
         if use_combined_eval:
             f.write(f"Eval cache         : "
                     f"{CONFIG.get('combined_eval_cache_path','')}\n")
-        f.write(f"Sampling           : "
-                f"high={N_HIGH}×{TARGET_HIGH} low={N_LOW}×{TARGET_LOW}\n")
+        f.write(f"Sampling CASIA-MS  : {N_HIGH}×{TARGET_HIGH_CASIA} + "
+                f"{N_LOW}×{TARGET_LOW_CASIA}\n")
+        f.write(f"Sampling MPDv2     : {N_HIGH}×{TARGET_HIGH_MPD} + "
+                f"{N_LOW}×{TARGET_LOW_MPD}\n")
+        f.write(f"Sampling XJTU      : {N_HIGH}×{TARGET_HIGH_XJTU} + "
+                f"{N_LOW}×{TARGET_LOW_XJTU}\n")
         f.write(f"Num classes        : {num_classes}\n")
         f.write(f"Eval set           : "
                 f"{'combined' if use_combined_eval else test_data}\n")
