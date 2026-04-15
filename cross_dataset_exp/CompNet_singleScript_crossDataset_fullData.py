@@ -844,6 +844,12 @@ def main():
     print(f"  Classes: {num_classes}\n")
 
     # ── model ─────────────────────────────────────────────────────────────
+    # ── reset seed before model init so weights are identical across runs ──
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    np.random.seed(SEED)
+    random.seed(SEED)
+
     print(f"Building CompNet — num_classes={num_classes} …")
     net = CompNet(num_classes, embedding_dim=embedding_dim,
                   arcface_s=arcface_s, arcface_m=arcface_m, dropout=dropout)
