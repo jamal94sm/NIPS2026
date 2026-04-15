@@ -9,12 +9,12 @@ Dataset sampling mirrors Palm-Auth distribution:
 Optional combined evaluation set
 ---------------------------------
 When combined_evaluation_set = True:
-  - 20% of ALL available IDs from each dataset (CASIA-MS, Palm-Auth, MPDv2)
-    are held out and merged into a single evaluation set with new sequential labels.
-  - These held-out IDs are excluded from the training parser so they are
-    never seen during training.
-  - gallery_ratio = 0.50 is applied to the combined set.
-  - The standard per-dataset test split is replaced by this combined set.
+  1. Parse all three datasets normally (190 IDs each).
+  2. Hold out 20% of those 190 IDs (~38) from each dataset.
+  3. Merge the held-out IDs into a single eval set with new sequential labels.
+  4. Split each eval ID's samples by combined_gallery_ratio (0.50).
+  5. The remaining ~152 IDs of the TRAINING dataset are used for training.
+  The standard test_data split is replaced by this combined set.
 """
 
 # ==============================================================
@@ -23,8 +23,8 @@ When combined_evaluation_set = True:
 CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
     # Choices: "CASIA-MS" | "Palm-Auth" | "MPDv2"
-    "train_data"           : "MPDv2",
-    "test_data"            : "MPDv2", # ignored for eval when combined=True
+    "train_data"           : "Palm-Auth",
+    "test_data"            : "MPDv2",      # used only when combined_evaluation_set=False
 
     # ── Dataset paths ──────────────────────────────────────────
     "casiams_data_root"    : "/home/pai-ng/Jamal/CASIA-MS-ROI",
@@ -39,10 +39,10 @@ CONFIG = {
     "use_scanner"          : True,
 
     # ── Combined evaluation set ────────────────────────────────
-    # True  → hold out 20% of IDs from ALL three datasets,
-    #         merge into one evaluation set with new global labels.
-    # False → standard per-dataset test split (original behaviour).
-    "combined_evaluation_set" : True,
+    # True  → select 190 IDs from each dataset, hold out 20% of each,
+    #         merge into one combined eval set with new global labels.
+    # False → standard per-dataset test split.
+    "combined_evaluation_set" : False,
     "combined_gallery_ratio"  : 0.50,
 
     # ── Model ──────────────────────────────────────────────────
@@ -104,10 +104,7 @@ SEED = CONFIG["random_seed"]
 random.seed(SEED); np.random.seed(SEED)
 torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 
-# Scanner spectra to include
 ALLOWED_SPECTRA = {"green", "ir", "yellow", "pink", "white"}
-
-# Two-group sampling parameters
 N_HIGH      = 150
 N_LOW       = 40
 TARGET_HIGH = 30
@@ -140,14 +137,14 @@ class GaborConv2d(nn.Module):
 
     def _gen(self, ksize, c_in, c_out, sigma, gamma, theta, f, psi):
         half = ksize // 2; ksz = 2 * half + 1
-        y0   = torch.arange(-half, half + 1).float()
-        x0   = torch.arange(-half, half + 1).float()
-        y    = y0.view(1, -1).repeat(c_out, c_in, ksz, 1)
-        x    = x0.view(-1, 1).repeat(c_out, c_in, 1, ksz)
-        x    = x.to(sigma.device); y = y.to(sigma.device)
-        xt   =  x * torch.cos(theta.view(-1,1,1,1)) + y * torch.sin(theta.view(-1,1,1,1))
-        yt   = -x * torch.sin(theta.view(-1,1,1,1)) + y * torch.cos(theta.view(-1,1,1,1))
-        gb   = -torch.exp(
+        y0 = torch.arange(-half, half + 1).float()
+        x0 = torch.arange(-half, half + 1).float()
+        y  = y0.view(1,-1).repeat(c_out, c_in, ksz, 1)
+        x  = x0.view(-1,1).repeat(c_out, c_in, 1, ksz)
+        x  = x.to(sigma.device); y = y.to(sigma.device)
+        xt =  x * torch.cos(theta.view(-1,1,1,1)) + y * torch.sin(theta.view(-1,1,1,1))
+        yt = -x * torch.sin(theta.view(-1,1,1,1)) + y * torch.cos(theta.view(-1,1,1,1))
+        gb = -torch.exp(
             -0.5 * ((gamma * xt)**2 + yt**2) / (8 * sigma.view(-1,1,1,1)**2)
         ) * torch.cos(2 * math.pi * f.view(-1,1,1,1) * xt + psi.view(-1,1,1,1))
         return gb - gb.mean(dim=[2,3], keepdim=True)
@@ -251,24 +248,50 @@ class NormSingleROI:
 
 
 # ══════════════════════════════════════════════════════════════
-#  RAW SCANNERS  (full datasets, no sampling — used for combined eval)
+#  DATASET PARSERS
 # ══════════════════════════════════════════════════════════════
 
-def _scan_casia_ms_all(data_root):
-    """Return all IDs → all paths from CASIA-MS, no sampling."""
+def parse_casia_ms(data_root, seed=42):
+    rng     = random.Random(seed)
     id_spec = defaultdict(lambda: defaultdict(list))
     for fname in sorted(os.listdir(data_root)):
         if not fname.lower().endswith((".jpg",".jpeg",".bmp",".png")): continue
-        parts = os.path.splitext(fname)[0].split("_")
+        stem = os.path.splitext(fname)[0]; parts = stem.split("_")
         if len(parts) < 4: continue
         id_spec[parts[0]+"_"+parts[1]][parts[2]].append(
             os.path.join(data_root, fname))
-    return {ident: [p for sp in specs.values() for p in sp]
-            for ident, specs in id_spec.items()}
+
+    all_ids = sorted(id_spec.keys())
+    if len(all_ids) < N_HIGH + N_LOW:
+        raise ValueError(f"Need {N_HIGH+N_LOW} IDs but only {len(all_ids)} available.")
+
+    selected = sorted(rng.sample(all_ids, N_HIGH + N_LOW))
+    rng.shuffle(selected)
+    high_ids = selected[:N_HIGH]; low_ids = selected[N_HIGH:]
+
+    def _sample(ident, target):
+        spec_list = list(sorted(id_spec[ident].keys())); rng.shuffle(spec_list)
+        n_spec = len(spec_list); base_s = target // n_spec; rem_s = target % n_spec
+        chosen = []
+        for j, sp in enumerate(spec_list):
+            k = min(base_s + (1 if j < rem_s else 0), len(id_spec[ident][sp]))
+            chosen.extend(rng.sample(id_spec[ident][sp], k))
+        return chosen
+
+    id2paths = {}
+    for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH)
+    for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW)
+
+    actual = sum(len(v) for v in id2paths.values())
+    hc = [len(id2paths[i]) for i in high_ids]
+    lc = [len(id2paths[i]) for i in low_ids]
+    print(f"  [CASIA-MS] ids={len(id2paths)}  total={actual}")
+    print(f"    High ({N_HIGH}×~{TARGET_HIGH}): min={min(hc)} max={max(hc)} mean={sum(hc)/N_HIGH:.1f}")
+    print(f"    Low  ({N_LOW}×~{TARGET_LOW}): min={min(lc)} max={max(lc)} mean={sum(lc)/N_LOW:.1f}")
+    return id2paths
 
 
-def _scan_palm_auth_all(data_root, use_scanner=False):
-    """Return all IDs → all paths from Palm-Auth, no sampling."""
+def parse_palm_auth_data(data_root, use_scanner=False):
     IMG_EXTS = {".jpg",".jpeg",".bmp",".png"}
     id2paths  = defaultdict(list)
     for subject_id in sorted(os.listdir(data_root)):
@@ -291,197 +314,25 @@ def _scan_palm_auth_all(data_root, use_scanner=False):
                     if parts[2].lower() not in ALLOWED_SPECTRA: continue
                     id2paths[subject_id+"_"+parts[1].lower()].append(
                         os.path.join(scan_dir, fname))
-    return dict(id2paths)
-
-
-def _scan_mpd_all(data_root):
-    """Return all IDs → all paths from MPDv2, no sampling."""
-    id_dev = defaultdict(lambda: defaultdict(list))
-    for fname in sorted(os.listdir(data_root)):
-        if not fname.lower().endswith((".jpg",".jpeg",".bmp",".png")): continue
-        parts = os.path.splitext(fname)[0].split("_")
-        if len(parts) != 5: continue
-        subject, session, device, hand_side, iteration = parts
-        if device not in ("h","m") or hand_side not in ("l","r"): continue
-        id_dev[subject+"_"+hand_side][device].append(os.path.join(data_root, fname))
-    return {ident: devs.get("h",[]) + devs.get("m",[])
-            for ident, devs in id_dev.items()}
-
-
-# ══════════════════════════════════════════════════════════════
-#  COMBINED EVALUATION SET
-# ══════════════════════════════════════════════════════════════
-
-def build_combined_eval_set(cfg, seed=42):
-    """
-    Hold out 20% of ALL available IDs from each of the three datasets.
-    Merge them into a single evaluation set with new global sequential labels.
-    Apply gallery_ratio = combined_gallery_ratio to each ID's images.
-
-    Returns
-    -------
-    gallery_samples : list of (path, global_label)
-    probe_samples   : list of (path, global_label)
-    held_out_ids    : dict { "casiams" | "palmauth" | "mpdv2" : set of identity strings }
-                      — these IDs must be excluded from training parsers.
-    """
-    rng          = random.Random(seed)
-    gallery_ratio = cfg.get("combined_gallery_ratio", 0.50)
-    use_scanner   = cfg.get("use_scanner", False)
-
-    scanners = [
-        ("casiams",  _scan_casia_ms_all(cfg["casiams_data_root"])),
-        ("palmauth", _scan_palm_auth_all(cfg["palm_auth_data_root"], use_scanner)),
-        ("mpdv2",    _scan_mpd_all(cfg["mpd_data_root"])),
-    ]
-
-    gallery_samples = []
-    probe_samples   = []
-    held_out_ids    = {}
-    label_offset    = 0
-
-    for ds_key, id2paths in scanners:
-        all_ids = sorted(id2paths.keys())
-        n_held  = max(1, int(len(all_ids) * 0.20))
-
-        # deterministic shuffle per dataset
-        rng_ds = random.Random(seed + abs(hash(ds_key)) % 100000)
-        shuffled = list(all_ids); rng_ds.shuffle(shuffled)
-        held_ids = sorted(shuffled[:n_held])   # sort for reproducibility
-        held_out_ids[ds_key] = set(held_ids)
-
-        for local_idx, ident in enumerate(held_ids):
-            global_label = label_offset + local_idx
-            paths = list(id2paths[ident]); rng.shuffle(paths)
-            n_gal = max(1, int(len(paths) * gallery_ratio))
-            for p in paths[:n_gal]:
-                gallery_samples.append((p, global_label))
-            for p in paths[n_gal:]:
-                probe_samples.append((p, global_label))
-
-        label_offset += n_held
-        print(f"  [combined eval / {ds_key}] held-out={n_held} IDs  "
-              f"gallery={sum(1 for _,l in gallery_samples if l < label_offset and l >= label_offset - n_held)}  "
-              f"probe={sum(1 for _,l in probe_samples if l < label_offset and l >= label_offset - n_held)}")
-
-    print(f"  [combined eval] total IDs={label_offset}  "
-          f"gallery={len(gallery_samples)}  probe={len(probe_samples)}")
-    return gallery_samples, probe_samples, held_out_ids
-
-
-# ══════════════════════════════════════════════════════════════
-#  DATASET PARSERS  (with optional exclude_ids)
-# ══════════════════════════════════════════════════════════════
-
-def parse_casia_ms(data_root, seed=42, exclude_ids=None):
-    """
-    Two-group sampling. IDs in exclude_ids are skipped before selection.
-    """
-    exclude_ids = set(exclude_ids or [])
-    rng     = random.Random(seed)
-    id_spec = defaultdict(lambda: defaultdict(list))
-
-    for fname in sorted(os.listdir(data_root)):
-        if not fname.lower().endswith((".jpg",".jpeg",".bmp",".png")): continue
-        stem  = os.path.splitext(fname)[0]; parts = stem.split("_")
-        if len(parts) < 4: continue
-        identity = parts[0] + "_" + parts[1]; spectrum = parts[2]
-        if identity in exclude_ids: continue
-        id_spec[identity][spectrum].append(os.path.join(data_root, fname))
-
-    all_ids = sorted(id_spec.keys())
-    if len(all_ids) < N_HIGH + N_LOW:
-        raise ValueError(f"Need {N_HIGH+N_LOW} IDs but only {len(all_ids)} available "
-                         f"after excluding {len(exclude_ids)} held-out IDs.")
-
-    selected = sorted(rng.sample(all_ids, N_HIGH + N_LOW))
-    rng.shuffle(selected)
-    high_ids = selected[:N_HIGH]; low_ids = selected[N_HIGH:]
-
-    def _sample(ident, target):
-        spec_list = list(sorted(id_spec[ident].keys())); rng.shuffle(spec_list)
-        n_spec = len(spec_list); base_s = target // n_spec; rem_s = target % n_spec
-        chosen = []
-        for j, sp in enumerate(spec_list):
-            k = min(base_s + (1 if j < rem_s else 0), len(id_spec[ident][sp]))
-            chosen.extend(rng.sample(id_spec[ident][sp], k))
-        return chosen
-
-    id2paths = {}
-    for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH)
-    for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW)
-
-    actual_total = sum(len(v) for v in id2paths.values())
-    hc = [len(id2paths[i]) for i in high_ids]
-    lc = [len(id2paths[i]) for i in low_ids]
-    print(f"  [CASIA-MS] ids={len(id2paths)}  total={actual_total}")
-    print(f"    High ({N_HIGH}×~{TARGET_HIGH}): min={min(hc)} max={max(hc)} mean={sum(hc)/N_HIGH:.1f}")
-    print(f"    Low  ({N_LOW}×~{TARGET_LOW}): min={min(lc)} max={max(lc)} mean={sum(lc)/N_LOW:.1f}")
-    return id2paths
-
-
-def parse_palm_auth_data(data_root, use_scanner=False, exclude_ids=None):
-    """
-    Load Palm-Auth ROI images. IDs in exclude_ids are skipped.
-    """
-    exclude_ids = set(exclude_ids or [])
-    IMG_EXTS    = {".jpg",".jpeg",".bmp",".png"}
-    id2paths    = defaultdict(list)
-
-    for subject_id in sorted(os.listdir(data_root)):
-        subject_dir = os.path.join(data_root, subject_id)
-        if not os.path.isdir(subject_dir): continue
-
-        roi_dir = os.path.join(subject_dir, "roi_perspective")
-        if os.path.isdir(roi_dir):
-            for fname in sorted(os.listdir(roi_dir)):
-                if os.path.splitext(fname)[1].lower() not in IMG_EXTS: continue
-                parts = os.path.splitext(fname)[0].split("_")
-                if len(parts) < 3: continue
-                identity = parts[0] + "_" + parts[1]
-                if identity in exclude_ids: continue
-                id2paths[identity].append(os.path.join(roi_dir, fname))
-
-        if use_scanner:
-            scan_dir = os.path.join(subject_dir, "roi_scanner")
-            if os.path.isdir(scan_dir):
-                for fname in sorted(os.listdir(scan_dir)):
-                    if os.path.splitext(fname)[1].lower() not in IMG_EXTS: continue
-                    parts = os.path.splitext(fname)[0].split("_")
-                    if len(parts) < 4: continue
-                    if parts[2].lower() not in ALLOWED_SPECTRA: continue
-                    hand = parts[1].lower()
-                    identity = subject_id + "_" + hand
-                    if identity in exclude_ids: continue
-                    id2paths[identity].append(os.path.join(scan_dir, fname))
-
     result = dict(id2paths)
     counts = [len(v) for v in result.values()]
     mode   = f"perspective + scanner ({', '.join(sorted(ALLOWED_SPECTRA))})" \
              if use_scanner else "perspective only"
-    print(f"  [Palm-Auth/{mode}] ids={len(result)}  "
-          f"total={sum(counts)}  "
+    print(f"  [Palm-Auth/{mode}] ids={len(result)}  total={sum(counts)}  "
           f"per-id min/max/mean={min(counts)}/{max(counts)}/{sum(counts)/len(counts):.1f}")
     return result
 
 
-def parse_mpd_data(data_root, seed=42, exclude_ids=None):
-    """
-    Two-group sampling. IDs in exclude_ids are skipped before sorting/selection.
-    """
-    exclude_ids = set(exclude_ids or [])
+def parse_mpd_data(data_root, seed=42):
     rng    = random.Random(seed)
     id_dev = defaultdict(lambda: defaultdict(list))
-
     for fname in sorted(os.listdir(data_root)):
         if not fname.lower().endswith((".jpg",".jpeg",".bmp",".png")): continue
-        stem  = os.path.splitext(fname)[0]; parts = stem.split("_")
+        stem = os.path.splitext(fname)[0]; parts = stem.split("_")
         if len(parts) != 5: continue
         subject, session, device, hand_side, iteration = parts
         if device not in ("h","m") or hand_side not in ("l","r"): continue
-        identity = subject + "_" + hand_side
-        if identity in exclude_ids: continue
-        id_dev[identity][device].append(os.path.join(data_root, fname))
+        id_dev[subject+"_"+hand_side][device].append(os.path.join(data_root, fname))
 
     all_ids = list(id_dev.keys()); rng.shuffle(all_ids)
     all_ids.sort(
@@ -489,18 +340,15 @@ def parse_mpd_data(data_root, seed=42, exclude_ids=None):
         reverse=True)
 
     if len(all_ids) < N_HIGH:
-        raise ValueError(f"Need {N_HIGH} IDs for high group but only {len(all_ids)} "
-                         f"available after excluding {len(exclude_ids)} held-out IDs.")
+        raise ValueError(f"Need {N_HIGH} IDs but only {len(all_ids)} found.")
 
     high_ids = all_ids[:N_HIGH]
-    low_candidates = [
-        i for i in all_ids[N_HIGH:]
-        if len(id_dev[i].get("h",[])) + len(id_dev[i].get("m",[])) >= TARGET_LOW
-    ]
-    if len(low_candidates) < N_LOW:
-        raise ValueError(f"Not enough IDs with ≥{TARGET_LOW} samples for low group: "
-                         f"found {len(low_candidates)}, need {N_LOW}.")
-    low_ids = low_candidates[:N_LOW]
+    low_cands = [i for i in all_ids[N_HIGH:]
+                 if len(id_dev[i].get("h",[])) + len(id_dev[i].get("m",[])) >= TARGET_LOW]
+    if len(low_cands) < N_LOW:
+        raise ValueError(f"Not enough IDs with ≥{TARGET_LOW} samples: "
+                         f"found {len(low_cands)}, need {N_LOW}.")
+    low_ids = low_cands[:N_LOW]
 
     def _sample(ident, target):
         paths = id_dev[ident].get("h",[]) + id_dev[ident].get("m",[])
@@ -510,34 +358,116 @@ def parse_mpd_data(data_root, seed=42, exclude_ids=None):
     for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH)
     for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW)
 
-    actual_total = sum(len(v) for v in id2paths.values())
+    actual = sum(len(v) for v in id2paths.values())
     hc = [len(id2paths[i]) for i in high_ids]
     lc = [len(id2paths[i]) for i in low_ids]
     cutoff_h = len(id_dev[high_ids[-1]].get("h",[])) + len(id_dev[high_ids[-1]].get("m",[]))
     cutoff_l = len(id_dev[low_ids[-1]].get("h",[])) + len(id_dev[low_ids[-1]].get("m",[]))
-    print(f"  [MPDv2] ids={len(id2paths)}  total={actual_total}")
+    print(f"  [MPDv2] ids={len(id2paths)}  total={actual}")
     print(f"    High ({N_HIGH}×~{TARGET_HIGH}): min={min(hc)} max={max(hc)} mean={sum(hc)/N_HIGH:.1f} cutoff={cutoff_h}")
     print(f"    Low  ({N_LOW}×~{TARGET_LOW}): min={min(lc)} max={max(lc)} mean={sum(lc)/N_LOW:.1f} cutoff={cutoff_l}")
     return id2paths
 
 
-def get_parser(dataset_name, cfg, exclude_ids=None):
+def get_parser(dataset_name, cfg):
     name = dataset_name.strip().lower().replace("-","").replace("_","")
     seed = cfg["random_seed"]
-    excl = exclude_ids or set()
     if name == "casiams":
-        return lambda: parse_casia_ms(cfg["casiams_data_root"],
-                                      seed=seed, exclude_ids=excl)
+        return lambda: parse_casia_ms(cfg["casiams_data_root"], seed=seed)
     elif name == "palmauth":
         return lambda: parse_palm_auth_data(cfg["palm_auth_data_root"],
-                                            use_scanner=cfg.get("use_scanner", False),
-                                            exclude_ids=excl)
+                                            use_scanner=cfg.get("use_scanner", False))
     elif name == "mpdv2":
-        return lambda: parse_mpd_data(cfg["mpd_data_root"],
-                                      seed=seed, exclude_ids=excl)
+        return lambda: parse_mpd_data(cfg["mpd_data_root"], seed=seed)
     else:
         raise ValueError(f"Unknown dataset: '{dataset_name}'. "
                          f"Use 'CASIA-MS', 'Palm-Auth', or 'MPDv2'.")
+
+
+def _ds_key(name):
+    return name.strip().lower().replace("-","").replace("_","")
+
+
+# ══════════════════════════════════════════════════════════════
+#  COMBINED EVALUATION SET
+# ══════════════════════════════════════════════════════════════
+
+def build_combined_eval_set(cfg, seed=42):
+    """
+    For each of the three datasets:
+      1. Run the standard parser → get the 190 selected IDs with their sampled images.
+      2. Hold out 20% of those 190 IDs (~38) for evaluation.
+      3. Keep the remaining ~152 IDs available for training.
+
+    Merge held-out IDs from all three datasets into one eval set
+    with new global sequential labels.
+    Split each eval ID's images by combined_gallery_ratio.
+
+    Returns
+    -------
+    gallery_samples : list of (path, global_label)
+    probe_samples   : list of (path, global_label)
+    train_remaining : dict { ds_key : id2paths }
+                      — the non-held-out IDs for each dataset,
+                        ready to be used directly as training data.
+    """
+    rng           = random.Random(seed)
+    gallery_ratio = cfg.get("combined_gallery_ratio", 0.50)
+    use_scanner   = cfg.get("use_scanner", False)
+
+    # ── parse all three datasets to get the selected 190 IDs each ─────────
+    print("  Parsing datasets for combined evaluation set …")
+    parsed = {
+        "casiams":  parse_casia_ms(cfg["casiams_data_root"], seed=seed),
+        "palmauth": parse_palm_auth_data(cfg["palm_auth_data_root"],
+                                         use_scanner=use_scanner),
+        "mpdv2":    parse_mpd_data(cfg["mpd_data_root"], seed=seed),
+    }
+
+    gallery_samples = []
+    probe_samples   = []
+    train_remaining = {}   # ds_key → id2paths dict (non-held-out IDs)
+    label_offset    = 0
+
+    for ds_key, id2paths in parsed.items():
+        all_ids = sorted(id2paths.keys())
+        n_held  = max(1, int(len(all_ids) * 0.20))
+
+        # deterministic per-dataset shuffle for reproducibility
+        rng_ds   = random.Random(seed + abs(hash(ds_key)) % 100000)
+        shuffled = list(all_ids); rng_ds.shuffle(shuffled)
+        held_ids = set(shuffled[:n_held])
+
+        # split into held-out (eval) and remaining (train)
+        train_remaining[ds_key] = {k: v for k, v in id2paths.items()
+                                   if k not in held_ids}
+
+        # build gallery + probe from held-out IDs
+        held_sorted = sorted(held_ids)
+        for local_idx, ident in enumerate(held_sorted):
+            global_label = label_offset + local_idx
+            paths = list(id2paths[ident]); rng.shuffle(paths)
+            n_gal = max(1, int(len(paths) * gallery_ratio))
+            for p in paths[:n_gal]:
+                gallery_samples.append((p, global_label))
+            for p in paths[n_gal:]:
+                probe_samples.append((p, global_label))
+
+        n_gal_ds  = sum(1 for _, l in gallery_samples
+                        if label_offset <= l < label_offset + n_held)
+        n_prob_ds = sum(1 for _, l in probe_samples
+                        if label_offset <= l < label_offset + n_held)
+        print(f"  [{ds_key}] total={len(all_ids)} IDs  "
+              f"held-out={n_held}  train={len(train_remaining[ds_key])}  "
+              f"gallery={n_gal_ds}  probe={n_prob_ds}")
+
+        label_offset += n_held
+
+    total_eval_ids = label_offset
+    print(f"  [combined eval] total eval IDs={total_eval_ids}  "
+          f"gallery={len(gallery_samples)}  probe={len(probe_samples)}\n")
+
+    return gallery_samples, probe_samples, train_remaining
 
 
 # ══════════════════════════════════════════════════════════════
@@ -573,6 +503,14 @@ def split_cross_dataset_test(id2paths, gallery_ratio=0.50, seed=42):
         for p in paths[:n_gal]: gallery_samples.append((p, label_map[ident]))
         for p in paths[n_gal:]: probe_samples.append((p, label_map[ident]))
     return gallery_samples, probe_samples, label_map
+
+
+def id2paths_to_samples(id2paths):
+    """Convert id2paths dict to flat (path, label) list with sequential labels."""
+    label_map = {k: i for i, k in enumerate(sorted(id2paths.keys()))}
+    return [(p, label_map[ident])
+            for ident, paths in id2paths.items()
+            for p in paths], label_map
 
 
 # ══════════════════════════════════════════════════════════════
@@ -656,11 +594,7 @@ def extract_features(model, loader, device):
 
 
 def compute_eer(scores_array):
-    """
-    scores_array : (N, 2)
-        col 0 = dot-product similarity (higher = more similar)
-        col 1 = +1 (genuine) | -1 (impostor)
-    """
+    """dot-product similarity: genuine scores are higher."""
     ins  = scores_array[scores_array[:, 1] ==  1, 0]
     outs = scores_array[scores_array[:, 1] == -1, 0]
     if len(ins) == 0 or len(outs) == 0: return 1.0, 0.0
@@ -677,23 +611,21 @@ def evaluate(model, probe_loader, gallery_loader, device,
     probe_feats,   probe_labels   = extract_features(model, probe_loader, device)
     gallery_feats, gallery_labels = extract_features(model, gallery_loader, device)
     n_probe   = len(probe_feats)
-    n_gallery = len(gallery_feats)
 
-    # dot-product similarity matrix  (n_probe × n_gallery)
-    # both embeddings are L2-normalised → dot product = cosine similarity
-    sim_matrix = probe_feats @ gallery_feats.T
+    # dot-product similarity (both embeddings are L2-normalised)
+    sim_matrix = probe_feats @ gallery_feats.T   # (n_probe, n_gallery)
 
-    # genuine/impostor pairs: probe i vs gallery j
+    # genuine/impostor pairs
     scores_list, labels_list = [], []
     for i in range(n_probe):
-        for j in range(n_gallery):
+        for j in range(sim_matrix.shape[1]):
             scores_list.append(sim_matrix[i, j])
             labels_list.append(1 if probe_labels[i] == gallery_labels[j] else -1)
 
-    scores_arr  = np.column_stack([scores_list, labels_list])
-    eer, _      = compute_eer(scores_arr)
+    scores_arr = np.column_stack([scores_list, labels_list])
+    eer, _     = compute_eer(scores_arr)
 
-    # Rank-1: nearest gallery neighbour by highest similarity
+    # Rank-1
     nn_idx  = np.argmax(sim_matrix, axis=1)
     correct = sum(probe_labels[i] == gallery_labels[nn_idx[i]]
                   for i in range(n_probe))
@@ -766,8 +698,8 @@ def main():
     use_scanner         = CONFIG.get("use_scanner", False)
     use_combined_eval   = CONFIG.get("combined_evaluation_set", False)
 
-    same_dataset = (train_data.strip().lower().replace("-","") ==
-                    test_data.strip().lower().replace("-",""))
+    same_dataset = (not use_combined_eval and
+                    _ds_key(train_data) == _ds_key(test_data))
 
     os.makedirs(results_dir, exist_ok=True)
     rst_eval = os.path.join(results_dir, "eval")
@@ -779,39 +711,51 @@ def main():
     print(f"  CompNet Palmprint Recognition")
     print(f"  Device         : {device}")
     print(f"  Train dataset  : {train_data}")
-    print(f"  Test dataset   : {'[combined]' if use_combined_eval else test_data}")
-    if same_dataset and not use_combined_eval:
+    print(f"  Evaluation     : {'combined (all 3 datasets)' if use_combined_eval else test_data}")
+    if use_combined_eval:
+        print(f"  Combined eval  : 20% of each dataset's 190 selected IDs")
+    if same_dataset:
         print(f"  Mode           : same-dataset split "
               f"({int(train_subject_ratio*100)}% train / "
               f"{int((1-train_subject_ratio)*100)}% test)")
-    if "palm-auth" in train_data.lower() or "palm-auth" in test_data.lower() \
-            or use_combined_eval:
-        print(f"  Scanner data   : {'ON  ('+', '.join(sorted(ALLOWED_SPECTRA))+')' if use_scanner else 'OFF'}")
-    print(f"  Combined eval  : {'ON  (20% from each dataset)' if use_combined_eval else 'OFF'}")
+    if "palm-auth" in train_data.lower() or use_combined_eval:
+        print(f"  Scanner data   : "
+              f"{'ON  ('+', '.join(sorted(ALLOWED_SPECTRA))+')' if use_scanner else 'OFF'}")
     print(f"  Sampling       : high={N_HIGH}×{TARGET_HIGH}  low={N_LOW}×{TARGET_LOW}")
     print(f"  Augment factor : {augment_factor}×")
     print(f"{'='*60}\n")
 
-    # ── build combined evaluation set first (if requested) ────────────────
-    held_out_ids = {}   # ds_key → set of identity strings to exclude from training
+    # ── combined evaluation set ───────────────────────────────────────────
+    train_remaining = {}   # ds_key → id2paths (non-held-out IDs)
     if use_combined_eval:
-        print("Building combined evaluation set (20% from each dataset) …")
-        gallery_samples, probe_samples, held_out_ids = build_combined_eval_set(
-            CONFIG, seed=seed)
-        print()
+        print("Building combined evaluation set …")
+        gallery_samples, probe_samples, train_remaining = \
+            build_combined_eval_set(CONFIG, seed=seed)
+        eval_tag_base = "combined"
+    else:
+        eval_tag_base = test_data.replace("-","")
 
-    # ── determine which held-out set applies to the training dataset ───────
-    def _ds_key(name):
-        return name.strip().lower().replace("-","").replace("_","")
+    # ── training data ─────────────────────────────────────────────────────
+    if use_combined_eval:
+        # Use the non-held-out portion of the training dataset
+        train_id2paths = train_remaining[_ds_key(train_data)]
+        print(f"Training on {train_data} "
+              f"(after removing held-out eval IDs) …")
+        n_train_ids  = len(train_id2paths)
+        n_train_imgs = sum(len(v) for v in train_id2paths.values())
+        print(f"  {n_train_ids} identities, {n_train_imgs} images.\n")
 
-    train_excl = held_out_ids.get(_ds_key(train_data), set())
+        train_label_map = {k: i for i, k in enumerate(sorted(train_id2paths))}
+        train_samples   = [(p, train_label_map[ident])
+                           for ident, paths in train_id2paths.items()
+                           for p in paths]
+        num_classes = len(train_label_map)
+        n_test_ids  = len(set(l for _, l in gallery_samples + probe_samples))
+        n_test_imgs = len(gallery_samples) + len(probe_samples)
 
-    # ── parse training data ────────────────────────────────────────────────
-    train_parser = get_parser(train_data, CONFIG, exclude_ids=train_excl)
-
-    if same_dataset and not use_combined_eval:
+    elif same_dataset:
         print(f"Scanning {train_data} (shared train+test) …")
-        all_id2paths = train_parser()
+        all_id2paths = get_parser(train_data, CONFIG)()
         n_total_ids  = len(all_id2paths)
         n_total_imgs = sum(len(v) for v in all_id2paths.values())
         print(f"  Found {n_total_ids} identities, {n_total_imgs} images.\n")
@@ -829,7 +773,7 @@ def main():
 
     else:
         print(f"Scanning {train_data} (train) …")
-        train_id2paths = train_parser()
+        train_id2paths = get_parser(train_data, CONFIG)()
         n_train_ids    = len(train_id2paths)
         n_train_imgs   = sum(len(v) for v in train_id2paths.values())
         print(f"  Found {n_train_ids} identities, {n_train_imgs} images.\n")
@@ -840,21 +784,14 @@ def main():
                            for p in paths]
         num_classes = len(train_label_map)
 
-        if not use_combined_eval:
-            # standard cross-dataset test split
-            test_excl   = held_out_ids.get(_ds_key(test_data), set())
-            test_parser = get_parser(test_data, CONFIG, exclude_ids=test_excl)
-            print(f"Scanning {test_data} (test) …")
-            test_id2paths = test_parser()
-            n_test_ids    = len(test_id2paths)
-            n_test_imgs   = sum(len(v) for v in test_id2paths.values())
-            print(f"  Found {n_test_ids} identities, {n_test_imgs} images.\n")
-            gallery_samples, probe_samples, _ = split_cross_dataset_test(
-                test_id2paths, gallery_ratio=test_gallery_ratio, seed=seed)
-        else:
-            # combined eval already built above
-            n_test_ids  = len(set(l for _,l in gallery_samples + probe_samples))
-            n_test_imgs = len(gallery_samples) + len(probe_samples)
+        print(f"Scanning {test_data} (test) …")
+        test_id2paths = get_parser(test_data, CONFIG)()
+        n_test_ids    = len(test_id2paths)
+        n_test_imgs   = sum(len(v) for v in test_id2paths.values())
+        print(f"  Found {n_test_ids} identities, {n_test_imgs} images.\n")
+
+        gallery_samples, probe_samples, _ = split_cross_dataset_test(
+            test_id2paths, gallery_ratio=test_gallery_ratio, seed=seed)
 
     # ── data loaders ──────────────────────────────────────────────────────
     train_loader = DataLoader(
@@ -868,8 +805,6 @@ def main():
     probe_loader = DataLoader(
         SingleDataset(probe_samples, img_side),
         batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
-
-    eval_tag_base = "combined" if use_combined_eval else test_data.replace("-","")
 
     print(f"  Train  : {n_train_ids} subjects | "
           f"{n_train_imgs} imgs (+aug → {n_train_imgs*augment_factor})")
@@ -956,7 +891,7 @@ def main():
                     pass
 
     # ── final evaluation ──────────────────────────────────────────────────
-    print(f"\n=== Final evaluation ({'combined set' if use_combined_eval else test_data}) ===")
+    print(f"\n=== Final evaluation ({'combined' if use_combined_eval else test_data}) ===")
     best_path = os.path.join(results_dir, "net_params_best_eer.pth")
     if not os.path.exists(best_path):
         best_path = os.path.join(results_dir, "net_params.pth")
