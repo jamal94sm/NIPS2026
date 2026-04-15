@@ -6,18 +6,27 @@ Dataset sampling mirrors Palm-Auth distribution:
   Low  group :  40 IDs × ~15 samples
   Total      : 190 IDs
 
-Optional combined evaluation set
----------------------------------
-When combined_evaluation_set = True:
-  1. Parse all three datasets normally (190 IDs each).
-  2. Hold out 20% of those 190 IDs (~38) from each dataset.
-  3. Merge the held-out IDs into a single eval set with new sequential labels.
-  4. Split each eval ID's samples by combined_gallery_ratio (0.50).
-  5. The remaining ~152 IDs of the TRAINING dataset are used for training.
+Combined evaluation set  (combined_evaluation_set = True)
+---------------------------------------------------------
+  1. Parse all three datasets → 190 selected IDs each.
+  2. Hold out 20% (~38) from each dataset's 190 IDs for evaluation.
+  3. Merge held-out IDs with new global sequential labels.
+  4. Split each eval ID's images by combined_gallery_ratio (0.50).
+  5. Remaining ~152 IDs of the TRAINING dataset → training.
 
-  The combined eval set is cached to combined_eval_cache_path on first build
-  and reloaded identically on every subsequent run — guaranteeing the same
-  evaluation set regardless of which train_data is selected.
+  TWO CACHES are written on the first run and reused on every
+  subsequent run, guaranteeing identical conditions across all
+  train-dataset combinations:
+
+    combined_eval_cache_path  (JSON)
+        • gallery sample paths + labels
+        • probe sample paths + labels
+        • train_remaining paths for each dataset
+
+    init_weights_nc{N}.pth   (alongside the JSON)
+        • initial CompNet weights for num_classes = N
+        • all runs with the same N start from identical weights
+        • completely eliminates CUDA-RNG divergence at epoch 0
 """
 
 # ==============================================================
@@ -26,7 +35,7 @@ When combined_evaluation_set = True:
 CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
     # Choices: "CASIA-MS" | "Palm-Auth" | "MPDv2"
-    "train_data"           : "MPDv2",
+    "train_data"           : "Palm-Auth",
     "test_data"            : "MPDv2",      # used only when combined_evaluation_set=False
 
     # ── Dataset paths ──────────────────────────────────────────
@@ -42,13 +51,12 @@ CONFIG = {
     "use_scanner"          : True,
 
     # ── Combined evaluation set ────────────────────────────────
-    # True  → build (or load cached) combined eval set from all 3 datasets.
-    # False → standard per-dataset test split.
-    "combined_evaluation_set" : True,
-    "combined_gallery_ratio"  : 0.50,
+    "combined_evaluation_set"  : True,
+    "combined_gallery_ratio"   : 0.50,
 
-    # Path where the combined eval set JSON is cached.
-    # All experiments that share this path will use the identical eval set.
+    # Both cache files live next to this path:
+    #   combined_eval_cache.json          ← gallery / probe / train_remaining
+    #   init_weights_nc{N}.pth           ← fixed initial model weights
     "combined_eval_cache_path" : "./combined_eval_cache.json",
 
     # ── Model ──────────────────────────────────────────────────
@@ -112,10 +120,12 @@ random.seed(SEED); np.random.seed(SEED)
 torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 
 ALLOWED_SPECTRA = {"green", "ir", "yellow", "pink", "white"}
-N_HIGH      = 150
-N_LOW       = 40
-TARGET_HIGH = 30
-TARGET_LOW  = 15
+
+# Two-group sampling constants — shared across all three dataset parsers
+N_HIGH      = 150   # number of IDs in the high-sample group
+N_LOW       = 40    # number of IDs in the low-sample group
+TARGET_HIGH = 30    # target images per ID in the high group
+TARGET_LOW  = 15    # target images per ID in the low group
 
 
 # ══════════════════════════════════════════════════════════════
@@ -133,7 +143,9 @@ class GaborConv2d(nn.Module):
         self.padding     = padding
         self.init_ratio  = max(init_ratio, 1e-6)
         self.kernel      = 0
-        _S = 9.2 * self.init_ratio; _F = 0.057 / self.init_ratio; _G = 2.0
+        _S = 9.2 * self.init_ratio
+        _F = 0.057 / self.init_ratio
+        _G = 2.0
         self.gamma = nn.Parameter(torch.FloatTensor([_G]))
         self.sigma = nn.Parameter(torch.FloatTensor([_S]))
         self.theta = nn.Parameter(
@@ -149,11 +161,11 @@ class GaborConv2d(nn.Module):
         y  = y0.view(1,-1).repeat(c_out, c_in, ksz, 1)
         x  = x0.view(-1,1).repeat(c_out, c_in, 1, ksz)
         x  = x.to(sigma.device); y = y.to(sigma.device)
-        xt =  x * torch.cos(theta.view(-1,1,1,1)) + y * torch.sin(theta.view(-1,1,1,1))
-        yt = -x * torch.sin(theta.view(-1,1,1,1)) + y * torch.cos(theta.view(-1,1,1,1))
+        xt =  x*torch.cos(theta.view(-1,1,1,1)) + y*torch.sin(theta.view(-1,1,1,1))
+        yt = -x*torch.sin(theta.view(-1,1,1,1)) + y*torch.cos(theta.view(-1,1,1,1))
         gb = -torch.exp(
-            -0.5 * ((gamma * xt)**2 + yt**2) / (8 * sigma.view(-1,1,1,1)**2)
-        ) * torch.cos(2 * math.pi * f.view(-1,1,1,1) * xt + psi.view(-1,1,1,1))
+            -0.5*((gamma*xt)**2 + yt**2) / (8*sigma.view(-1,1,1,1)**2)
+        ) * torch.cos(2*math.pi*f.view(-1,1,1,1)*xt + psi.view(-1,1,1,1))
         return gb - gb.mean(dim=[2,3], keepdim=True)
 
     def forward(self, x):
@@ -210,6 +222,7 @@ class ArcMarginProduct(nn.Module):
 
 
 class CompNet(nn.Module):
+    """CompNet = CB1 ∥ CB2 ∥ CB3 + FC(9708→emb_dim) + Dropout + ArcFace"""
     def __init__(self, num_classes, embedding_dim=512,
                  arcface_s=30.0, arcface_m=0.50, dropout=0.25):
         super().__init__()
@@ -259,11 +272,12 @@ class NormSingleROI:
 # ══════════════════════════════════════════════════════════════
 
 def parse_casia_ms(data_root, seed=42):
+    """150 IDs × TARGET_HIGH  +  40 IDs × TARGET_LOW."""
     rng     = random.Random(seed)
     id_spec = defaultdict(lambda: defaultdict(list))
     for fname in sorted(os.listdir(data_root)):
         if not fname.lower().endswith((".jpg",".jpeg",".bmp",".png")): continue
-        stem = os.path.splitext(fname)[0]; parts = stem.split("_")
+        stem  = os.path.splitext(fname)[0]; parts = stem.split("_")
         if len(parts) < 4: continue
         id_spec[parts[0]+"_"+parts[1]][parts[2]].append(
             os.path.join(data_root, fname))
@@ -286,7 +300,7 @@ def parse_casia_ms(data_root, seed=42):
         return chosen
 
     id2paths = {}
-    for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH-1)
+    for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH)
     for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW)
 
     actual = sum(len(v) for v in id2paths.values())
@@ -294,11 +308,12 @@ def parse_casia_ms(data_root, seed=42):
     lc = [len(id2paths[i]) for i in low_ids]
     print(f"  [CASIA-MS] ids={len(id2paths)}  total={actual}")
     print(f"    High ({N_HIGH}×~{TARGET_HIGH}): min={min(hc)} max={max(hc)} mean={sum(hc)/N_HIGH:.1f}")
-    print(f"    Low  ({N_LOW}×~{TARGET_LOW}): min={min(lc)} max={max(lc)} mean={sum(lc)/N_LOW:.1f}")
+    print(f"    Low  ({N_LOW}×~{TARGET_LOW}):  min={min(lc)} max={max(lc)} mean={sum(lc)/N_LOW:.1f}")
     return id2paths
 
 
 def parse_palm_auth_data(data_root, use_scanner=False):
+    """All available IDs; roi_perspective + optional roi_scanner (ALLOWED_SPECTRA)."""
     IMG_EXTS = {".jpg",".jpeg",".bmp",".png"}
     id2paths  = defaultdict(list)
     for subject_id in sorted(os.listdir(data_root)):
@@ -319,28 +334,33 @@ def parse_palm_auth_data(data_root, use_scanner=False):
                     parts = os.path.splitext(fname)[0].split("_")
                     if len(parts) < 4: continue
                     if parts[2].lower() not in ALLOWED_SPECTRA: continue
-                    id2paths[subject_id+"_"+parts[1].lower()].append(
-                        os.path.join(scan_dir, fname))
+                    # format: {id}_{Hand}_{spectrum}_{num}.jpg
+                    hand = parts[1].lower()           # "left" / "right"
+                    identity = subject_id + "_" + hand
+                    id2paths[identity].append(os.path.join(scan_dir, fname))
     result = dict(id2paths)
     counts = [len(v) for v in result.values()]
-    mode   = f"perspective + scanner ({', '.join(sorted(ALLOWED_SPECTRA))})" \
-             if use_scanner else "perspective only"
-    print(f"  [Palm-Auth/{mode}] ids={len(result)}  total={sum(counts)}  "
+    mode   = (f"perspective + scanner ({', '.join(sorted(ALLOWED_SPECTRA))})"
+              if use_scanner else "perspective only")
+    print(f"  [Palm-Auth/{mode}]")
+    print(f"    ids={len(result)}  total={sum(counts)}  "
           f"per-id min/max/mean={min(counts)}/{max(counts)}/{sum(counts)/len(counts):.1f}")
     return result
 
 
 def parse_mpd_data(data_root, seed=42):
+    """Top-150 IDs × TARGET_HIGH  +  next-40 IDs (≥TARGET_LOW) × TARGET_LOW."""
     rng    = random.Random(seed)
     id_dev = defaultdict(lambda: defaultdict(list))
     for fname in sorted(os.listdir(data_root)):
         if not fname.lower().endswith((".jpg",".jpeg",".bmp",".png")): continue
-        stem = os.path.splitext(fname)[0]; parts = stem.split("_")
+        stem  = os.path.splitext(fname)[0]; parts = stem.split("_")
         if len(parts) != 5: continue
         subject, session, device, hand_side, iteration = parts
         if device not in ("h","m") or hand_side not in ("l","r"): continue
         id_dev[subject+"_"+hand_side][device].append(os.path.join(data_root, fname))
 
+    # Sort descending by total count; random shuffle first for tie-breaking
     all_ids = list(id_dev.keys()); rng.shuffle(all_ids)
     all_ids.sort(
         key=lambda i: len(id_dev[i].get("h",[])) + len(id_dev[i].get("m",[])),
@@ -348,10 +368,11 @@ def parse_mpd_data(data_root, seed=42):
 
     if len(all_ids) < N_HIGH:
         raise ValueError(f"Need {N_HIGH} IDs but only {len(all_ids)} found.")
-
     high_ids = all_ids[:N_HIGH]
+
     low_cands = [i for i in all_ids[N_HIGH:]
-                 if len(id_dev[i].get("h",[])) + len(id_dev[i].get("m",[])) >= TARGET_LOW]
+                 if (len(id_dev[i].get("h",[])) +
+                     len(id_dev[i].get("m",[]))) >= TARGET_LOW]
     if len(low_cands) < N_LOW:
         raise ValueError(f"Not enough IDs with ≥{TARGET_LOW} samples: "
                          f"found {len(low_cands)}, need {N_LOW}.")
@@ -362,17 +383,21 @@ def parse_mpd_data(data_root, seed=42):
         return rng.sample(paths, min(target, len(paths)))
 
     id2paths = {}
-    for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH+4)
-    for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW+1)
+    for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH)
+    for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW)
 
-    actual = sum(len(v) for v in id2paths.values())
+    actual   = sum(len(v) for v in id2paths.values())
     hc = [len(id2paths[i]) for i in high_ids]
     lc = [len(id2paths[i]) for i in low_ids]
-    cutoff_h = len(id_dev[high_ids[-1]].get("h",[])) + len(id_dev[high_ids[-1]].get("m",[]))
-    cutoff_l = len(id_dev[low_ids[-1]].get("h",[])) + len(id_dev[low_ids[-1]].get("m",[]))
+    cutoff_h = (len(id_dev[high_ids[-1]].get("h",[])) +
+                len(id_dev[high_ids[-1]].get("m",[])))
+    cutoff_l = (len(id_dev[low_ids[-1]].get("h",[])) +
+                len(id_dev[low_ids[-1]].get("m",[])))
     print(f"  [MPDv2] ids={len(id2paths)}  total={actual}")
-    print(f"    High ({N_HIGH}×~{TARGET_HIGH}): min={min(hc)} max={max(hc)} mean={sum(hc)/N_HIGH:.1f} cutoff={cutoff_h}")
-    print(f"    Low  ({N_LOW}×~{TARGET_LOW}): min={min(lc)} max={max(lc)} mean={sum(lc)/N_LOW:.1f} cutoff={cutoff_l}")
+    print(f"    High ({N_HIGH}×~{TARGET_HIGH}): "
+          f"min={min(hc)} max={max(hc)} mean={sum(hc)/N_HIGH:.1f} cutoff={cutoff_h}")
+    print(f"    Low  ({N_LOW}×~{TARGET_LOW}):  "
+          f"min={min(lc)} max={max(lc)} mean={sum(lc)/N_LOW:.1f} cutoff={cutoff_l}")
     return id2paths
 
 
@@ -396,55 +421,50 @@ def _ds_key(name):
 
 
 # ══════════════════════════════════════════════════════════════
-#  COMBINED EVALUATION SET  (with cache)
+#  COMBINED EVALUATION SET  (JSON cache)
 # ══════════════════════════════════════════════════════════════
 
 def build_combined_eval_set(cfg, seed=42):
     """
-    Build (or reload from cache) the combined evaluation set.
+    Build or reload the combined evaluation set.
 
-    On first call:
-      1. Parse all three datasets → 190 selected IDs each.
-      2. Hold out 20% (~38) of each dataset's 190 IDs for evaluation.
-      3. Merge held-out IDs with new global sequential labels.
-      4. Split each eval ID's images by combined_gallery_ratio.
-      5. Save everything to combined_eval_cache_path as JSON.
+    FIRST RUN  → parses all three datasets, holds out 20% of each
+                 dataset's 190 selected IDs, writes JSON cache.
+    LATER RUNS → loads JSON cache directly; no parsing, no RNG consumed.
 
-    On subsequent calls:
-      Load the JSON and return identical gallery/probe/train_remaining,
-      guaranteeing the same evaluation set across ALL experiments.
+    The gallery/probe split for each ID uses a per-dataset RNG seeded
+    from (seed + hash(ds_key)) so it is independent of global RNG state.
 
     Returns
     -------
-    gallery_samples  : list of (path, global_label)
-    probe_samples    : list of (path, global_label)
-    train_remaining  : dict { ds_key : {ident: [paths]} }
-                       — non-held-out IDs for each dataset.
+    gallery_samples  : list of (path, int_label)
+    probe_samples    : list of (path, int_label)
+    train_remaining  : {ds_key: {ident: [paths]}}
     """
     cache_path = cfg.get("combined_eval_cache_path", "./combined_eval_cache.json")
 
-    # ── load from cache if it exists ─────────────────────────────────────
+    # ── load from cache ───────────────────────────────────────
     if os.path.exists(cache_path):
         print(f"  Loading cached combined eval set from:\n    {cache_path}")
         with open(cache_path, "r") as f:
             data = json.load(f)
-        gallery_samples = [tuple(x) for x in data["gallery"]]
-        probe_samples   = [tuple(x) for x in data["probe"]]
-        train_remaining = {k: {ident: paths
-                               for ident, paths in v.items()}
-                           for k, v in data["train_remaining"].items()}
-        print(f"  [combined eval] total eval IDs={data['n_eval_ids']}  "
+        gallery_samples = [(row[0], int(row[1])) for row in data["gallery"]]
+        probe_samples   = [(row[0], int(row[1])) for row in data["probe"]]
+        train_remaining = {
+            k: {ident: paths for ident, paths in v.items()}
+            for k, v in data["train_remaining"].items()
+        }
+        print(f"  [combined eval] eval IDs={data['n_eval_ids']}  "
               f"gallery={len(gallery_samples)}  probe={len(probe_samples)}\n")
         return gallery_samples, probe_samples, train_remaining
 
-    # ── build fresh ───────────────────────────────────────────────────────
+    # ── build fresh ───────────────────────────────────────────
     print("  Building combined evaluation set for the first time …")
-    rng           = random.Random(seed)
-    gallery_ratio = cfg.get("combined_gallery_ratio", 0.50)
     use_scanner   = cfg.get("use_scanner", False)
+    gallery_ratio = cfg.get("combined_gallery_ratio", 0.50)
 
-    # Use a FIXED seed for each dataset's parser so the 190-ID selection
-    # is identical no matter when or how many times this function is called.
+    # Parse all three datasets with the global seed so sampling is
+    # deterministic and identical whenever the cache is rebuilt.
     parsed = {
         "casiams":  parse_casia_ms(cfg["casiams_data_root"], seed=seed),
         "palmauth": parse_palm_auth_data(cfg["palm_auth_data_root"],
@@ -461,21 +481,18 @@ def build_combined_eval_set(cfg, seed=42):
         all_ids = sorted(id2paths.keys())
         n_held  = max(1, int(len(all_ids) * 0.20))
 
-        # Deterministic per-dataset shuffle — completely independent of
-        # any global RNG state so held-out IDs never change between runs.
-        rng_ds   = random.Random(seed + abs(hash(ds_key)) % 100000)
-        shuffled = list(all_ids); rng_ds.shuffle(shuffled)
+        # Independent per-dataset RNG — completely isolated from global state
+        rng_hold  = random.Random(seed + abs(hash(ds_key))          % 100000)
+        rng_split = random.Random(seed + abs(hash(ds_key + "_split"))% 100000)
+
+        shuffled = list(all_ids); rng_hold.shuffle(shuffled)
         held_ids = set(shuffled[:n_held])
 
         train_remaining[ds_key] = {k: v for k, v in id2paths.items()
                                    if k not in held_ids}
 
-        # Build gallery + probe — use a per-dataset RNG seeded from ds_key
-        # so the gallery/probe split is also stable across runs.
-        rng_split = random.Random(seed + abs(hash(ds_key + "_split")) % 100000)
-        held_sorted = sorted(held_ids)
         n_gal_ds = 0; n_prob_ds = 0
-        for local_idx, ident in enumerate(held_sorted):
+        for local_idx, ident in enumerate(sorted(held_ids)):
             global_label = label_offset + local_idx
             paths = list(id2paths[ident]); rng_split.shuffle(paths)
             n_gal = max(1, int(len(paths) * gallery_ratio))
@@ -484,22 +501,22 @@ def build_combined_eval_set(cfg, seed=42):
             for p in paths[n_gal:]:
                 probe_samples.append((p, global_label));   n_prob_ds += 1
 
-        print(f"  [{ds_key}] total={len(all_ids)} IDs  "
-              f"held-out={n_held}  train={len(train_remaining[ds_key])}  "
+        print(f"  [{ds_key}] total={len(all_ids)} IDs  held-out={n_held}  "
+              f"train={len(train_remaining[ds_key])}  "
               f"gallery={n_gal_ds}  probe={n_prob_ds}")
         label_offset += n_held
 
     print(f"  [combined eval] total eval IDs={label_offset}  "
           f"gallery={len(gallery_samples)}  probe={len(probe_samples)}")
 
-    # ── save to cache ─────────────────────────────────────────────────────
-    os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
+    # ── save JSON cache ───────────────────────────────────────
+    cache_dir = os.path.dirname(os.path.abspath(cache_path))
+    os.makedirs(cache_dir, exist_ok=True)
     with open(cache_path, "w") as f:
         json.dump({
             "gallery":         [[p, l] for p, l in gallery_samples],
             "probe":           [[p, l] for p, l in probe_samples],
-            "train_remaining": {k: {ident: paths
-                                    for ident, paths in v.items()}
+            "train_remaining": {k: {ident: paths for ident, paths in v.items()}
                                 for k, v in train_remaining.items()},
             "n_eval_ids":      label_offset,
             "seed":            seed,
@@ -511,7 +528,41 @@ def build_combined_eval_set(cfg, seed=42):
 
 
 # ══════════════════════════════════════════════════════════════
-#  SPLITS
+#  FIXED MODEL INITIALISATION  (.pth cache)
+# ══════════════════════════════════════════════════════════════
+
+def get_or_create_init_weights(net, cfg, num_classes, device):
+    """
+    Ensure all experiments start from IDENTICAL initial weights.
+
+    The weights file is stored alongside the eval JSON cache:
+        init_weights_nc{num_classes}.pth
+
+    FIRST CALL  → saves the freshly-constructed net's state_dict.
+    LATER CALLS → loads those saved weights into net, overwriting
+                  whatever xavier_uniform_ produced this time.
+
+    Because all training datasets produce the same num_classes
+    (152 in combined-eval mode), one file covers every experiment.
+    """
+    cache_path = cfg.get("combined_eval_cache_path", "./combined_eval_cache.json")
+    cache_dir  = os.path.dirname(os.path.abspath(cache_path))
+    weights_path = os.path.join(cache_dir, f"init_weights_nc{num_classes}.pth")
+
+    _net = net.module if isinstance(net, DataParallel) else net
+
+    if os.path.exists(weights_path):
+        print(f"  Loading cached init weights from:\n    {weights_path}")
+        _net.load_state_dict(torch.load(weights_path, map_location=device))
+    else:
+        print(f"  Saving init weights to:\n    {weights_path}")
+        torch.save(_net.state_dict(), weights_path)
+
+    return net
+
+
+# ══════════════════════════════════════════════════════════════
+#  SPLITS  (standard mode — not used when combined_eval=True)
 # ══════════════════════════════════════════════════════════════
 
 def split_same_dataset(id2paths, train_subject_ratio=0.80,
@@ -550,10 +601,11 @@ def split_cross_dataset_test(id2paths, gallery_ratio=0.50, seed=42):
 # ══════════════════════════════════════════════════════════════
 
 class SingleDataset(Dataset):
+    """Deterministic — no augmentation, no shuffling."""
     def __init__(self, samples, img_side=128):
         self.samples   = samples
-        self.transform = T.Compose([T.Resize(img_side), T.ToTensor(),
-                                    NormSingleROI(outchannels=1)])
+        self.transform = T.Compose([
+            T.Resize(img_side), T.ToTensor(), NormSingleROI(outchannels=1)])
 
     def __len__(self): return len(self.samples)
 
@@ -618,6 +670,7 @@ def run_one_epoch(model, loader, criterion, optimizer, device, phase):
 
 @torch.no_grad()
 def extract_features(model, loader, device):
+    """Deterministic: model.eval(), no_grad, shuffle=False in loader."""
     model.eval(); feats, labels = [], []
     for imgs, labs in loader:
         feats.append(model.get_embedding(imgs.to(device)).cpu().numpy())
@@ -626,7 +679,11 @@ def extract_features(model, loader, device):
 
 
 def compute_eer(scores_array):
-    """dot-product similarity: genuine scores are higher."""
+    """
+    scores_array[:,0] = dot-product similarity  (higher → more similar)
+    scores_array[:,1] = +1 genuine | -1 impostor
+    No negation needed: roc_curve expects higher score = positive class.
+    """
     ins  = scores_array[scores_array[:, 1] ==  1, 0]
     outs = scores_array[scores_array[:, 1] == -1, 0]
     if len(ins) == 0 or len(outs) == 0: return 1.0, 0.0
@@ -640,24 +697,24 @@ def compute_eer(scores_array):
 
 def evaluate(model, probe_loader, gallery_loader, device,
              out_dir=".", tag="eval"):
-    probe_feats,   probe_labels   = extract_features(model, probe_loader, device)
+    probe_feats,   probe_labels   = extract_features(model, probe_loader,   device)
     gallery_feats, gallery_labels = extract_features(model, gallery_loader, device)
     n_probe = len(probe_feats)
 
-    # dot-product similarity (both embeddings are L2-normalised)
-    sim_matrix = probe_feats @ gallery_feats.T   # (n_probe, n_gallery)
+    # L2-normalised embeddings → dot product = cosine similarity ∈ [-1,1]
+    sim_matrix = probe_feats @ gallery_feats.T    # (n_probe, n_gallery)
 
-    # genuine (+1) / impostor (-1) pairs: all probe vs all gallery
+    # All probe-vs-gallery pairs
     scores_list, labels_list = [], []
     for i in range(n_probe):
         for j in range(sim_matrix.shape[1]):
-            scores_list.append(sim_matrix[i, j])
+            scores_list.append(float(sim_matrix[i, j]))
             labels_list.append(1 if probe_labels[i] == gallery_labels[j] else -1)
 
     scores_arr = np.column_stack([scores_list, labels_list])
     eer, _     = compute_eer(scores_arr)
 
-    # Rank-1: nearest gallery neighbour by highest similarity
+    # Rank-1: nearest gallery neighbour by highest dot-product similarity
     nn_idx  = np.argmax(sim_matrix, axis=1)
     correct = sum(probe_labels[i] == gallery_labels[nn_idx[i]]
                   for i in range(n_probe))
@@ -769,9 +826,9 @@ def main():
 
     # ── training data ─────────────────────────────────────────────────────
     if use_combined_eval:
-        # Use the non-held-out portion returned by the combined eval builder
+        # The non-held-out portion was returned by build_combined_eval_set
         train_id2paths = train_remaining[_ds_key(train_data)]
-        print(f"Scanning {train_data} (training portion after eval hold-out) …")
+        print(f"Scanning {train_data} (training portion, eval IDs excluded) …")
         n_train_ids  = len(train_id2paths)
         n_train_imgs = sum(len(v) for v in train_id2paths.values())
         print(f"  {n_train_ids} identities, {n_train_imgs} images.\n")
@@ -829,6 +886,7 @@ def main():
         AugmentedDataset(train_samples, img_side, augment_factor),
         batch_size=batch_size, shuffle=True, num_workers=nw, pin_memory=True)
 
+    # shuffle=False is essential for deterministic feature extraction
     gallery_loader = DataLoader(
         SingleDataset(gallery_samples, img_side),
         batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
@@ -844,12 +902,6 @@ def main():
     print(f"  Classes: {num_classes}\n")
 
     # ── model ─────────────────────────────────────────────────────────────
-    # ── reset seed before model init so weights are identical across runs ──
-    torch.manual_seed(SEED)
-    torch.cuda.manual_seed_all(SEED)
-    np.random.seed(SEED)
-    random.seed(SEED)
-
     print(f"Building CompNet — num_classes={num_classes} …")
     net = CompNet(num_classes, embedding_dim=embedding_dim,
                   arcface_s=arcface_s, arcface_m=arcface_m, dropout=dropout)
@@ -858,17 +910,23 @@ def main():
         print(f"  Using {torch.cuda.device_count()} GPUs")
         net = DataParallel(net)
 
+    # ── fixed initialisation (save on first run, load on all others) ───────
+    if use_combined_eval:
+        net = get_or_create_init_weights(net, CONFIG, num_classes, device)
+    else:
+        print("  Training from scratch (random init).")
+
+    # ── optional checkpoint resume ─────────────────────────────────────────
     if CONFIG.get("resume", False):
-        for ckpt in ["net_params_best_eer.pth", "net_params_best.pth", "net_params.pth"]:
+        for ckpt in ["net_params_best_eer.pth", "net_params_best.pth",
+                     "net_params.pth"]:
             path = os.path.join(results_dir, ckpt)
             if os.path.exists(path):
                 _net = net.module if isinstance(net, DataParallel) else net
                 _net.load_state_dict(torch.load(path, map_location=device))
                 print(f"  Resumed from : {path}"); break
         else:
-            print("  No checkpoint found — training from scratch.")
-    else:
-        print("  Training from scratch.")
+            print("  No checkpoint found — starting from init weights.")
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(net.parameters(), lr=lr)
@@ -928,7 +986,8 @@ def main():
                     pass
 
     # ── final evaluation ──────────────────────────────────────────────────
-    print(f"\n=== Final evaluation ({'combined' if use_combined_eval else test_data}) ===")
+    print(f"\n=== Final evaluation "
+          f"({'combined' if use_combined_eval else test_data}) ===")
     best_path = os.path.join(results_dir, "net_params_best_eer.pth")
     if not os.path.exists(best_path):
         best_path = os.path.join(results_dir, "net_params.pth")
@@ -947,7 +1006,8 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"  Train  : {train_data} ({n_train_ids} subjects, {n_train_imgs} imgs)")
-    print(f"  Eval   : {'combined (CASIA-MS + Palm-Auth + MPDv2)' if use_combined_eval else test_data}")
+    print(f"  Eval   : "
+          f"{'combined (CASIA-MS + Palm-Auth + MPDv2)' if use_combined_eval else test_data}")
     print(f"  FINAL EER    : {final_eer*100:.4f}%")
     print(f"  FINAL Rank-1 : {final_rank1:.3f}%")
     print(f"  Results      : {results_dir}")
@@ -963,10 +1023,13 @@ def main():
             f.write(f"Scanner spectra    : {', '.join(sorted(ALLOWED_SPECTRA))}\n")
         f.write(f"Combined eval      : {use_combined_eval}\n")
         if use_combined_eval:
-            f.write(f"Eval cache         : {CONFIG.get('combined_eval_cache_path','')}\n")
-        f.write(f"Sampling           : high={N_HIGH}×{TARGET_HIGH} low={N_LOW}×{TARGET_LOW}\n")
+            f.write(f"Eval cache         : "
+                    f"{CONFIG.get('combined_eval_cache_path','')}\n")
+        f.write(f"Sampling           : "
+                f"high={N_HIGH}×{TARGET_HIGH} low={N_LOW}×{TARGET_LOW}\n")
         f.write(f"Num classes        : {num_classes}\n")
-        f.write(f"Eval set           : {'combined' if use_combined_eval else test_data}\n")
+        f.write(f"Eval set           : "
+                f"{'combined' if use_combined_eval else test_data}\n")
         f.write(f"Eval subjects      : {n_test_ids}\n")
         f.write(f"Gallery samples    : {len(gallery_samples)}\n")
         f.write(f"Probe samples      : {len(probe_samples)}\n")
