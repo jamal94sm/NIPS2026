@@ -316,7 +316,7 @@ def parse_casia_ms(data_root, seed=42):
     low_counts   = [len(id2paths[i]) for i in low_ids]
 
     print(f"  [CASIA-MS] ids={len(id2paths)}  total={actual_total}")
-    print(f"    High group ({N_HIGH} IDs × ~{TARGET_HIGH}): "
+    print(f"    High group ({N_HIGH} IDs × ~{TARGET_HIGH_CASIA}): "
           f"min={min(high_counts)}  max={max(high_counts)}  "
           f"mean={sum(high_counts)/N_HIGH:.1f}")
     print(f"    Low  group ({N_LOW} IDs × ~{TARGET_LOW}): "
