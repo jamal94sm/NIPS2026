@@ -32,8 +32,8 @@ Results are saved to:
 # ==============================================================
 #  EXPERIMENT GRID  — edit these two lists to change what runs
 # ==============================================================
-TRAIN_DATASETS = ["CASIA-MS", "Palm-Auth", "MPDv2", "XJTU"]
-TEST_DATASETS  = ["CASIA-MS", "Palm-Auth", "MPDv2", "XJTU", "Combined"]
+TRAIN_DATASETS = ["Palm-Auth", "CASIA-MS", "MPDv2", "XJTU"]
+TEST_DATASETS  = ["Palm-Auth", "CASIA-MS", "MPDv2", "XJTU", "Combined"]
 
 # ==============================================================
 #  BASE CONFIG  — shared across all experiments
