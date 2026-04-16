@@ -5,11 +5,7 @@ Runs ALL combinations of train × test datasets and prints a
 summary table of EER and Rank-1 at the end.
 
 Train datasets : CASIA-MS | Palm-Auth | MPDv2 | XJTU
-Test  datasets : CASIA-MS | Palm-Auth | MPDv2 | XJTU | Combined
-
-The combined evaluation set cache (JSON + init weights) is built
-once on the first run and reused identically for every subsequent
-combination — guaranteeing a fair comparison.
+Test  datasets : CASIA-MS | Palm-Auth | MPDv2 | XJTU
 
 Results are saved to:
   {BASE_RESULTS_DIR}/train_{X}_test_{Y}/   ← per-experiment outputs
@@ -21,7 +17,7 @@ Results are saved to:
 #  EXPERIMENT GRID  — edit these two lists to change what runs
 # ==============================================================
 TRAIN_DATASETS = ["CASIA-MS", "Palm-Auth", "MPDv2", "XJTU"]
-TEST_DATASETS  = ["CASIA-MS", "Palm-Auth", "MPDv2", "XJTU", "Combined"]
+TEST_DATASETS  = ["CASIA-MS", "Palm-Auth", "MPDv2", "XJTU"]
 
 # ==============================================================
 #  BASE CONFIG  — shared across all experiments
@@ -40,12 +36,6 @@ BASE_CONFIG = {
     # ── Palm-Auth toggle ───────────────────────────────────────
     "use_scanner"          : True,
 
-    # ── Combined evaluation set ────────────────────────────────
-    "combined_evaluation_set"  : False,
-    "combined_gallery_ratio"   : 0.50,
-    # All experiments share the SAME cache file
-    "combined_eval_cache_path" : "./combined_eval_cache.json",
-
     # ── Model ──────────────────────────────────────────────────
     "img_side"             : 128,
     "dropout"              : 0.5,
@@ -63,7 +53,7 @@ BASE_CONFIG = {
     "lr"                   : 0.001,
     "lr_step"              : 30,
     "lr_gamma"             : 0.6,
-    "augment_factor"       : 4,
+    "augment_factor"       : 2,
 
     # ── Misc ───────────────────────────────────────────────────
     "base_results_dir"     : "./rst_co3net_all",
@@ -536,101 +526,6 @@ def _ds_key(name):
 
 
 # ══════════════════════════════════════════════════════════════
-#  COMBINED EVALUATION SET  (shared JSON cache)
-# ══════════════════════════════════════════════════════════════
-
-def build_combined_eval_set(cfg, seed=42):
-    cache_path = cfg.get("combined_eval_cache_path", "./combined_eval_cache.json")
-
-    if os.path.exists(cache_path):
-        print(f"  Loading cached combined eval set from:\n    {cache_path}")
-        with open(cache_path, "r") as f:
-            data = json.load(f)
-        gallery_samples = [(row[0], int(row[1])) for row in data["gallery"]]
-        probe_samples   = [(row[0], int(row[1])) for row in data["probe"]]
-        train_remaining = {k: {ident: paths for ident, paths in v.items()}
-                           for k, v in data["train_remaining"].items()}
-        print(f"  [combined eval] eval IDs={data['n_eval_ids']}  "
-              f"gallery={len(gallery_samples)}  probe={len(probe_samples)}\n")
-        return gallery_samples, probe_samples, train_remaining
-
-    print("  Building combined evaluation set for the first time …")
-    use_scanner   = cfg.get("use_scanner", False)
-    gallery_ratio = cfg.get("combined_gallery_ratio", 0.50)
-
-    parsed = {
-        "casiams":  parse_casia_ms(cfg["casiams_data_root"], seed=seed),
-        "palmauth": parse_palm_auth_data(cfg["palm_auth_data_root"],
-                                         use_scanner=use_scanner),
-        "mpdv2":    parse_mpd_data(cfg["mpd_data_root"], seed=seed),
-        "xjtu":     parse_xjtu_data(cfg["xjtu_data_root"], seed=seed),
-    }
-
-    gallery_samples = []; probe_samples = []; train_remaining = {}; label_offset = 0
-
-    for ds_key, id2paths in parsed.items():
-        all_ids  = sorted(id2paths.keys())
-        n_held   = max(1, int(len(all_ids) * 0.20))
-        rng_hold  = random.Random(seed + abs(hash(ds_key))           % 100000)
-        rng_split = random.Random(seed + abs(hash(ds_key + "_split")) % 100000)
-        shuffled  = list(all_ids); rng_hold.shuffle(shuffled)
-        held_ids  = set(shuffled[:n_held])
-        train_remaining[ds_key] = {k: v for k, v in id2paths.items()
-                                   if k not in held_ids}
-        n_gal_ds = 0; n_prob_ds = 0
-        for local_idx, ident in enumerate(sorted(held_ids)):
-            global_label = label_offset + local_idx
-            paths = list(id2paths[ident]); rng_split.shuffle(paths)
-            n_gal = max(1, int(len(paths) * gallery_ratio))
-            for p in paths[:n_gal]:
-                gallery_samples.append((p, global_label)); n_gal_ds += 1
-            for p in paths[n_gal:]:
-                probe_samples.append((p, global_label));   n_prob_ds += 1
-        print(f"  [{ds_key}] total={len(all_ids)} IDs  held-out={n_held}  "
-              f"train={len(train_remaining[ds_key])}  "
-              f"gallery={n_gal_ds}  probe={n_prob_ds}")
-        label_offset += n_held
-
-    print(f"  [combined eval] total eval IDs={label_offset}  "
-          f"gallery={len(gallery_samples)}  probe={len(probe_samples)}")
-
-    cache_dir = os.path.dirname(os.path.abspath(cache_path))
-    os.makedirs(cache_dir, exist_ok=True)
-    with open(cache_path, "w") as f:
-        json.dump({
-            "gallery":         [[p, l] for p, l in gallery_samples],
-            "probe":           [[p, l] for p, l in probe_samples],
-            "train_remaining": {k: {ident: paths for ident, paths in v.items()}
-                                for k, v in train_remaining.items()},
-            "n_eval_ids": label_offset, "seed": seed,
-            "use_scanner": use_scanner, "gallery_ratio": gallery_ratio,
-        }, f, indent=2)
-    print(f"  Eval set cached to:\n    {cache_path}\n")
-    return gallery_samples, probe_samples, train_remaining
-
-
-# ══════════════════════════════════════════════════════════════
-#  FIXED MODEL INITIALISATION
-# ══════════════════════════════════════════════════════════════
-
-def get_or_create_init_weights(net, cfg, num_classes, device):
-    """Filename includes model class name to avoid cross-model conflicts."""
-    cache_path   = cfg.get("combined_eval_cache_path", "./combined_eval_cache.json")
-    cache_dir    = os.path.dirname(os.path.abspath(cache_path))
-    model_name   = type(net.module if isinstance(net, DataParallel) else net).__name__
-    weights_path = os.path.join(cache_dir,
-                                f"init_weights_{model_name}_nc{num_classes}.pth")
-    _net = net.module if isinstance(net, DataParallel) else net
-    if os.path.exists(weights_path):
-        print(f"  Loading cached init weights: {weights_path}")
-        _net.load_state_dict(torch.load(weights_path, map_location=device))
-    else:
-        print(f"  Saving init weights: {weights_path}")
-        torch.save(_net.state_dict(), weights_path)
-    return net
-
-
-# ══════════════════════════════════════════════════════════════
 #  SPLITS
 # ══════════════════════════════════════════════════════════════
 
@@ -804,9 +699,7 @@ def evaluate(model, probe_loader, gallery_loader, device,
 #  SINGLE EXPERIMENT
 # ══════════════════════════════════════════════════════════════
 
-def run_experiment(train_data, test_data, cfg,
-                   combined_gallery=None, combined_probe=None,
-                   train_remaining=None, device=None):
+def run_experiment(train_data, test_data, cfg, device=None):
     """
     Train CO3Net on `train_data`, evaluate on `test_data`.
     Returns (final_eer, final_rank1).
@@ -831,44 +724,26 @@ def run_experiment(train_data, test_data, cfg,
     eval_every      = cfg["eval_every"]
     save_every      = cfg["save_every"]
     nw              = cfg["num_workers"]
-    use_combined    = (test_data.lower() == "combined")
 
     os.makedirs(results_dir, exist_ok=True)
     rst_eval = os.path.join(results_dir, "eval")
     os.makedirs(rst_eval, exist_ok=True)
 
-    same_dataset  = (not use_combined and _ds_key(train_data) == _ds_key(test_data))
-    eval_tag_base = "combined" if use_combined else test_data.replace("-","")
+    same_dataset  = (_ds_key(train_data) == _ds_key(test_data))
+    eval_tag_base = test_data.replace("-","")
 
     # ── training + evaluation data ────────────────────────────────────────
-    if use_combined:
-        train_id2paths  = train_remaining[_ds_key(train_data)]
-        n_train_ids     = len(train_id2paths)
-        n_train_imgs    = sum(len(v) for v in train_id2paths.values())
-        print(f"  Train  : {n_train_ids} subjects | {n_train_imgs} imgs")
-        train_label_map = {k: i for i, k in enumerate(sorted(train_id2paths))}
-        train_samples   = [(p, train_label_map[ident])
-                           for ident, paths in train_id2paths.items()
-                           for p in paths]
-        num_classes     = len(train_label_map)
-        gallery_samples = combined_gallery
-        probe_samples   = combined_probe
-
-    elif same_dataset:
+    if same_dataset:
         print(f"  Parsing {train_data} (shared train+test) …")
         all_id2paths = get_parser(train_data, cfg)()
         (train_samples, gallery_samples, probe_samples,
          train_label_map, _) = split_same_dataset(
             all_id2paths, train_sub_ratio, test_gal_ratio, seed)
         num_classes  = len(train_label_map)
-        n_train_ids  = num_classes
-        n_train_imgs = len(train_samples)
 
     else:
         print(f"  Parsing {train_data} (train) …")
         train_id2paths  = get_parser(train_data, cfg)()
-        n_train_ids     = len(train_id2paths)
-        n_train_imgs    = sum(len(v) for v in train_id2paths.values())
         train_label_map = {k: i for i, k in enumerate(sorted(train_id2paths))}
         train_samples   = [(p, train_label_map[ident])
                            for ident, paths in train_id2paths.items()
@@ -898,9 +773,6 @@ def run_experiment(train_data, test_data, cfg,
     net.to(device)
     if torch.cuda.device_count() > 1:
         net = DataParallel(net)
-
-    # Fixed init weights — same starting point for all experiments
-    net = get_or_create_init_weights(net, cfg, num_classes, device)
 
     criterion     = nn.CrossEntropyLoss()
     con_criterion = SupConLoss(temperature=temperature, base_temperature=temperature)
@@ -1029,12 +901,6 @@ def main():
     print(f"  Results dir : {base_results_dir}")
     print(f"{'='*60}\n")
 
-    # ── Build combined eval set ONCE before any training ──────────────────
-    print("Step 1: Ensuring combined evaluation set exists …")
-    combined_gallery, combined_probe, train_remaining = \
-        build_combined_eval_set(BASE_CONFIG, seed=seed)
-    print()
-
     # ── Loop over all train × test combinations ───────────────────────────
     n_total = len(TRAIN_DATASETS) * len(TEST_DATASETS)
     n_done  = 0
@@ -1052,22 +918,16 @@ def main():
             cfg = copy.deepcopy(BASE_CONFIG)
             cfg["train_data"] = train_data
             cfg["test_data"]  = test_data
-            cfg["combined_evaluation_set"] = (test_data.lower() == "combined")
 
             safe_train = train_data.replace("-","").replace(" ","")
             safe_test  = test_data.replace("-","").replace(" ","")
             cfg["results_dir"] = os.path.join(
                 base_results_dir, f"train_{safe_train}_test_{safe_test}")
 
-            use_combined = cfg["combined_evaluation_set"]
             t_start = time.time()
             try:
                 eer, rank1 = run_experiment(
-                    train_data, test_data, cfg,
-                    combined_gallery=combined_gallery if use_combined else None,
-                    combined_probe=combined_probe     if use_combined else None,
-                    train_remaining=train_remaining    if use_combined else None,
-                    device=device)
+                    train_data, test_data, cfg, device=device)
 
                 results[(train_data, test_data)] = (eer * 100, rank1)
                 elapsed = time.time() - t_start
