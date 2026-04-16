@@ -740,17 +740,41 @@ def extract_features(model, loader, device):
     return np.concatenate(feats), np.concatenate(labels)
 
 
-def compute_eer(scores_array):
-    """dot-product similarity: genuine scores are higher, no negation needed."""
+def compute_eer(scores_array, n_impostors_per_genuine=1, n_trials=10, seed=42):
+    """
+    Balanced EER: subsample impostors to match genuine count (1:1 ratio).
+    Repeat n_trials times and return the mean EER ± std.
+
+    scores_array[:,0] = dot-product similarity  (higher → more similar)
+    scores_array[:,1] = +1 genuine | -1 impostor
+    """
+    rng  = np.random.RandomState(seed)
     ins  = scores_array[scores_array[:, 1] ==  1, 0]
     outs = scores_array[scores_array[:, 1] == -1, 0]
-    if len(ins) == 0 or len(outs) == 0: return 1.0, 0.0
-    y   = np.concatenate([np.ones(len(ins)), np.zeros(len(outs))])
-    s   = np.concatenate([ins, outs])
-    fpr, tpr, thresholds = roc_curve(y, s, pos_label=1)
-    eer    = brentq(lambda x: 1.0 - x - interp1d(fpr, tpr)(x), 0.0, 1.0)
-    thresh = float(interp1d(fpr, thresholds)(eer))
-    return eer, thresh
+    if len(ins) == 0 or len(outs) == 0: return 1.0, 0.0, 0.0
+
+    n_gen = len(ins)
+    n_imp = min(len(outs), n_gen * n_impostors_per_genuine)
+
+    eers = []
+    for _ in range(n_trials):
+        imp_sample = rng.choice(outs, size=n_imp, replace=False)
+        # mirror official getEER.py: flip if genuine mean < impostor mean
+        if ins.mean() < imp_sample.mean():
+            ins_use = -ins; imp_use = -imp_sample
+        else:
+            ins_use = ins;  imp_use = imp_sample
+        y   = np.concatenate([np.ones(n_gen),   np.zeros(n_imp)])
+        s   = np.concatenate([ins_use,            imp_use])
+        fpr, tpr, thresholds = roc_curve(y, s, pos_label=1)
+        eer = brentq(lambda x: 1.0 - x - interp1d(fpr, tpr)(x), 0.0, 1.0)
+        eers.append(eer)
+
+    mean_eer = float(np.mean(eers))
+    std_eer  = float(np.std(eers))
+    # also return threshold from the last trial for reference
+    thresh   = float(interp1d(fpr, thresholds)(eers[-1]))
+    return mean_eer, thresh, std_eer
 
 
 def evaluate(model, probe_loader, gallery_loader, device,
@@ -767,8 +791,8 @@ def evaluate(model, probe_loader, gallery_loader, device,
             scores_list.append(float(sim_matrix[i, j]))
             labels_list.append(1 if probe_labels[i] == gallery_labels[j] else -1)
 
-    scores_arr = np.column_stack([scores_list, labels_list])
-    eer, _     = compute_eer(scores_arr)
+    scores_arr          = np.column_stack([scores_list, labels_list])
+    eer, _, eer_std     = compute_eer(scores_arr)
 
     nn_idx  = np.argmax(sim_matrix, axis=1)
     correct = sum(probe_labels[i] == gallery_labels[nn_idx[i]]
@@ -780,7 +804,7 @@ def evaluate(model, probe_loader, gallery_loader, device,
         for s, l in zip(scores_list, labels_list): f.write(f"{s} {l}\n")
     _save_roc_det(scores_arr, out_dir, tag)
 
-    print(f"  [{tag}]  EER={eer*100:.4f}%  Rank-1={rank1:.2f}%")
+    print(f"  [{tag}]  EER={eer*100:.4f}% (±{eer_std*100:.4f}%)  Rank-1={rank1:.2f}%")
     return eer, rank1
 
 
