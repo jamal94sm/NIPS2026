@@ -1,5 +1,5 @@
 """
-CompNet — Full Cross-Dataset Experiment Runner
+CCNet — Full Cross-Dataset Experiment Runner
 ==================================================
 Runs ALL combinations of train × test datasets and prints a
 summary table of EER and Rank-1 at the end.
@@ -7,13 +7,26 @@ summary table of EER and Rank-1 at the end.
 Train datasets : CASIA-MS | Palm-Auth | MPDv2 | XJTU
 Test  datasets : CASIA-MS | Palm-Auth | MPDv2 | XJTU | Combined
 
-The combined evaluation set cache (JSON + init weights) is built
-once on the first run and reused identically for every subsequent
-combination — guaranteeing a fair comparison.
+Model architecture and training: unchanged from official CCNet.
+  - CompetitiveBlock_Mul_Ord_Comp (multi-order Gabor + spatial/channel
+    competition + SE layer)
+  - FC: 13152 → 4096 → 2048 + ArcFace (s=30, m=0.5)
+  - Loss: ce_weight * CrossEntropy + con_weight * SupConLoss
+  - Paired-image training (same-class pairs for SupConLoss)
+  - comp_weight controls channel vs. spatial competition
+
+Evaluation framework: follows CO3Net cross-dataset structure.
+  - Same four dataset parsers with two-group sampling
+  - Combined evaluation set cache (JSON, shared across all runs)
+  - Fixed init weights cache (per model class + num_classes)
+  - EER_all (all impostor pairs) + EER_bal (balanced 1:1, 10 trials)
+  - Model selection uses EER_bal
+  - Results table saved as .txt and .json
 
 Results are saved to:
   {BASE_RESULTS_DIR}/train_{X}_test_{Y}/   ← per-experiment outputs
-  {BASE_RESULTS_DIR}/results_table.txt     ← final EER / Rank-1 table
+  {BASE_RESULTS_DIR}/results_table.txt     ← final EER_bal / Rank-1 table
+  {BASE_RESULTS_DIR}/results_raw.json      ← raw numbers as JSON
 """
 
 # ==============================================================
@@ -40,35 +53,36 @@ BASE_CONFIG = {
     "use_scanner"          : True,
 
     # ── Combined evaluation set ────────────────────────────────
-    # These two are overridden per-experiment; cache path is shared.
     "combined_evaluation_set"  : False,
     "combined_gallery_ratio"   : 0.50,
-    # !! All experiments share the SAME cache file !!
     "combined_eval_cache_path" : "./combined_eval_cache.json",
 
-    # ── Model ──────────────────────────────────────────────────
+    # ── Model (official CCNet values) ──────────────────────────
     "img_side"             : 128,
-    "embedding_dim"        : 512,
-    "dropout"              : 0.25,
+    "comp_weight"          : 0.8,    # channel vs. spatial competition weight
+    "dropout"              : 0.5,
     "arcface_s"            : 30.0,
     "arcface_m"            : 0.50,
 
+    # ── Loss ───────────────────────────────────────────────────
+    "ce_weight"            : 0.8,
+    "con_weight"           : 0.2,
+    "temperature"          : 0.07,
+
     # ── Training ───────────────────────────────────────────────
-    "batch_size"           : 128,
+    "batch_size"           : 256,
     "num_epochs"           : 100,
     "lr"                   : 0.001,
-    "lr_step"              : 30,
+    "lr_step"              : 17,     # proportional to official 500/3000 × 100
     "lr_gamma"             : 0.8,
-    "augment_factor"       : 2,
+    "augment_factor"       : 4,      # dataset expansion factor
 
     # ── Misc ───────────────────────────────────────────────────
-    "base_results_dir"     : "./rst_compnet_all",
+    "base_results_dir"     : "./rst_ccnet_all",
     "random_seed"          : 42,
     "save_every"           : 50,
     "eval_every"           : 50,
     "num_workers"          : 4,
-    "resume"               : False,
-    "eval_only"            : False,
 }
 # ==============================================================
 
@@ -124,63 +138,169 @@ XJTU_VARIATIONS = [
 
 
 # ══════════════════════════════════════════════════════════════
-#  MODEL
+#  SUPCONLOSS  (exact copy from official CCNet/loss.py)
+# ══════════════════════════════════════════════════════════════
+
+class SupConLoss(nn.Module):
+    def __init__(self, temperature=0.07, contrast_mode='all',
+                 base_temperature=0.07):
+        super().__init__()
+        self.temperature      = temperature
+        self.contrast_mode    = contrast_mode
+        self.base_temperature = base_temperature
+
+    def forward(self, features, labels=None, mask=None):
+        device = torch.device('cuda') if features.is_cuda else torch.device('cpu')
+        if len(features.shape) < 3:
+            raise ValueError('`features` needs to be [bsz, n_views, ...]')
+        if len(features.shape) > 3:
+            features = features.view(features.shape[0], features.shape[1], -1)
+        batch_size = features.shape[0]
+        if labels is not None and mask is not None:
+            raise ValueError('Cannot define both `labels` and `mask`')
+        elif labels is None and mask is None:
+            mask = torch.eye(batch_size, dtype=torch.float32).to(device)
+        elif labels is not None:
+            labels = labels.contiguous().view(-1, 1)
+            if labels.shape[0] != batch_size:
+                raise ValueError('Num of labels does not match num of features')
+            mask = torch.eq(labels, labels.T).float().to(device)
+        else:
+            mask = mask.float().to(device)
+        contrast_count   = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+        if self.contrast_mode == 'one':
+            anchor_feature = features[:, 0]; anchor_count = 1
+        elif self.contrast_mode == 'all':
+            anchor_feature = contrast_feature; anchor_count = contrast_count
+        else:
+            raise ValueError('Unknown mode: {}'.format(self.contrast_mode))
+        anchor_dot_contrast = torch.div(
+            torch.matmul(anchor_feature, contrast_feature.T), self.temperature)
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+        mask = mask.repeat(anchor_count, contrast_count)
+        logits_mask = torch.scatter(
+            torch.ones_like(mask), 1,
+            torch.arange(batch_size * anchor_count).view(-1, 1).to(device), 0)
+        mask = mask * logits_mask
+        exp_logits        = torch.exp(logits) * logits_mask
+        log_prob          = logits - torch.log(exp_logits.sum(1, keepdim=True))
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
+        loss = -(self.temperature / self.base_temperature) * mean_log_prob_pos
+        return loss.view(anchor_count, batch_size).mean()
+
+
+# ══════════════════════════════════════════════════════════════
+#  CCNET ARCHITECTURE  (exact copy from official CCNet)
 # ══════════════════════════════════════════════════════════════
 
 class GaborConv2d(nn.Module):
     def __init__(self, channel_in, channel_out, kernel_size,
                  stride=1, padding=0, init_ratio=1):
         super().__init__()
-        self.channel_in = channel_in; self.channel_out = channel_out
-        self.kernel_size = kernel_size; self.stride = stride
-        self.padding = padding; self.init_ratio = max(init_ratio, 1e-6)
-        self.kernel = 0
-        _S = 9.2 * self.init_ratio; _F = 0.057 / self.init_ratio; _G = 2.0
-        self.gamma = nn.Parameter(torch.FloatTensor([_G]))
-        self.sigma = nn.Parameter(torch.FloatTensor([_S]))
+        self.channel_in  = channel_in
+        self.channel_out = channel_out
+        self.kernel_size = kernel_size
+        self.stride      = stride
+        self.padding     = padding
+        self.init_ratio  = init_ratio if init_ratio > 0 else 1.0
+        self.kernel      = 0
+        _SIGMA = 9.2   * self.init_ratio
+        _FREQ  = 0.057 / self.init_ratio
+        _GAMMA = 2.0
+        self.gamma = nn.Parameter(torch.FloatTensor([_GAMMA]), requires_grad=True)
+        self.sigma = nn.Parameter(torch.FloatTensor([_SIGMA]), requires_grad=True)
         self.theta = nn.Parameter(
-            torch.arange(0, channel_out).float() * math.pi / channel_out,
+            torch.FloatTensor(torch.arange(0, channel_out).float()) * math.pi / channel_out,
             requires_grad=False)
-        self.f   = nn.Parameter(torch.FloatTensor([_F]))
-        self.psi = nn.Parameter(torch.FloatTensor([0]), requires_grad=False)
+        self.f   = nn.Parameter(torch.FloatTensor([_FREQ]), requires_grad=True)
+        self.psi = nn.Parameter(torch.FloatTensor([0]),     requires_grad=False)
 
-    def _gen(self, ksize, c_in, c_out, sigma, gamma, theta, f, psi):
-        half = ksize // 2; ksz = 2 * half + 1
-        y0 = torch.arange(-half, half + 1).float()
-        x0 = torch.arange(-half, half + 1).float()
-        y  = y0.view(1,-1).repeat(c_out, c_in, ksz, 1)
-        x  = x0.view(-1,1).repeat(c_out, c_in, 1, ksz)
-        x  = x.to(sigma.device); y = y.to(sigma.device)
+    def genGaborBank(self, kernel_size, channel_in, channel_out,
+                     sigma, gamma, theta, f, psi):
+        xmax = kernel_size // 2; xmin = -xmax; ksize = xmax - xmin + 1
+        y_0  = torch.arange(xmin, xmax + 1).float()
+        x_0  = torch.arange(xmin, xmax + 1).float()
+        y = y_0.view(1,-1).repeat(channel_out, channel_in, ksize, 1)
+        x = x_0.view(-1,1).repeat(channel_out, channel_in, 1, ksize)
+        x = x.float().to(sigma.device); y = y.float().to(sigma.device)
         xt =  x*torch.cos(theta.view(-1,1,1,1)) + y*torch.sin(theta.view(-1,1,1,1))
         yt = -x*torch.sin(theta.view(-1,1,1,1)) + y*torch.cos(theta.view(-1,1,1,1))
-        gb = -torch.exp(-0.5*((gamma*xt)**2+yt**2)/(8*sigma.view(-1,1,1,1)**2)
-            ) * torch.cos(2*math.pi*f.view(-1,1,1,1)*xt+psi.view(-1,1,1,1))
+        gb = -torch.exp(
+            -0.5*((gamma*xt)**2 + yt**2) / (8*sigma.view(-1,1,1,1)**2)
+        ) * torch.cos(2*math.pi*f.view(-1,1,1,1)*xt + psi.view(-1,1,1,1))
         return gb - gb.mean(dim=[2,3], keepdim=True)
 
     def forward(self, x):
-        self.kernel = self._gen(self.kernel_size, self.channel_in,
-                                self.channel_out, self.sigma, self.gamma,
-                                self.theta, self.f, self.psi)
-        return F.conv2d(x, self.kernel, stride=self.stride, padding=self.padding)
+        kernel = self.genGaborBank(self.kernel_size, self.channel_in,
+                                   self.channel_out, self.sigma, self.gamma,
+                                   self.theta, self.f, self.psi)
+        self.kernel = kernel
+        return F.conv2d(x, kernel, stride=self.stride, padding=self.padding)
 
 
-class CompetitiveBlock(nn.Module):
-    def __init__(self, channel_in, n_competitor, ksize, stride, padding,
-                 init_ratio=1, o1=32, o2=12):
+class SELayer(nn.Module):
+    def __init__(self, channel, reduction=1):
         super().__init__()
-        self.gabor   = GaborConv2d(channel_in, n_competitor, ksize,
-                                   stride, padding, init_ratio)
-        self.a       = nn.Parameter(torch.FloatTensor([1]))
-        self.b       = nn.Parameter(torch.FloatTensor([0]))
-        self.argmax  = nn.Softmax(dim=1)
-        self.conv1   = nn.Conv2d(n_competitor, o1, 5, 1, 0)
-        self.maxpool = nn.MaxPool2d(2, 2)
-        self.conv2   = nn.Conv2d(o1, o2, 1, 1, 0)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid())
 
     def forward(self, x):
-        x = self.gabor(x)
-        x = self.argmax((x - self.b) * self.a)
-        return self.conv2(self.maxpool(self.conv1(x)))
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
+class CompetitiveBlock_Mul_Ord_Comp(nn.Module):
+    """
+    Multi-Order Comprehensive Competition Block (CCNet).
+    1st order: LGC → spatial+channel competition → SE → conv → pool
+    2nd order: LGC(on 1st Gabor output) → competition → SE → conv → pool
+    Output: concatenation of 1st and 2nd order flattened features.
+    """
+    def __init__(self, channel_in, n_competitor, ksize, stride, padding,
+                 weight, init_ratio=1, o1=32, o2=12):
+        super().__init__()
+        self.gabor_conv2d  = GaborConv2d(channel_in, n_competitor, ksize,
+                                         stride=2, padding=ksize//2,
+                                         init_ratio=init_ratio)
+        self.gabor_conv2d2 = GaborConv2d(n_competitor, n_competitor, ksize,
+                                         stride=2, padding=ksize//2,
+                                         init_ratio=init_ratio)
+        self.argmax   = nn.Softmax(dim=1)   # channel competition
+        self.argmax_x = nn.Softmax(dim=2)   # spatial-x competition
+        self.argmax_y = nn.Softmax(dim=3)   # spatial-y competition
+        self.conv1_1  = nn.Conv2d(n_competitor, o1 // 2, 5, 2, 0)
+        self.conv2_1  = nn.Conv2d(n_competitor, o1 // 2, 5, 2, 0)
+        self.maxpool  = nn.MaxPool2d(2, 2)
+        self.se1      = SELayer(n_competitor)
+        self.se2      = SELayer(n_competitor)
+        self.weight_chan = weight
+        self.weight_spa  = (1 - weight) / 2
+
+    def forward(self, x):
+        # 1st order
+        x = self.gabor_conv2d(x)
+        x_1 = self.weight_chan * self.argmax(x) + self.weight_spa * (
+              self.argmax_x(x) + self.argmax_y(x))
+        x_1 = self.se1(x_1)
+        x_1 = self.maxpool(self.conv1_1(x_1))
+
+        # 2nd order
+        x = self.gabor_conv2d2(x)
+        x_2 = self.weight_chan * self.argmax(x) + self.weight_spa * (
+              self.argmax_x(x) + self.argmax_y(x))
+        x_2 = self.se2(x_2)
+        x_2 = self.maxpool(self.conv2_1(x_2))
+
+        return torch.cat((x_1.view(x_1.shape[0], -1),
+                          x_2.view(x_2.shape[0], -1)), dim=1)
 
 
 class ArcMarginProduct(nn.Module):
@@ -194,53 +314,64 @@ class ArcMarginProduct(nn.Module):
         self.cos_m = math.cos(m); self.sin_m = math.sin(m)
         self.th    = math.cos(math.pi - m); self.mm = math.sin(math.pi - m) * m
 
-    def forward(self, x, label=None):
-        cosine = F.linear(F.normalize(x), F.normalize(self.weight))
+    def forward(self, inp, label=None):
+        cosine = F.linear(F.normalize(inp), F.normalize(self.weight))
         if self.training:
             assert label is not None
             sine = torch.sqrt((1.0 - cosine.pow(2)).clamp(0, 1))
             phi  = cosine * self.cos_m - sine * self.sin_m
             phi  = (torch.where(cosine > 0, phi, cosine) if self.easy_margin
                     else torch.where(cosine > self.th, phi, cosine - self.mm))
-            one_hot = torch.zeros_like(cosine)
+            one_hot = torch.zeros(cosine.size(), device=cosine.device)
             one_hot.scatter_(1, label.view(-1, 1).long(), 1)
-            return self.s * ((one_hot * phi) + ((1 - one_hot) * cosine))
+            return self.s * ((one_hot * phi) + ((1.0 - one_hot) * cosine))
         return self.s * cosine
 
 
-class CompNet(nn.Module):
-    def __init__(self, num_classes, embedding_dim=512,
-                 arcface_s=30.0, arcface_m=0.50, dropout=0.25):
+class ccnet(nn.Module):
+    """
+    CCNet = CB1 // CB2 // CB3 + FC(13152→4096→2048) + Dropout + ArcFace.
+    forward() returns (logits, normalised_6144d_contrastive_features).
+    get_embedding() returns L2-normalised 2048-d matching embedding.
+    """
+    def __init__(self, num_classes, weight=0.8, dropout=0.5,
+                 arcface_s=30.0, arcface_m=0.50):
         super().__init__()
-        self.cb1  = CompetitiveBlock(1, 9, 35, 3, 0, init_ratio=1.00)
-        self.cb2  = CompetitiveBlock(1, 9, 17, 3, 0, init_ratio=0.50)
-        self.cb3  = CompetitiveBlock(1, 9,  7, 3, 0, init_ratio=0.25)
-        self.fc   = nn.Linear(9708, embedding_dim)
-        self.drop = nn.Dropout(p=dropout)
-        self.arc  = ArcMarginProduct(embedding_dim, num_classes,
-                                     s=arcface_s, m=arcface_m)
-
-    def _backbone(self, x):
-        x1 = self.cb1(x).flatten(1); x2 = self.cb2(x).flatten(1)
-        x3 = self.cb3(x).flatten(1)
-        return self.fc(torch.cat([x1, x2, x3], dim=1))
+        self.num_classes = num_classes
+        self.cb1 = CompetitiveBlock_Mul_Ord_Comp(
+            1,  9, 35, stride=3, padding=17, init_ratio=1,    weight=weight)
+        self.cb2 = CompetitiveBlock_Mul_Ord_Comp(
+            1, 36, 17, stride=3, padding=8,  init_ratio=0.5,  weight=weight, o2=24)
+        self.cb3 = CompetitiveBlock_Mul_Ord_Comp(
+            1,  9,  7, stride=3, padding=3,  init_ratio=0.25, weight=weight)
+        self.fc       = nn.Linear(13152, 4096)
+        self.fc1      = nn.Linear(4096, 2048)
+        self.drop     = nn.Dropout(p=dropout)
+        self.arclayer = ArcMarginProduct(2048, num_classes,
+                                         s=arcface_s, m=arcface_m)
 
     def forward(self, x, y=None):
-        return self.arc(self.drop(self._backbone(x)), y)
+        x1 = self.cb1(x); x2 = self.cb2(x); x3 = self.cb3(x)
+        x  = torch.cat((x1, x2, x3), dim=1)
+        x1 = self.fc(x); x = self.fc1(x1)
+        fe = F.normalize(torch.cat((x1, x), dim=1), dim=-1)  # 6144-d contrastive
+        x  = self.arclayer(self.drop(x), y)
+        return x, fe
 
     @torch.no_grad()
     def get_embedding(self, x):
-        return F.normalize(self._backbone(x), p=2, dim=1)
+        """L2-normalised 2048-d embedding for matching."""
+        x1 = self.cb1(x); x2 = self.cb2(x); x3 = self.cb3(x)
+        x  = torch.cat((x1, x2, x3), dim=1)
+        return F.normalize(self.fc1(self.fc(x)), p=2, dim=1)
 
 
 # ══════════════════════════════════════════════════════════════
-#  NORMALISATION
+#  NORMALISATION  (exact copy from official CCNet)
 # ══════════════════════════════════════════════════════════════
 
 class NormSingleROI:
-    def __init__(self, outchannels=1):
-        self.outchannels = outchannels
-
+    def __init__(self, outchannels=1): self.outchannels = outchannels
     def __call__(self, tensor):
         c, h, w = tensor.size(); tensor = tensor.view(c, h * w)
         idx = tensor > 0; t = tensor[idx]
@@ -264,15 +395,12 @@ def parse_casia_ms(data_root, seed=42):
         if len(parts) < 4: continue
         id_spec[parts[0]+"_"+parts[1]][parts[2]].append(
             os.path.join(data_root, fname))
-
     all_ids = sorted(id_spec.keys())
     if len(all_ids) < N_HIGH + N_LOW:
         raise ValueError(f"CASIA-MS: need {N_HIGH+N_LOW} IDs, found {len(all_ids)}")
-
     selected = sorted(rng.sample(all_ids, N_HIGH + N_LOW))
     rng.shuffle(selected)
     high_ids = selected[:N_HIGH]; low_ids = selected[N_HIGH:]
-
     def _sample(ident, target):
         spec_list = list(sorted(id_spec[ident].keys())); rng.shuffle(spec_list)
         n_spec = len(spec_list); base_s = target // n_spec; rem_s = target % n_spec
@@ -281,11 +409,9 @@ def parse_casia_ms(data_root, seed=42):
             k = min(base_s + (1 if j < rem_s else 0), len(id_spec[ident][sp]))
             chosen.extend(rng.sample(id_spec[ident][sp], k))
         return chosen
-
     id2paths = {}
     for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH_CASIA)
     for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW_CASIA)
-
     actual = sum(len(v) for v in id2paths.values())
     hc = [len(id2paths[i]) for i in high_ids]; lc = [len(id2paths[i]) for i in low_ids]
     print(f"  [CASIA-MS] ids={len(id2paths)}  total={actual}")
@@ -295,8 +421,7 @@ def parse_casia_ms(data_root, seed=42):
 
 
 def parse_palm_auth_data(data_root, use_scanner=False):
-    IMG_EXTS = {".jpg",".jpeg",".bmp",".png"}
-    id2paths  = defaultdict(list)
+    IMG_EXTS = {".jpg",".jpeg",".bmp",".png"}; id2paths = defaultdict(list)
     for subject_id in sorted(os.listdir(data_root)):
         subject_dir = os.path.join(data_root, subject_id)
         if not os.path.isdir(subject_dir): continue
@@ -336,27 +461,23 @@ def parse_mpd_data(data_root, seed=42):
         subject, session, device, hand_side, iteration = parts
         if device not in ("h","m") or hand_side not in ("l","r"): continue
         id_dev[subject+"_"+hand_side][device].append(os.path.join(data_root, fname))
-
     all_ids = list(id_dev.keys()); rng.shuffle(all_ids)
     all_ids.sort(key=lambda i: len(id_dev[i].get("h",[]))+len(id_dev[i].get("m",[])),
                  reverse=True)
     if len(all_ids) < N_HIGH:
         raise ValueError(f"MPDv2: need {N_HIGH} IDs, found {len(all_ids)}")
-    high_ids = all_ids[:N_HIGH]
+    high_ids  = all_ids[:N_HIGH]
     low_cands = [i for i in all_ids[N_HIGH:]
                  if len(id_dev[i].get("h",[]))+len(id_dev[i].get("m",[]))>=TARGET_LOW_MPD]
     if len(low_cands) < N_LOW:
-        raise ValueError(f"MPDv2: not enough low-group IDs")
+        raise ValueError("MPDv2: not enough low-group IDs")
     low_ids = low_cands[:N_LOW]
-
     def _sample(ident, target):
         paths = id_dev[ident].get("h",[]) + id_dev[ident].get("m",[])
         return rng.sample(paths, min(target, len(paths)))
-
     id2paths = {}
     for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH_MPD)
     for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW_MPD)
-
     actual = sum(len(v) for v in id2paths.values())
     hc = [len(id2paths[i]) for i in high_ids]; lc = [len(id2paths[i]) for i in low_ids]
     cutoff_h = len(id_dev[high_ids[-1]].get("h",[]))+len(id_dev[high_ids[-1]].get("m",[]))
@@ -371,7 +492,6 @@ def parse_xjtu_data(data_root, seed=42):
     rng      = random.Random(seed)
     IMG_EXTS = {".jpg",".jpeg",".bmp",".png"}
     id_var   = defaultdict(lambda: defaultdict(list))
-
     for device, condition in XJTU_VARIATIONS:
         var_dir = os.path.join(data_root, device, condition)
         if not os.path.isdir(var_dir):
@@ -385,16 +505,13 @@ def parse_xjtu_data(data_root, seed=42):
                 if os.path.splitext(fname)[1].lower() not in IMG_EXTS: continue
                 id_var[id_folder][(device, condition)].append(
                     os.path.join(id_dir, fname))
-
     all_ids = sorted(id_var.keys())
     print(f"  [XJTU] Total IDs found: {len(all_ids)}")
     if len(all_ids) < N_HIGH + N_LOW:
         raise ValueError(f"XJTU: need {N_HIGH+N_LOW} IDs, found {len(all_ids)}")
-
     selected = sorted(rng.sample(all_ids, N_HIGH + N_LOW))
     rng.shuffle(selected)
     high_ids = selected[:N_HIGH]; low_ids = selected[N_HIGH:]
-
     def _sample_var(ident, target):
         var_keys = list(XJTU_VARIATIONS); rng.shuffle(var_keys)
         n_var = len(var_keys); base_v = target // n_var; rem_v = target % n_var
@@ -403,11 +520,9 @@ def parse_xjtu_data(data_root, seed=42):
             k = min(base_v + (1 if j < rem_v else 0), len(id_var[ident].get(vk,[])))
             if k > 0: chosen.extend(rng.sample(id_var[ident].get(vk,[]), k))
         return chosen
-
     id2paths = {}
     for ident in high_ids: id2paths[ident] = _sample_var(ident, TARGET_HIGH_XJTU)
     for ident in low_ids:  id2paths[ident] = _sample_var(ident, TARGET_LOW_XJTU)
-
     actual = sum(len(v) for v in id2paths.values())
     hc = [len(id2paths[i]) for i in high_ids]; lc = [len(id2paths[i]) for i in low_ids]
     print(f"  [XJTU] ids={len(id2paths)}  total={actual}")
@@ -437,12 +552,11 @@ def _ds_key(name):
 
 
 # ══════════════════════════════════════════════════════════════
-#  COMBINED EVALUATION SET  (JSON cache — shared across all runs)
+#  COMBINED EVALUATION SET  (shared JSON cache)
 # ══════════════════════════════════════════════════════════════
 
 def build_combined_eval_set(cfg, seed=42):
     cache_path = cfg.get("combined_eval_cache_path", "./combined_eval_cache.json")
-
     if os.path.exists(cache_path):
         print(f"  Loading cached combined eval set from:\n    {cache_path}")
         with open(cache_path, "r") as f:
@@ -458,7 +572,6 @@ def build_combined_eval_set(cfg, seed=42):
     print("  Building combined evaluation set for the first time …")
     use_scanner   = cfg.get("use_scanner", False)
     gallery_ratio = cfg.get("combined_gallery_ratio", 0.50)
-
     parsed = {
         "casiams":  parse_casia_ms(cfg["casiams_data_root"], seed=seed),
         "palmauth": parse_palm_auth_data(cfg["palm_auth_data_root"],
@@ -466,12 +579,10 @@ def build_combined_eval_set(cfg, seed=42):
         "mpdv2":    parse_mpd_data(cfg["mpd_data_root"], seed=seed),
         "xjtu":     parse_xjtu_data(cfg["xjtu_data_root"], seed=seed),
     }
-
     gallery_samples = []; probe_samples = []; train_remaining = {}; label_offset = 0
-
     for ds_key, id2paths in parsed.items():
-        all_ids = sorted(id2paths.keys())
-        n_held  = max(1, int(len(all_ids) * 0.20))
+        all_ids  = sorted(id2paths.keys())
+        n_held   = max(1, int(len(all_ids) * 0.20))
         rng_hold  = random.Random(seed + abs(hash(ds_key))           % 100000)
         rng_split = random.Random(seed + abs(hash(ds_key + "_split")) % 100000)
         shuffled  = list(all_ids); rng_hold.shuffle(shuffled)
@@ -491,10 +602,8 @@ def build_combined_eval_set(cfg, seed=42):
               f"train={len(train_remaining[ds_key])}  "
               f"gallery={n_gal_ds}  probe={n_prob_ds}")
         label_offset += n_held
-
     print(f"  [combined eval] total eval IDs={label_offset}  "
           f"gallery={len(gallery_samples)}  probe={len(probe_samples)}")
-
     cache_dir = os.path.dirname(os.path.abspath(cache_path))
     os.makedirs(cache_dir, exist_ok=True)
     with open(cache_path, "w") as f:
@@ -503,7 +612,7 @@ def build_combined_eval_set(cfg, seed=42):
             "probe":           [[p, l] for p, l in probe_samples],
             "train_remaining": {k: {ident: paths for ident, paths in v.items()}
                                 for k, v in train_remaining.items()},
-            "n_eval_ids":      label_offset, "seed": seed,
+            "n_eval_ids": label_offset, "seed": seed,
             "use_scanner": use_scanner, "gallery_ratio": gallery_ratio,
         }, f, indent=2)
     print(f"  Eval set cached to:\n    {cache_path}\n")
@@ -515,7 +624,7 @@ def build_combined_eval_set(cfg, seed=42):
 # ══════════════════════════════════════════════════════════════
 
 def get_or_create_init_weights(net, cfg, num_classes, device):
-    """Per-model, per-num_classes weight cache to guarantee identical init."""
+    """Filename includes model class name to avoid cross-model conflicts."""
     cache_path   = cfg.get("combined_eval_cache_path", "./combined_eval_cache.json")
     cache_dir    = os.path.dirname(os.path.abspath(cache_path))
     model_name   = type(net.module if isinstance(net, DataParallel) else net).__name__
@@ -570,6 +679,49 @@ def split_cross_dataset_test(id2paths, gallery_ratio=0.50, seed=42):
 #  PYTORCH DATASETS
 # ══════════════════════════════════════════════════════════════
 
+class PairedDataset(Dataset):
+    """
+    Paired-image training dataset for CCNet SupConLoss.
+    Returns [img1, img2] where img2 is a different sample of the same identity.
+    Matches the official CCNet paired-sampling logic.
+    """
+    def __init__(self, samples, img_side=128, augment_factor=1):
+        self.samples        = samples
+        self.augment_factor = augment_factor
+        self.label2idxs     = defaultdict(list)
+        for i, (_, lab) in enumerate(samples):
+            self.label2idxs[lab].append(i)
+        self.aug_transform = T.Compose([
+            T.Resize(img_side),
+            T.RandomChoice([
+                T.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
+                T.RandomResizedCrop(img_side, scale=(0.8,1.0), ratio=(1.0,1.0)),
+                T.RandomPerspective(distortion_scale=0.15, p=1),
+                T.RandomChoice([
+                    T.RandomRotation(10, expand=False,
+                                     center=(0.5*img_side, 0.0)),
+                    T.RandomRotation(10, expand=False,
+                                     center=(0.0, 0.5*img_side)),
+                ]),
+            ]),
+            T.ToTensor(), NormSingleROI(outchannels=1),
+        ])
+
+    def __len__(self): return len(self.samples) * self.augment_factor
+
+    def __getitem__(self, index):
+        real_idx     = index % len(self.samples)
+        path1, label = self.samples[real_idx]
+        idxs = self.label2idxs[label]
+        idx2 = real_idx
+        while idx2 == real_idx and len(idxs) > 1:
+            idx2 = random.choice(idxs)
+        path2 = self.samples[idx2][0]
+        img1  = self.aug_transform(Image.open(path1).convert("L"))
+        img2  = self.aug_transform(Image.open(path2).convert("L"))
+        return [img1, img2], label
+
+
 class SingleDataset(Dataset):
     def __init__(self, samples, img_side=128):
         self.samples   = samples
@@ -581,50 +733,31 @@ class SingleDataset(Dataset):
         return self.transform(Image.open(path).convert("L")), label
 
 
-class AugmentedDataset(Dataset):
-    def __init__(self, samples, img_side=128, augment_factor=1):
-        self.samples = samples; self.augment_factor = augment_factor
-        self.aug_transform = T.Compose([
-            T.Resize(img_side),
-            T.RandomChoice([
-                T.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
-                T.RandomResizedCrop(img_side, scale=(0.8,1.0), ratio=(1.0,1.0)),
-                T.RandomPerspective(distortion_scale=0.15, p=1),
-                T.RandomChoice([
-                    T.RandomRotation(10, interpolation=Image.BICUBIC,
-                                     expand=False, center=(0.5*img_side, 0.0)),
-                    T.RandomRotation(10, interpolation=Image.BICUBIC,
-                                     expand=False, center=(0.0, 0.5*img_side)),
-                ]),
-            ]),
-            T.ToTensor(), NormSingleROI(outchannels=1),
-        ])
-    def __len__(self): return len(self.samples) * self.augment_factor
-    def __getitem__(self, index):
-        real_idx = index % len(self.samples)
-        path, label = self.samples[real_idx]
-        return self.aug_transform(Image.open(path).convert("L")), label
-
-
 # ══════════════════════════════════════════════════════════════
-#  TRAINING
+#  TRAINING  (CCNet: paired images, CE + SupCon — unchanged)
 # ══════════════════════════════════════════════════════════════
 
-def run_one_epoch(model, loader, criterion, optimizer, device, phase):
+def run_one_epoch(model, loader, criterion, con_criterion,
+                  optimizer, device, phase, ce_weight=0.8, con_weight=0.2):
     is_train = (phase == "training")
     model.train() if is_train else model.eval()
     running_loss = 0.0; running_correct = 0; total = 0
     ctx = torch.enable_grad() if is_train else torch.no_grad()
     with ctx:
-        for data, target in loader:
-            data, target = data.to(device), target.to(device)
+        for datas, target in loader:
+            data1 = datas[0].to(device); data2 = datas[1].to(device)
+            target = target.to(device)
             if is_train: optimizer.zero_grad()
-            output = model(data, target if is_train else None)
-            loss   = criterion(output, target)
+            output,  fe1 = model(data1, target if is_train else None)
+            output2, fe2 = model(data2, target if is_train else None)
+            fe      = torch.cat([fe1.unsqueeze(1), fe2.unsqueeze(1)], dim=1)
+            ce_loss  = criterion(output, target)
+            con_loss = con_criterion(fe, target)
+            loss     = ce_weight * ce_loss + con_weight * con_loss
             if is_train: loss.backward(); optimizer.step()
-            running_loss    += loss.item() * data.size(0)
+            running_loss    += loss.item() * data1.size(0)
             running_correct += output.data.max(1)[1].eq(target).sum().item()
-            total           += data.size(0)
+            total           += data1.size(0)
     return running_loss / max(total, 1), 100.0 * running_correct / max(total, 1)
 
 
@@ -641,20 +774,36 @@ def extract_features(model, loader, device):
     return np.concatenate(feats), np.concatenate(labels)
 
 
-def compute_eer(scores_array):
+def _single_eer(genuine, impostor):
+    """EER from two score arrays (dot-product similarity, higher=more similar)."""
+    if genuine.mean() < impostor.mean():
+        genuine = -genuine; impostor = -impostor
+    y   = np.concatenate([np.ones(len(genuine)), np.zeros(len(impostor))])
+    s   = np.concatenate([genuine, impostor])
+    fpr, tpr, _ = roc_curve(y, s, pos_label=1)
+    return brentq(lambda x: 1.0 - x - interp1d(fpr, tpr)(x), 0.0, 1.0)
+
+
+def compute_eer(scores_array, n_trials=10, seed=42):
+    """
+    Returns (eer_all, eer_bal):
+      eer_all : EER with ALL impostor pairs (unbalanced reference)
+      eer_bal : mean EER over n_trials of 1:1 balanced genuine/impostor sampling
+    """
+    rng  = np.random.RandomState(seed)
     ins  = scores_array[scores_array[:, 1] ==  1, 0]
     outs = scores_array[scores_array[:, 1] == -1, 0]
-    if len(ins) == 0 or len(outs) == 0: return 1.0, 0.0
-    y   = np.concatenate([np.ones(len(ins)), np.zeros(len(outs))])
-    s   = np.concatenate([ins, outs])
-    fpr, tpr, thresholds = roc_curve(y, s, pos_label=1)
-    eer    = brentq(lambda x: 1.0 - x - interp1d(fpr, tpr)(x), 0.0, 1.0)
-    thresh = float(interp1d(fpr, thresholds)(eer))
-    return eer, thresh
+    if len(ins) == 0 or len(outs) == 0: return 1.0, 1.0
+    eer_all = _single_eer(ins.copy(), outs.copy())
+    n_imp   = min(len(ins), len(outs))
+    eers    = [_single_eer(ins.copy(), rng.choice(outs, size=n_imp, replace=False))
+               for _ in range(n_trials)]
+    return eer_all, float(np.mean(eers))
 
 
 def evaluate(model, probe_loader, gallery_loader, device,
              out_dir=".", tag="eval"):
+    """Returns (eer_all, eer_bal, rank1)."""
     probe_feats,   probe_labels   = extract_features(model, probe_loader,   device)
     gallery_feats, gallery_labels = extract_features(model, gallery_loader, device)
     n_probe    = len(probe_feats)
@@ -666,8 +815,8 @@ def evaluate(model, probe_loader, gallery_loader, device,
             scores_list.append(float(sim_matrix[i, j]))
             labels_list.append(1 if probe_labels[i] == gallery_labels[j] else -1)
 
-    scores_arr = np.column_stack([scores_list, labels_list])
-    eer, _     = compute_eer(scores_arr)
+    scores_arr       = np.column_stack([scores_list, labels_list])
+    eer_all, eer_bal = compute_eer(scores_arr)
 
     nn_idx  = np.argmax(sim_matrix, axis=1)
     correct = sum(probe_labels[i] == gallery_labels[nn_idx[i]] for i in range(n_probe))
@@ -677,8 +826,9 @@ def evaluate(model, probe_loader, gallery_loader, device,
     with open(os.path.join(out_dir, f"scores_{tag}.txt"), "w") as f:
         for s, l in zip(scores_list, labels_list): f.write(f"{s} {l}\n")
 
-    print(f"  [{tag}]  EER={eer*100:.4f}%  Rank-1={rank1:.2f}%")
-    return eer, rank1
+    print(f"  [{tag}]  EER_all={eer_all*100:.4f}%  "
+          f"EER_bal={eer_bal*100:.4f}%  Rank-1={rank1:.2f}%")
+    return eer_all, eer_bal, rank1
 
 
 # ══════════════════════════════════════════════════════════════
@@ -688,13 +838,8 @@ def evaluate(model, probe_loader, gallery_loader, device,
 def run_experiment(train_data, test_data, cfg,
                    combined_gallery=None, combined_probe=None,
                    train_remaining=None, device=None):
-    """
-    Train CompNet on `train_data` and evaluate on `test_data`.
-    Returns (final_eer, final_rank1).
-
-    If test_data == "combined", combined_gallery/probe must be provided.
-    train_remaining is used to exclude held-out eval IDs from training.
-    """
+    """Train CCNet on train_data, evaluate on test_data.
+    Returns (final_eer_bal, final_rank1)."""
     seed            = cfg["random_seed"]
     results_dir     = cfg["results_dir"]
     img_side        = cfg["img_side"]
@@ -703,10 +848,13 @@ def run_experiment(train_data, test_data, cfg,
     lr              = cfg["lr"]
     lr_step         = cfg["lr_step"]
     lr_gamma        = cfg["lr_gamma"]
+    comp_weight     = cfg["comp_weight"]
     dropout         = cfg["dropout"]
     arcface_s       = cfg["arcface_s"]
     arcface_m       = cfg["arcface_m"]
-    embedding_dim   = cfg["embedding_dim"]
+    ce_weight       = cfg["ce_weight"]
+    con_weight      = cfg["con_weight"]
+    temperature     = cfg["temperature"]
     augment_factor  = cfg["augment_factor"]
     test_gal_ratio  = cfg["test_gallery_ratio"]
     train_sub_ratio = cfg["train_subject_ratio"]
@@ -719,15 +867,14 @@ def run_experiment(train_data, test_data, cfg,
     rst_eval = os.path.join(results_dir, "eval")
     os.makedirs(rst_eval, exist_ok=True)
 
-    same_dataset = (not use_combined and _ds_key(train_data) == _ds_key(test_data))
+    same_dataset  = (not use_combined and _ds_key(train_data) == _ds_key(test_data))
     eval_tag_base = "combined" if use_combined else test_data.replace("-","")
 
-    # ── select training IDs ───────────────────────────────────────────────
+    # ── data ─────────────────────────────────────────────────────────────
     if use_combined:
-        # use the non-held-out portion from the combined eval builder
-        train_id2paths = train_remaining[_ds_key(train_data)]
-        n_train_ids    = len(train_id2paths)
-        n_train_imgs   = sum(len(v) for v in train_id2paths.values())
+        train_id2paths  = train_remaining[_ds_key(train_data)]
+        n_train_ids     = len(train_id2paths)
+        n_train_imgs    = sum(len(v) for v in train_id2paths.values())
         print(f"  Train  : {n_train_ids} subjects | {n_train_imgs} imgs")
         train_label_map = {k: i for i, k in enumerate(sorted(train_id2paths))}
         train_samples   = [(p, train_label_map[ident])
@@ -743,9 +890,9 @@ def run_experiment(train_data, test_data, cfg,
         (train_samples, gallery_samples, probe_samples,
          train_label_map, _) = split_same_dataset(
             all_id2paths, train_sub_ratio, test_gal_ratio, seed)
-        num_classes   = len(train_label_map)
-        n_train_ids   = num_classes
-        n_train_imgs  = len(train_samples)
+        num_classes  = len(train_label_map)
+        n_train_ids  = num_classes
+        n_train_imgs = len(train_samples)
 
     else:
         print(f"  Parsing {train_data} (train) …")
@@ -762,9 +909,8 @@ def run_experiment(train_data, test_data, cfg,
         gallery_samples, probe_samples, _ = split_cross_dataset_test(
             test_id2paths, test_gal_ratio, seed)
 
-    # ── data loaders ──────────────────────────────────────────────────────
     train_loader = DataLoader(
-        AugmentedDataset(train_samples, img_side, augment_factor),
+        PairedDataset(train_samples, img_side, augment_factor),
         batch_size=batch_size, shuffle=True, num_workers=nw, pin_memory=True)
     gallery_loader = DataLoader(
         SingleDataset(gallery_samples, img_side),
@@ -776,25 +922,26 @@ def run_experiment(train_data, test_data, cfg,
     print(f"  Gallery={len(gallery_samples)}  Probe={len(probe_samples)}  Classes={num_classes}")
 
     # ── model ─────────────────────────────────────────────────────────────
-    net = CompNet(num_classes, embedding_dim=embedding_dim,
-                  arcface_s=arcface_s, arcface_m=arcface_m, dropout=dropout)
+    net = ccnet(num_classes=num_classes, weight=comp_weight,
+                dropout=dropout, arcface_s=arcface_s, arcface_m=arcface_m)
     net.to(device)
     if torch.cuda.device_count() > 1:
         net = DataParallel(net)
 
-    # Always load fixed init weights (ensures identical starting point)
     net = get_or_create_init_weights(net, cfg, num_classes, device)
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(net.parameters(), lr=lr)
-    scheduler = lr_scheduler.StepLR(optimizer, lr_step, lr_gamma)
+    criterion     = nn.CrossEntropyLoss()
+    con_criterion = SupConLoss(temperature=temperature, base_temperature=temperature)
+    optimizer     = optim.Adam(net.parameters(), lr=lr)
+    scheduler     = lr_scheduler.StepLR(optimizer, lr_step, lr_gamma)
 
     # ── pre-training evaluation ───────────────────────────────────────────
     _net = net.module if isinstance(net, DataParallel) else net
-    pre_eer, pre_r1 = evaluate(_net, probe_loader, gallery_loader,
-                                device, out_dir=rst_eval,
-                                tag=f"ep-001_pretrain_{eval_tag_base}")
-    best_eer = pre_eer; last_eer = pre_eer; last_rank1 = pre_r1
+    pre_eer_all, pre_eer_bal, pre_r1 = evaluate(
+        _net, probe_loader, gallery_loader,
+        device, out_dir=rst_eval, tag=f"ep-001_pretrain_{eval_tag_base}")
+    best_eer     = pre_eer_bal   # model selection uses balanced EER
+    last_eer_all = pre_eer_all; last_eer_bal = pre_eer_bal; last_rank1 = pre_r1
     torch.save(_net.state_dict(),
                os.path.join(results_dir, "net_params_best_eer.pth"))
 
@@ -803,44 +950,51 @@ def run_experiment(train_data, test_data, cfg,
     # ── training loop ─────────────────────────────────────────────────────
     for epoch in range(num_epochs):
         t_loss, t_acc = run_one_epoch(
-            net, train_loader, criterion, optimizer, device, "training")
+            net, train_loader, criterion, con_criterion,
+            optimizer, device, "training",
+            ce_weight=ce_weight, con_weight=con_weight)
         scheduler.step()
         train_losses.append(t_loss); train_accs.append(t_acc)
         _net = net.module if isinstance(net, DataParallel) else net
 
         if (epoch % eval_every == 0 and epoch > 0) or epoch == num_epochs - 1:
             tag = f"ep{epoch:04d}_{eval_tag_base}"
-            cur_eer, cur_rank1 = evaluate(_net, probe_loader, gallery_loader,
-                                           device, out_dir=rst_eval, tag=tag)
-            last_eer, last_rank1 = cur_eer, cur_rank1
-            if cur_eer < best_eer:
-                best_eer = cur_eer
+            cur_eer_all, cur_eer_bal, cur_rank1 = evaluate(
+                _net, probe_loader, gallery_loader,
+                device, out_dir=rst_eval, tag=tag)
+            last_eer_all = cur_eer_all; last_eer_bal = cur_eer_bal
+            last_rank1   = cur_rank1
+            if cur_eer_bal < best_eer:
+                best_eer = cur_eer_bal
                 torch.save(_net.state_dict(),
                            os.path.join(results_dir, "net_params_best_eer.pth"))
-                print(f"  *** New best EER: {best_eer*100:.4f}% ***")
+                print(f"  *** New best EER_bal: {best_eer*100:.4f}% ***")
 
         if epoch % 10 == 0 or epoch == num_epochs - 1:
-            ts        = time.strftime("%H:%M:%S")
-            eer_str   = f"{last_eer*100:.4f}%"  if not math.isnan(last_eer)   else "N/A"
-            rank1_str = f"{last_rank1:.2f}%"     if not math.isnan(last_rank1) else "N/A"
-            print(f"  [{ts}] ep {epoch:04d} | loss={t_loss:.4f} | "
-                  f"EER={eer_str}  Rank-1={rank1_str}")
+            ts = time.strftime("%H:%M:%S")
+            if math.isnan(last_eer_all):
+                eer_str = "N/A"
+            else:
+                eer_str = (f"EER_all={last_eer_all*100:.4f}% | "
+                           f"EER_bal={last_eer_bal*100:.4f}%")
+            rank1_str = f"{last_rank1:.2f}%" if not math.isnan(last_rank1) else "N/A"
+            print(f"  [{ts}] ep {epoch:04d} | loss={t_loss:.4f} | acc={t_acc:.2f}% | "
+                  f"{eer_str} | Rank-1={rank1_str}")
 
         if epoch % save_every == 0 or epoch == num_epochs - 1:
             torch.save(_net.state_dict(),
                        os.path.join(results_dir, "net_params.pth"))
 
-    # ── final evaluation (best checkpoint) ────────────────────────────────
+    # ── final evaluation ──────────────────────────────────────────────────
     best_path = os.path.join(results_dir, "net_params_best_eer.pth")
     if not os.path.exists(best_path):
         best_path = os.path.join(results_dir, "net_params.pth")
     eval_net = net.module if isinstance(net, DataParallel) else net
     eval_net.load_state_dict(torch.load(best_path, map_location=device))
-    final_eer, final_rank1 = evaluate(
+    final_eer_all, final_eer_bal, final_rank1 = evaluate(
         eval_net, probe_loader, gallery_loader,
         device, out_dir=rst_eval, tag=f"FINAL_{eval_tag_base}")
 
-    # ── save train curves ─────────────────────────────────────────────────
     try:
         fig, axes = plt.subplots(1, 2, figsize=(10, 4))
         axes[0].plot(train_losses,'b'); axes[0].set_title("Train Loss")
@@ -853,7 +1007,7 @@ def run_experiment(train_data, test_data, cfg,
     except Exception:
         pass
 
-    return final_eer, final_rank1
+    return final_eer_bal, final_rank1
 
 
 # ══════════════════════════════════════════════════════════════
@@ -861,30 +1015,22 @@ def run_experiment(train_data, test_data, cfg,
 # ══════════════════════════════════════════════════════════════
 
 def print_and_save_table(results, train_datasets, test_datasets, out_path):
-    """
-    results[(train, test)] = (eer_pct, rank1_pct)
-    Prints two tables (EER and Rank-1) and saves to out_path.
-    """
     col_w    = 14
     td_label = [t.replace("-","") for t in test_datasets]
     header   = f"{'Train\\Test':<14}" + "".join(f"{t:>{col_w}}" for t in td_label)
     sep      = "─" * len(header)
-
-    lines = []
-    for metric, idx, label in [("EER (%)", 0, "EER"), ("Rank-1 (%)", 1, "Rank-1")]:
+    lines    = []
+    for metric, idx, label in [("EER_bal (%)", 0, "EER_bal"), ("Rank-1 (%)", 1, "Rank-1")]:
         lines.append(f"\n{label} Results")
-        lines.append(sep)
-        lines.append(header)
-        lines.append(sep)
+        lines.append(sep); lines.append(header); lines.append(sep)
         for tr in train_datasets:
             row = f"{tr.replace('-',''):<14}"
             for te in test_datasets:
-                val = results.get((tr, te))
+                val  = results.get((tr, te))
                 cell = f"{val[idx]:.2f}" if val is not None else "—"
                 row += f"{cell:>{col_w}}"
             lines.append(row)
         lines.append(sep)
-
     text = "\n".join(lines)
     print(text)
     with open(out_path, "w") as f:
@@ -901,69 +1047,69 @@ def main():
     random.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    base_results_dir = BASE_CONFIG.get("base_results_dir", "./rst_compnet_all")
+    device           = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    base_results_dir = BASE_CONFIG.get("base_results_dir", "./rst_ccnet_all")
     os.makedirs(base_results_dir, exist_ok=True)
 
     print(f"\n{'='*60}")
-    print(f"  CompNet — Full Cross-Dataset Experiment")
-    print(f"  Device      : {device}")
-    print(f"  Train sets  : {TRAIN_DATASETS}")
-    print(f"  Test  sets  : {TEST_DATASETS}")
-    print(f"  Epochs      : {BASE_CONFIG['num_epochs']}")
-    print(f"  Results dir : {base_results_dir}")
+    print(f"  CCNet — Full Cross-Dataset Experiment")
+    print(f"  Device       : {device}")
+    print(f"  Train sets   : {TRAIN_DATASETS}")
+    print(f"  Test  sets   : {TEST_DATASETS}")
+    print(f"  Epochs       : {BASE_CONFIG['num_epochs']}")
+    print(f"  comp_weight  : {BASE_CONFIG['comp_weight']}  "
+          f"(channel vs spatial competition)")
+    print(f"  Loss         : {BASE_CONFIG['ce_weight']}×CE + "
+          f"{BASE_CONFIG['con_weight']}×SupCon(τ={BASE_CONFIG['temperature']})")
+    print(f"  EER_bal = balanced 1:1 impostor sampling (model selection)")
+    print(f"  EER_all = all impostor pairs (reference)")
+    print(f"  Results dir  : {base_results_dir}")
     print(f"{'='*60}\n")
 
-    # ── Build combined eval set ONCE before any training ──────────────────
+    # ── Build combined eval set ONCE ──────────────────────────────────────
     print("Step 1: Ensuring combined evaluation set exists …")
     combined_gallery, combined_probe, train_remaining = \
         build_combined_eval_set(BASE_CONFIG, seed=seed)
     print()
 
-    # ── Loop over all combinations ────────────────────────────────────────
+    # ── Loop over all train × test combinations ───────────────────────────
     n_total  = len(TRAIN_DATASETS) * len(TEST_DATASETS)
     n_done   = 0
-    results  = {}   # (train, test) → (eer_pct, rank1_pct)
+    results  = {}   # (train, test) → (eer_bal_pct, rank1_pct)
     failures = []
 
     for train_data in TRAIN_DATASETS:
         for test_data in TEST_DATASETS:
-
-            # Skip same-train same-test when it uses combined
-            # (combined already excludes held-out IDs from each dataset)
             n_done += 1
             exp_label = f"train={train_data}  test={test_data}"
             print(f"\n{'='*60}")
             print(f"  Experiment {n_done}/{n_total}:  {exp_label}")
             print(f"{'='*60}")
 
-            # ── build per-experiment config ────────────────────────────────
             cfg = copy.deepcopy(BASE_CONFIG)
             cfg["train_data"] = train_data
             cfg["test_data"]  = test_data
+            cfg["combined_evaluation_set"] = (test_data.lower() == "combined")
 
-            use_combined = (test_data.lower() == "combined")
-            cfg["combined_evaluation_set"] = use_combined
-
-            # Dedicated results folder per experiment
             safe_train = train_data.replace("-","").replace(" ","")
             safe_test  = test_data.replace("-","").replace(" ","")
             cfg["results_dir"] = os.path.join(
                 base_results_dir, f"train_{safe_train}_test_{safe_test}")
 
+            use_combined = cfg["combined_evaluation_set"]
             t_start = time.time()
             try:
-                eer, rank1 = run_experiment(
+                eer_bal, rank1 = run_experiment(
                     train_data, test_data, cfg,
                     combined_gallery=combined_gallery if use_combined else None,
-                    combined_probe=combined_probe   if use_combined else None,
-                    train_remaining=train_remaining  if use_combined else None,
+                    combined_probe=combined_probe     if use_combined else None,
+                    train_remaining=train_remaining    if use_combined else None,
                     device=device)
 
-                results[(train_data, test_data)] = (eer * 100, rank1)
+                results[(train_data, test_data)] = (eer_bal * 100, rank1)
                 elapsed = time.time() - t_start
                 print(f"\n  ✓  {exp_label}")
-                print(f"     EER={eer*100:.4f}%  Rank-1={rank1:.2f}%  "
+                print(f"     EER_bal={eer_bal*100:.4f}%  Rank-1={rank1:.2f}%  "
                       f"Time={elapsed/60:.1f} min")
 
             except Exception as e:
@@ -983,13 +1129,11 @@ def main():
         for tr, te, err in failures:
             print(f"  train={tr}  test={te}  → {err}")
 
-    # Also save raw numbers as JSON for later analysis
     json_results = {f"{tr}→{te}": list(v) if v else None
                     for (tr, te), v in results.items()}
     with open(os.path.join(base_results_dir, "results_raw.json"), "w") as f:
         json.dump(json_results, f, indent=2)
-    print(f"\nRaw results saved to: "
-          f"{os.path.join(base_results_dir, 'results_raw.json')}")
+    print(f"\nRaw results: {os.path.join(base_results_dir, 'results_raw.json')}")
 
 
 if __name__ == "__main__":
