@@ -805,7 +805,7 @@ def evaluate(model, probe_loader, gallery_loader, device,
     _save_roc_det(scores_arr, out_dir, tag)
 
     print(f"  [{tag}]  EER={eer*100:.4f}% (±{eer_std*100:.4f}%)  Rank-1={rank1:.2f}%")
-    return eer, rank1
+    return eer, rank1, eer_std
 
 
 def _save_roc_det(scores_arr, out_dir, tag):
