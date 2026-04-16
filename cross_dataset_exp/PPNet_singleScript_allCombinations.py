@@ -37,7 +37,7 @@ Results are saved to:
 #  EXPERIMENT GRID
 # ==============================================================
 TRAIN_DATASETS = ["Palm-Auth", "CASIA-MS", "MPDv2", "XJTU"]
-TEST_DATASETS  = ["Palm-Auth", "CASIA-MS", "MPDv2", "XJTU", "Combined"]
+TEST_DATASETS  = ["Palm-Auth", "CASIA-MS", "MPDv2", "XJTU"]
 
 # ==============================================================
 #  BASE CONFIG
@@ -55,11 +55,6 @@ BASE_CONFIG = {
 
     # ── Palm-Auth toggle ───────────────────────────────────────
     "use_scanner"          : True,
-
-    # ── Combined evaluation set ────────────────────────────────
-    "combined_evaluation_set"  : False,
-    "combined_gallery_ratio"   : 0.50,
-    "combined_eval_cache_path" : "./combined_eval_cache.json",
 
     # ── Model (official PPNet values) ──────────────────────────
     "img_side"             : 128,   # → FC1 input = 43264
@@ -413,73 +408,6 @@ def get_parser(dataset_name, cfg):
 def _ds_key(name):
     return name.strip().lower().replace("-","").replace("_","")
 
-
-# ══════════════════════════════════════════════════════════════
-#  COMBINED EVALUATION SET  (shared JSON cache)
-# ══════════════════════════════════════════════════════════════
-
-def build_combined_eval_set(cfg, seed=42):
-    cache_path = cfg.get("combined_eval_cache_path", "./combined_eval_cache.json")
-    if os.path.exists(cache_path):
-        print(f"  Loading cached combined eval set from:\n    {cache_path}")
-        with open(cache_path, "r") as f:
-            data = json.load(f)
-        gallery_samples = [(row[0], int(row[1])) for row in data["gallery"]]
-        probe_samples   = [(row[0], int(row[1])) for row in data["probe"]]
-        train_remaining = {k: {ident: paths for ident, paths in v.items()}
-                           for k, v in data["train_remaining"].items()}
-        print(f"  [combined eval] eval IDs={data['n_eval_ids']}  "
-              f"gallery={len(gallery_samples)}  probe={len(probe_samples)}\n")
-        return gallery_samples, probe_samples, train_remaining
-
-    print("  Building combined evaluation set for the first time …")
-    use_scanner   = cfg.get("use_scanner", False)
-    gallery_ratio = cfg.get("combined_gallery_ratio", 0.50)
-    parsed = {
-        "casiams":  parse_casia_ms(cfg["casiams_data_root"], seed=seed),
-        "palmauth": parse_palm_auth_data(cfg["palm_auth_data_root"],
-                                         use_scanner=use_scanner),
-        "mpdv2":    parse_mpd_data(cfg["mpd_data_root"], seed=seed),
-        "xjtu":     parse_xjtu_data(cfg["xjtu_data_root"], seed=seed),
-    }
-    gallery_samples = []; probe_samples = []; train_remaining = {}; label_offset = 0
-    for ds_key, id2paths in parsed.items():
-        all_ids  = sorted(id2paths.keys())
-        n_held   = max(1, int(len(all_ids) * 0.20))
-        rng_hold  = random.Random(seed + abs(hash(ds_key))           % 100000)
-        rng_split = random.Random(seed + abs(hash(ds_key + "_split")) % 100000)
-        shuffled  = list(all_ids); rng_hold.shuffle(shuffled)
-        held_ids  = set(shuffled[:n_held])
-        train_remaining[ds_key] = {k: v for k, v in id2paths.items()
-                                   if k not in held_ids}
-        n_gal_ds = 0; n_prob_ds = 0
-        for local_idx, ident in enumerate(sorted(held_ids)):
-            global_label = label_offset + local_idx
-            paths = list(id2paths[ident]); rng_split.shuffle(paths)
-            n_gal = max(1, int(len(paths) * gallery_ratio))
-            for p in paths[:n_gal]:
-                gallery_samples.append((p, global_label)); n_gal_ds += 1
-            for p in paths[n_gal:]:
-                probe_samples.append((p, global_label));   n_prob_ds += 1
-        print(f"  [{ds_key}] total={len(all_ids)} IDs  held-out={n_held}  "
-              f"train={len(train_remaining[ds_key])}  "
-              f"gallery={n_gal_ds}  probe={n_prob_ds}")
-        label_offset += n_held
-    print(f"  [combined eval] total eval IDs={label_offset}  "
-          f"gallery={len(gallery_samples)}  probe={len(probe_samples)}")
-    cache_dir = os.path.dirname(os.path.abspath(cache_path))
-    os.makedirs(cache_dir, exist_ok=True)
-    with open(cache_path, "w") as f:
-        json.dump({
-            "gallery":         [[p, l] for p, l in gallery_samples],
-            "probe":           [[p, l] for p, l in probe_samples],
-            "train_remaining": {k: {ident: paths for ident, paths in v.items()}
-                                for k, v in train_remaining.items()},
-            "n_eval_ids": label_offset, "seed": seed,
-            "use_scanner": use_scanner, "gallery_ratio": gallery_ratio,
-        }, f, indent=2)
-    print(f"  Eval set cached to:\n    {cache_path}\n")
-    return gallery_samples, probe_samples, train_remaining
 
 
 # ══════════════════════════════════════════════════════════════
