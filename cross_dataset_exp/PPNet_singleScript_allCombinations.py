@@ -5,7 +5,7 @@ Runs ALL combinations of train × test datasets and prints a
 summary table of EER and Rank-1 at the end.
 
 Train datasets : CASIA-MS | Palm-Auth | MPDv2 | XJTU
-Test  datasets : CASIA-MS | Palm-Auth | MPDv2 | XJTU | Combined
+Test  datasets : CASIA-MS | Palm-Auth | MPDv2 | XJTU
 
 Model architecture and training: unchanged from official PPNet.
   - 5 conv layers + BN + 2 FC layers (43264 → 512 → 512) + PairwiseDistance
@@ -15,7 +15,6 @@ Model architecture and training: unchanged from official PPNet.
 
 Evaluation framework: follows CCNet cross-dataset structure.
   - Same four dataset parsers with two-group sampling
-  - Combined evaluation set cache (JSON, shared across all runs)
   - Fixed init weights cache (per model class + num_classes)
   - EER_all (all impostor pairs) + EER_bal (balanced 1:1, 10 trials)
   - Model selection uses EER_bal
@@ -76,6 +75,7 @@ BASE_CONFIG = {
 
     # ── Misc ───────────────────────────────────────────────────
     "base_results_dir"     : "./rst_ppnet_all",
+    "init_weights_dir"     : "./rst_ppnet_all",
     "random_seed"          : 42,
     "save_every"           : 50,
     "eval_every"           : 50,
@@ -409,16 +409,15 @@ def _ds_key(name):
     return name.strip().lower().replace("-","").replace("_","")
 
 
-
 # ══════════════════════════════════════════════════════════════
 #  FIXED MODEL INITIALISATION
 # ══════════════════════════════════════════════════════════════
 
 def get_or_create_init_weights(net, cfg, num_classes, device):
-    cache_path   = cfg.get("combined_eval_cache_path", "./combined_eval_cache.json")
-    cache_dir    = os.path.dirname(os.path.abspath(cache_path))
+    weights_dir  = cfg.get("init_weights_dir", cfg.get("base_results_dir", "."))
+    os.makedirs(weights_dir, exist_ok=True)
     model_name   = type(net.module if isinstance(net, DataParallel) else net).__name__
-    weights_path = os.path.join(cache_dir,
+    weights_path = os.path.join(weights_dir,
                                 f"init_weights_{model_name}_nc{num_classes}.pth")
     _net = net.module if isinstance(net, DataParallel) else net
     if os.path.exists(weights_path):
@@ -607,7 +606,7 @@ def evaluate(model, probe_loader, gallery_loader, device,
     """
     probe_feats,   probe_labels   = extract_features(model, probe_loader,   device)
     gallery_feats, gallery_labels = extract_features(model, gallery_loader, device)
-    n_probe  = len(probe_feats)
+    n_probe   = len(probe_feats)
     n_gallery = len(gallery_feats)
 
     # ── L2 distance matrix ────────────────────────────────────────────────
@@ -644,9 +643,7 @@ def evaluate(model, probe_loader, gallery_loader, device,
 #  SINGLE EXPERIMENT
 # ══════════════════════════════════════════════════════════════
 
-def run_experiment(train_data, test_data, cfg,
-                   combined_gallery=None, combined_probe=None,
-                   train_remaining=None, device=None):
+def run_experiment(train_data, test_data, cfg, device=None):
     """Train PPNet on train_data, evaluate on test_data.
     Returns (final_eer_bal, final_rank1)."""
     seed            = cfg["random_seed"]
@@ -667,7 +664,6 @@ def run_experiment(train_data, test_data, cfg,
     eval_every      = cfg["eval_every"]
     save_every      = cfg["save_every"]
     nw              = cfg["num_workers"]
-    use_combined    = (test_data.lower() == "combined")
 
     assert batch_size % 2 == 0, f"batch_size must be even, got {batch_size}"
 
@@ -675,24 +671,11 @@ def run_experiment(train_data, test_data, cfg,
     rst_eval = os.path.join(results_dir, "eval")
     os.makedirs(rst_eval, exist_ok=True)
 
-    same_dataset  = (not use_combined and _ds_key(train_data) == _ds_key(test_data))
-    eval_tag_base = "combined" if use_combined else test_data.replace("-","")
+    same_dataset  = (_ds_key(train_data) == _ds_key(test_data))
+    eval_tag_base = test_data.replace("-","")
 
     # ── data ─────────────────────────────────────────────────────────────
-    if use_combined:
-        train_id2paths  = train_remaining[_ds_key(train_data)]
-        n_train_ids     = len(train_id2paths)
-        n_train_imgs    = sum(len(v) for v in train_id2paths.values())
-        print(f"  Train  : {n_train_ids} subjects | {n_train_imgs} imgs")
-        train_label_map = {k: i for i, k in enumerate(sorted(train_id2paths))}
-        train_samples   = [(p, train_label_map[ident])
-                           for ident, paths in train_id2paths.items()
-                           for p in paths]
-        num_classes     = len(train_label_map)
-        gallery_samples = combined_gallery
-        probe_samples   = combined_probe
-
-    elif same_dataset:
+    if same_dataset:
         print(f"  Parsing {train_data} (shared train+test) …")
         all_id2paths = get_parser(train_data, cfg)()
         (train_samples, gallery_samples, probe_samples,
@@ -728,6 +711,7 @@ def run_experiment(train_data, test_data, cfg,
         SingleDataset(probe_samples, img_side),
         batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
 
+    print(f"  Train: {n_train_ids} subjects | {n_train_imgs} imgs")
     print(f"  Gallery={len(gallery_samples)}  Probe={len(probe_samples)}  Classes={num_classes}")
 
     # ── model ─────────────────────────────────────────────────────────────
@@ -875,11 +859,6 @@ def main():
     print(f"  Results dir  : {base_results_dir}")
     print(f"{'='*60}\n")
 
-    print("Step 1: Ensuring combined evaluation set exists …")
-    combined_gallery, combined_probe, train_remaining = \
-        build_combined_eval_set(BASE_CONFIG, seed=seed)
-    print()
-
     n_total  = len(TRAIN_DATASETS) * len(TEST_DATASETS)
     n_done   = 0
     results  = {}
@@ -896,22 +875,16 @@ def main():
             cfg = copy.deepcopy(BASE_CONFIG)
             cfg["train_data"] = train_data
             cfg["test_data"]  = test_data
-            cfg["combined_evaluation_set"] = (test_data.lower() == "combined")
 
             safe_train = train_data.replace("-","").replace(" ","")
             safe_test  = test_data.replace("-","").replace(" ","")
             cfg["results_dir"] = os.path.join(
                 base_results_dir, f"train_{safe_train}_test_{safe_test}")
 
-            use_combined = cfg["combined_evaluation_set"]
             t_start = time.time()
             try:
                 eer_bal, rank1 = run_experiment(
-                    train_data, test_data, cfg,
-                    combined_gallery=combined_gallery if use_combined else None,
-                    combined_probe=combined_probe     if use_combined else None,
-                    train_remaining=train_remaining    if use_combined else None,
-                    device=device)
+                    train_data, test_data, cfg, device=device)
 
                 results[(train_data, test_data)] = (eer_bal * 100, rank1)
                 elapsed = time.time() - t_start
