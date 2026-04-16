@@ -77,7 +77,7 @@ BASE_CONFIG = {
     "lr"                   : 0.0001,
     "lr_step"              : 17,    # proportional to official 100/3000 × 500
     "lr_gamma"             : 0.8,
-    "augment_factor"       : 4,
+    "augment_factor"       : 2,
 
     # ── Misc ───────────────────────────────────────────────────
     "base_results_dir"     : "./rst_ppnet_all",
