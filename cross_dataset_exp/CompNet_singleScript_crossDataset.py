@@ -20,6 +20,12 @@ Combined evaluation set  (combined_evaluation_set = True)
   TWO CACHES guarantee identical conditions across all experiments:
     combined_eval_cache_path           (JSON)
     init_weights_{model}_nc{N}.pth    (alongside the JSON)
+
+EER reporting
+-------------
+  EER_all : computed using ALL impostor pairs (unbalanced, reference)
+  EER_bal : mean over 10 trials of 1:1 balanced genuine/impostor pairs (fair)
+  Model selection and best-EER tracking use EER_bal.
 """
 
 # ==============================================================
@@ -111,23 +117,18 @@ torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 
 ALLOWED_SPECTRA = {"green", "ir", "yellow", "pink", "white"}
 
-# ── Two-group sampling — shared group sizes ────────────────────
 N_HIGH = 150
 N_LOW  = 40
 
-# ── Per-dataset sampling targets ──────────────────────────────
 TARGET_HIGH_CASIA = 29
 TARGET_LOW_CASIA  = 15
-
-# Palm-Auth has no fixed cap — uses all available images per ID
 
 TARGET_HIGH_MPD = 33
 TARGET_LOW_MPD  = 16
 
-TARGET_HIGH_XJTU = 29    # 4 variations × ~7 = 28–29
+TARGET_HIGH_XJTU = 29
 TARGET_LOW_XJTU  = 15
 
-# XJTU variation folders: (device, condition)
 XJTU_VARIATIONS = [
     ("iPhone", "Flash"),
     ("iPhone", "Nature"),
@@ -280,10 +281,6 @@ class NormSingleROI:
 # ══════════════════════════════════════════════════════════════
 
 def parse_casia_ms(data_root, seed=42):
-    """
-    150 IDs × TARGET_HIGH_CASIA (29)  +  40 IDs × TARGET_LOW_CASIA (15).
-    Images distributed evenly across spectra per ID.
-    """
     rng     = random.Random(seed)
     id_spec = defaultdict(lambda: defaultdict(list))
     for fname in sorted(os.listdir(data_root)):
@@ -326,7 +323,6 @@ def parse_casia_ms(data_root, seed=42):
 
 
 def parse_palm_auth_data(data_root, use_scanner=False):
-    """All available IDs; roi_perspective + optional roi_scanner (ALLOWED_SPECTRA)."""
     IMG_EXTS = {".jpg",".jpeg",".bmp",".png"}
     id2paths  = defaultdict(list)
     for subject_id in sorted(os.listdir(data_root)):
@@ -361,10 +357,6 @@ def parse_palm_auth_data(data_root, use_scanner=False):
 
 
 def parse_mpd_data(data_root, seed=42):
-    """
-    Top-150 IDs × TARGET_HIGH_MPD (33)  +  next-40 IDs × TARGET_LOW_MPD (16).
-    IDs sorted descending by total sample count; tie-breaking is random.
-    """
     rng    = random.Random(seed)
     id_dev = defaultdict(lambda: defaultdict(list))
     for fname in sorted(os.listdir(data_root)):
@@ -416,22 +408,9 @@ def parse_mpd_data(data_root, seed=42):
 
 
 def parse_xjtu_data(data_root, seed=42):
-    """
-    XJTU-UP: 200 IDs (L_001…L_100, R_001…R_100), 4 variations each.
-    Structure: {data_root}/{device}/{condition}/{hand}_{id}/*.jpg
-
-    Select 190 IDs from 200, then:
-      High group : 150 IDs × TARGET_HIGH_XJTU (29) images
-      Low  group :  40 IDs × TARGET_LOW_XJTU  (15) images
-    Images sampled near-uniformly across 4 variations.
-
-    Identity key: folder name e.g. "L_001", "R_100"
-    """
     rng      = random.Random(seed)
     IMG_EXTS = {".jpg",".jpeg",".bmp",".png"}
-
-    # id_var[identity][(device, condition)] = [path, ...]
-    id_var = defaultdict(lambda: defaultdict(list))
+    id_var   = defaultdict(lambda: defaultdict(list))
 
     for device, condition in XJTU_VARIATIONS:
         var_dir = os.path.join(data_root, device, condition)
@@ -459,7 +438,6 @@ def parse_xjtu_data(data_root, seed=42):
     high_ids = selected[:N_HIGH]; low_ids = selected[N_HIGH:]
 
     def _sample_variations(ident, target):
-        """Sample `target` images near-uniformly across 4 variations."""
         var_keys = list(XJTU_VARIATIONS); rng.shuffle(var_keys)
         n_var    = len(var_keys)
         base_v   = target // n_var; rem_v = target % n_var
@@ -514,13 +492,6 @@ def _ds_key(name):
 # ══════════════════════════════════════════════════════════════
 
 def build_combined_eval_set(cfg, seed=42):
-    """
-    Build or reload the combined evaluation set from ALL FOUR datasets.
-
-    FIRST RUN  → parses all four datasets, holds out 20% of each
-                 dataset's selected IDs, writes JSON cache.
-    LATER RUNS → loads JSON cache; no parsing, no RNG consumed.
-    """
     cache_path = cfg.get("combined_eval_cache_path", "./combined_eval_cache.json")
 
     if os.path.exists(cache_path):
@@ -553,16 +524,12 @@ def build_combined_eval_set(cfg, seed=42):
     for ds_key, id2paths in parsed.items():
         all_ids = sorted(id2paths.keys())
         n_held  = max(1, int(len(all_ids) * 0.20))
-
         rng_hold  = random.Random(seed + abs(hash(ds_key))           % 100000)
         rng_split = random.Random(seed + abs(hash(ds_key + "_split")) % 100000)
-
         shuffled = list(all_ids); rng_hold.shuffle(shuffled)
         held_ids = set(shuffled[:n_held])
-
         train_remaining[ds_key] = {k: v for k, v in id2paths.items()
                                    if k not in held_ids}
-
         n_gal_ds = 0; n_prob_ds = 0
         for local_idx, ident in enumerate(sorted(held_ids)):
             global_label = label_offset + local_idx
@@ -572,7 +539,6 @@ def build_combined_eval_set(cfg, seed=42):
                 gallery_samples.append((p, global_label)); n_gal_ds += 1
             for p in paths[n_gal:]:
                 probe_samples.append((p, global_label));   n_prob_ds += 1
-
         print(f"  [{ds_key}] total={len(all_ids)} IDs  held-out={n_held}  "
               f"train={len(train_remaining[ds_key])}  "
               f"gallery={n_gal_ds}  probe={n_prob_ds}")
@@ -599,22 +565,16 @@ def build_combined_eval_set(cfg, seed=42):
 
 
 # ══════════════════════════════════════════════════════════════
-#  FIXED MODEL INITIALISATION  (.pth cache)
+#  FIXED MODEL INITIALISATION
 # ══════════════════════════════════════════════════════════════
 
 def get_or_create_init_weights(net, cfg, num_classes, device):
-    """
-    Save init weights on first run, load on every subsequent run.
-    Filename includes model class name to avoid cross-model conflicts:
-        init_weights_{ModelName}_nc{num_classes}.pth
-    """
     cache_path   = cfg.get("combined_eval_cache_path", "./combined_eval_cache.json")
     cache_dir    = os.path.dirname(os.path.abspath(cache_path))
     model_name   = type(net.module if isinstance(net, DataParallel) else net).__name__
     weights_path = os.path.join(cache_dir,
                                 f"init_weights_{model_name}_nc{num_classes}.pth")
     _net = net.module if isinstance(net, DataParallel) else net
-
     if os.path.exists(weights_path):
         print(f"  Loading cached init weights from:\n    {weights_path}")
         _net.load_state_dict(torch.load(weights_path, map_location=device))
@@ -625,7 +585,7 @@ def get_or_create_init_weights(net, cfg, num_classes, device):
 
 
 # ══════════════════════════════════════════════════════════════
-#  SPLITS  (standard mode)
+#  SPLITS
 # ══════════════════════════════════════════════════════════════
 
 def split_same_dataset(id2paths, train_subject_ratio=0.80,
@@ -664,14 +624,11 @@ def split_cross_dataset_test(id2paths, gallery_ratio=0.50, seed=42):
 # ══════════════════════════════════════════════════════════════
 
 class SingleDataset(Dataset):
-    """Deterministic — no augmentation, no shuffling."""
     def __init__(self, samples, img_side=128):
         self.samples   = samples
         self.transform = T.Compose([
             T.Resize(img_side), T.ToTensor(), NormSingleROI(outchannels=1)])
-
     def __len__(self): return len(self.samples)
-
     def __getitem__(self, idx):
         path, label = self.samples[idx]
         return self.transform(Image.open(path).convert("L")), label
@@ -696,9 +653,7 @@ class AugmentedDataset(Dataset):
             ]),
             T.ToTensor(), NormSingleROI(outchannels=1),
         ])
-
     def __len__(self): return len(self.samples) * self.augment_factor
-
     def __getitem__(self, index):
         real_idx    = index % len(self.samples)
         path, label = self.samples[real_idx]
@@ -740,45 +695,50 @@ def extract_features(model, loader, device):
     return np.concatenate(feats), np.concatenate(labels)
 
 
-def compute_eer(scores_array, n_impostors_per_genuine=1, n_trials=10, seed=42):
-    """
-    Balanced EER: subsample impostors to match genuine count (1:1 ratio).
-    Repeat n_trials times and return the mean EER ± std.
+def _single_eer(genuine, impostor):
+    """Compute EER from two score arrays. Flips direction if needed."""
+    if genuine.mean() < impostor.mean():
+        genuine = -genuine; impostor = -impostor
+    y   = np.concatenate([np.ones(len(genuine)), np.zeros(len(impostor))])
+    s   = np.concatenate([genuine, impostor])
+    fpr, tpr, _ = roc_curve(y, s, pos_label=1)
+    return brentq(lambda x: 1.0 - x - interp1d(fpr, tpr)(x), 0.0, 1.0)
 
-    scores_array[:,0] = dot-product similarity  (higher → more similar)
-    scores_array[:,1] = +1 genuine | -1 impostor
+
+def compute_eer(scores_array, n_trials=10, seed=42):
+    """
+    Returns two EER values:
+      eer_all : EER computed using ALL impostor pairs (unbalanced)
+      eer_bal : mean EER over n_trials of 1:1 balanced genuine/impostor sampling
     """
     rng  = np.random.RandomState(seed)
     ins  = scores_array[scores_array[:, 1] ==  1, 0]
     outs = scores_array[scores_array[:, 1] == -1, 0]
-    if len(ins) == 0 or len(outs) == 0: return 1.0, 0.0, 0.0
+    if len(ins) == 0 or len(outs) == 0:
+        return 1.0, 1.0
 
-    n_gen = len(ins)
-    n_imp = min(len(outs), n_gen * n_impostors_per_genuine)
+    # ── EER with ALL impostor pairs ───────────────────────────
+    eer_all = _single_eer(ins.copy(), outs.copy())
 
-    eers = []
+    # ── EER with balanced 1:1 sampled impostor pairs ──────────
+    n_imp = min(len(ins), len(outs))   # 1:1 ratio
+    eers  = []
     for _ in range(n_trials):
         imp_sample = rng.choice(outs, size=n_imp, replace=False)
-        # mirror official getEER.py: flip if genuine mean < impostor mean
-        if ins.mean() < imp_sample.mean():
-            ins_use = -ins; imp_use = -imp_sample
-        else:
-            ins_use = ins;  imp_use = imp_sample
-        y   = np.concatenate([np.ones(n_gen),   np.zeros(n_imp)])
-        s   = np.concatenate([ins_use,            imp_use])
-        fpr, tpr, thresholds = roc_curve(y, s, pos_label=1)
-        eer = brentq(lambda x: 1.0 - x - interp1d(fpr, tpr)(x), 0.0, 1.0)
-        eers.append(eer)
+        eers.append(_single_eer(ins.copy(), imp_sample))
+    eer_bal = float(np.mean(eers))
 
-    mean_eer = float(np.mean(eers))
-    std_eer  = float(np.std(eers))
-    # also return threshold from the last trial for reference
-    thresh   = float(interp1d(fpr, thresholds)(eers[-1]))
-    return mean_eer, thresh, std_eer
+    return eer_all, eer_bal
 
 
 def evaluate(model, probe_loader, gallery_loader, device,
              out_dir=".", tag="eval"):
+    """
+    Returns (eer_all, eer_bal, rank1).
+      eer_all : EER with all impostor pairs
+      eer_bal : EER with balanced 1:1 impostor sampling (mean over 10 trials)
+      rank1   : Rank-1 identification accuracy (%)
+    """
     probe_feats,   probe_labels   = extract_features(model, probe_loader,   device)
     gallery_feats, gallery_labels = extract_features(model, gallery_loader, device)
     n_probe = len(probe_feats)
@@ -791,8 +751,8 @@ def evaluate(model, probe_loader, gallery_loader, device,
             scores_list.append(float(sim_matrix[i, j]))
             labels_list.append(1 if probe_labels[i] == gallery_labels[j] else -1)
 
-    scores_arr          = np.column_stack([scores_list, labels_list])
-    eer, _, eer_std     = compute_eer(scores_arr)
+    scores_arr       = np.column_stack([scores_list, labels_list])
+    eer_all, eer_bal = compute_eer(scores_arr)
 
     nn_idx  = np.argmax(sim_matrix, axis=1)
     correct = sum(probe_labels[i] == gallery_labels[nn_idx[i]]
@@ -804,8 +764,10 @@ def evaluate(model, probe_loader, gallery_loader, device,
         for s, l in zip(scores_list, labels_list): f.write(f"{s} {l}\n")
     _save_roc_det(scores_arr, out_dir, tag)
 
-    print(f"  [{tag}]  EER={eer*100:.4f}% (±{eer_std*100:.4f}%)  Rank-1={rank1:.2f}%")
-    return eer, rank1, eer_std
+    print(f"  [{tag}]  "
+          f"EER_all={eer_all*100:.4f}%  EER_bal={eer_bal*100:.4f}%  "
+          f"Rank-1={rank1:.2f}%")
+    return eer_all, eer_bal, rank1
 
 
 def _save_roc_det(scores_arr, out_dir, tag):
@@ -959,11 +921,9 @@ def main():
     train_loader = DataLoader(
         AugmentedDataset(train_samples, img_side, augment_factor),
         batch_size=batch_size, shuffle=True, num_workers=nw, pin_memory=True)
-
     gallery_loader = DataLoader(
         SingleDataset(gallery_samples, img_side),
         batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
-
     probe_loader = DataLoader(
         SingleDataset(probe_samples, img_side),
         batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
@@ -983,15 +943,13 @@ def main():
         print(f"  Using {torch.cuda.device_count()} GPUs")
         net = DataParallel(net)
 
-    # ── fixed initialisation ──────────────────────────────────────────────
     if use_combined_eval:
         net = get_or_create_init_weights(net, CONFIG, num_classes, device)
     else:
         print("  Training from scratch (random init).")
 
     if CONFIG.get("resume", False):
-        for ckpt in ["net_params_best_eer.pth", "net_params_best.pth",
-                     "net_params.pth"]:
+        for ckpt in ["net_params_best_eer.pth", "net_params_best.pth", "net_params.pth"]:
             path = os.path.join(results_dir, ckpt)
             if os.path.exists(path):
                 _net = net.module if isinstance(net, DataParallel) else net
@@ -1004,27 +962,34 @@ def main():
     optimizer = optim.Adam(net.parameters(), lr=lr)
     scheduler = lr_scheduler.StepLR(optimizer, lr_step, lr_gamma)
 
-    # ── training loop ─────────────────────────────────────────────────────
+    # ── training state variables ───────────────────────────────────────────
     train_losses, train_accs = [], []
-    best_eer = 1.0; last_eer = float("nan"); last_rank1 = float("nan"); last_eer_std = float("nan")
+    # best-model selection uses EER_bal (balanced, fair)
+    best_eer     = 1.0
+    last_eer_all = float("nan")   # EER with all impostors
+    last_eer_bal = float("nan")   # EER with balanced 1:1 sampling
+    last_rank1   = float("nan")
 
     print(f"\nStarting training for {num_epochs} epochs …")
-    print(f"  EER / Rank-1 evaluated every {eval_every} epochs.\n")
+    print(f"  EER / Rank-1 evaluated every {eval_every} epochs.")
+    print(f"  EER_all = all impostor pairs | EER_bal = balanced 1:1 sampling\n")
 
     if CONFIG.get("eval_only", False):
         print("  eval_only=True — skipping training.\n")
     else:
-        # ── pre-training evaluation (true zero-shot baseline) ─────────────
+        # ── pre-training evaluation ────────────────────────────────────────
         _net = net.module if isinstance(net, DataParallel) else net
         print("  Pre-training evaluation (before any gradient update) …")
-        cur_eer, cur_rank1, cur_eer_std = evaluate(
+        cur_eer_all, cur_eer_bal, cur_rank1 = evaluate(
             _net, probe_loader, gallery_loader,
             device, out_dir=rst_eval, tag=f"ep-001_pretrain_{eval_tag_base}")
-        best_eer = cur_eer; last_eer = cur_eer; last_rank1 = cur_rank1; last_eer_std = cur_eer_std
-      
+        best_eer     = cur_eer_bal   # use balanced EER for model selection
+        last_eer_all = cur_eer_all
+        last_eer_bal = cur_eer_bal
+        last_rank1   = cur_rank1
         torch.save(_net.state_dict(),
                    os.path.join(results_dir, "net_params_best_eer.pth"))
-        print(f"  *** Initial best EER: {best_eer*100:.4f}% ***\n")
+        print(f"  *** Initial best EER_bal: {best_eer*100:.4f}% ***\n")
 
         for epoch in range(num_epochs):
             t_loss, t_acc = run_one_epoch(
@@ -1034,27 +999,30 @@ def main():
             train_losses.append(t_loss); train_accs.append(t_acc)
             _net = net.module if isinstance(net, DataParallel) else net
 
-            # Skip epoch 0 eval — already done as pre-training baseline
             if (epoch % eval_every == 0 and epoch > 0) or epoch == num_epochs - 1:
                 tag = f"ep{epoch:04d}_{eval_tag_base}"
-                cur_eer, cur_rank1, cur_eer_std = evaluate(
+                cur_eer_all, cur_eer_bal, cur_rank1 = evaluate(
                     _net, probe_loader, gallery_loader,
                     device, out_dir=rst_eval, tag=tag)
-                last_eer, last_rank1, last_eer_std = cur_eer, cur_rank1, cur_eer_std
-                if cur_eer < best_eer:
-                    best_eer = cur_eer
+                last_eer_all = cur_eer_all
+                last_eer_bal = cur_eer_bal
+                last_rank1   = cur_rank1
+                if cur_eer_bal < best_eer:
+                    best_eer = cur_eer_bal
                     torch.save(_net.state_dict(),
                                os.path.join(results_dir, "net_params_best_eer.pth"))
-                    print(f"  *** New best EER: {best_eer*100:.4f}% ***")
+                    print(f"  *** New best EER_bal: {best_eer*100:.4f}% ***")
 
             if epoch % 10 == 0 or epoch == num_epochs - 1:
-                ts        = time.strftime("%H:%M:%S")
-                eer_str   = (f"{last_eer*100:.4f}% (±{last_eer_std*100:.4f}%)"
-                             if not math.isnan(last_eer) else "N/A")
+                ts = time.strftime("%H:%M:%S")
+                if math.isnan(last_eer_all):
+                    eer_str = "N/A"
+                else:
+                    eer_str = (f"EER_all={last_eer_all*100:.4f}% | "
+                               f"EER_bal={last_eer_bal*100:.4f}%")
                 rank1_str = f"{last_rank1:.2f}%" if not math.isnan(last_rank1) else "N/A"
-                print(f"[{ts}] ep {epoch:04d} | "
-                      f"loss={t_loss:.5f} | acc={t_acc:.2f}% | "
-                      f"EER={eer_str}  Rank-1={rank1_str}")
+                print(f"[{ts}] ep {epoch:04d} | loss={t_loss:.5f} | acc={t_acc:.2f}% | "
+                      f"{eer_str} | Rank-1={rank1_str}")
 
             if epoch % save_every == 0 or epoch == num_epochs - 1:
                 torch.save(_net.state_dict(),
@@ -1086,7 +1054,7 @@ def main():
     torch.save(eval_net.state_dict(), os.path.join(results_dir, saved_name))
     print(f"  Model saved as {saved_name}")
 
-    final_eer, final_rank1, final_eer_std = evaluate(
+    final_eer_all, final_eer_bal, final_rank1 = evaluate(
         eval_net, probe_loader, gallery_loader,
         device, out_dir=rst_eval, tag=f"FINAL_{eval_tag_base}")
 
@@ -1094,9 +1062,10 @@ def main():
     print(f"  Train  : {train_data} ({n_train_ids} subjects, {n_train_imgs} imgs)")
     print(f"  Eval   : "
           f"{'combined (CASIA-MS + Palm-Auth + MPDv2 + XJTU)' if use_combined_eval else test_data}")
-    print(f"  FINAL EER    : {final_eer*100:.4f}% (±{final_eer_std*100:.4f}%)")
-    print(f"  FINAL Rank-1 : {final_rank1:.3f}%")
-    print(f"  Results      : {results_dir}")
+    print(f"  FINAL EER_all  : {final_eer_all*100:.4f}%")
+    print(f"  FINAL EER_bal  : {final_eer_bal*100:.4f}%")
+    print(f"  FINAL Rank-1   : {final_rank1:.3f}%")
+    print(f"  Results        : {results_dir}")
     print(f"{'='*60}\n")
 
     with open(os.path.join(results_dir, "summary.txt"), "w") as f:
@@ -1123,7 +1092,8 @@ def main():
         f.write(f"Eval subjects      : {n_test_ids}\n")
         f.write(f"Gallery samples    : {len(gallery_samples)}\n")
         f.write(f"Probe samples      : {len(probe_samples)}\n")
-        f.write(f"Final EER          : {final_eer*100:.6f}% (±{final_eer_std*100:.6f}%)\n")
+        f.write(f"Final EER_all      : {final_eer_all*100:.6f}%\n")
+        f.write(f"Final EER_bal      : {final_eer_bal*100:.6f}%\n")
         f.write(f"Final Rank-1       : {final_rank1:.3f}%\n")
 
 
