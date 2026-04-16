@@ -1006,7 +1006,7 @@ def main():
 
     # ── training loop ─────────────────────────────────────────────────────
     train_losses, train_accs = [], []
-    best_eer = 1.0; last_eer = float("nan"); last_rank1 = float("nan")
+    best_eer = 1.0; last_eer = float("nan"); last_rank1 = float("nan"); last_eer_std = float("nan")
 
     print(f"\nStarting training for {num_epochs} epochs …")
     print(f"  EER / Rank-1 evaluated every {eval_every} epochs.\n")
@@ -1017,10 +1017,11 @@ def main():
         # ── pre-training evaluation (true zero-shot baseline) ─────────────
         _net = net.module if isinstance(net, DataParallel) else net
         print("  Pre-training evaluation (before any gradient update) …")
-        cur_eer, cur_rank1 = evaluate(
+        cur_eer, cur_rank1, cur_eer_std = evaluate(
             _net, probe_loader, gallery_loader,
             device, out_dir=rst_eval, tag=f"ep-001_pretrain_{eval_tag_base}")
-        best_eer = cur_eer; last_eer = cur_eer; last_rank1 = cur_rank1
+        best_eer = cur_eer; last_eer = cur_eer; last_rank1 = cur_rank1; last_eer_std = cur_eer_std
+      
         torch.save(_net.state_dict(),
                    os.path.join(results_dir, "net_params_best_eer.pth"))
         print(f"  *** Initial best EER: {best_eer*100:.4f}% ***\n")
@@ -1036,10 +1037,10 @@ def main():
             # Skip epoch 0 eval — already done as pre-training baseline
             if (epoch % eval_every == 0 and epoch > 0) or epoch == num_epochs - 1:
                 tag = f"ep{epoch:04d}_{eval_tag_base}"
-                cur_eer, cur_rank1 = evaluate(
+                cur_eer, cur_rank1, cur_eer_std = evaluate(
                     _net, probe_loader, gallery_loader,
                     device, out_dir=rst_eval, tag=tag)
-                last_eer, last_rank1 = cur_eer, cur_rank1
+                last_eer, last_rank1, last_eer_std = cur_eer, cur_rank1, cur_eer_std
                 if cur_eer < best_eer:
                     best_eer = cur_eer
                     torch.save(_net.state_dict(),
@@ -1048,8 +1049,9 @@ def main():
 
             if epoch % 10 == 0 or epoch == num_epochs - 1:
                 ts        = time.strftime("%H:%M:%S")
-                eer_str   = f"{last_eer*100:.4f}%"  if not math.isnan(last_eer)   else "N/A"
-                rank1_str = f"{last_rank1:.2f}%"     if not math.isnan(last_rank1) else "N/A"
+                eer_str   = (f"{last_eer*100:.4f}% (±{last_eer_std*100:.4f}%)"
+                             if not math.isnan(last_eer) else "N/A")
+                rank1_str = f"{last_rank1:.2f}%" if not math.isnan(last_rank1) else "N/A"
                 print(f"[{ts}] ep {epoch:04d} | "
                       f"loss={t_loss:.5f} | acc={t_acc:.2f}% | "
                       f"EER={eer_str}  Rank-1={rank1_str}")
@@ -1084,7 +1086,7 @@ def main():
     torch.save(eval_net.state_dict(), os.path.join(results_dir, saved_name))
     print(f"  Model saved as {saved_name}")
 
-    final_eer, final_rank1 = evaluate(
+    final_eer, final_rank1, final_eer_std = evaluate(
         eval_net, probe_loader, gallery_loader,
         device, out_dir=rst_eval, tag=f"FINAL_{eval_tag_base}")
 
@@ -1092,7 +1094,7 @@ def main():
     print(f"  Train  : {train_data} ({n_train_ids} subjects, {n_train_imgs} imgs)")
     print(f"  Eval   : "
           f"{'combined (CASIA-MS + Palm-Auth + MPDv2 + XJTU)' if use_combined_eval else test_data}")
-    print(f"  FINAL EER    : {final_eer*100:.4f}%")
+    print(f"  FINAL EER    : {final_eer*100:.4f}% (±{final_eer_std*100:.4f}%)")
     print(f"  FINAL Rank-1 : {final_rank1:.3f}%")
     print(f"  Results      : {results_dir}")
     print(f"{'='*60}\n")
@@ -1121,7 +1123,7 @@ def main():
         f.write(f"Eval subjects      : {n_test_ids}\n")
         f.write(f"Gallery samples    : {len(gallery_samples)}\n")
         f.write(f"Probe samples      : {len(probe_samples)}\n")
-        f.write(f"Final EER          : {final_eer*100:.6f}%\n")
+        f.write(f"Final EER          : {final_eer*100:.6f}% (±{final_eer_std*100:.6f}%)\n")
         f.write(f"Final Rank-1       : {final_rank1:.3f}%\n")
 
 
