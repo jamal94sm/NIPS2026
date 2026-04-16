@@ -75,7 +75,7 @@ BASE_CONFIG = {
     "lr"                   : 0.001,
     "lr_step"              : 17,     # proportional to official 500/3000 × 100
     "lr_gamma"             : 0.8,
-    "augment_factor"       : 4,      # dataset expansion factor
+    "augment_factor"       : 2,      # dataset expansion factor
 
     # ── Misc ───────────────────────────────────────────────────
     "base_results_dir"     : "./rst_ccnet_all",
