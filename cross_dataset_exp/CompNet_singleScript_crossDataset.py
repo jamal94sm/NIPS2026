@@ -34,8 +34,8 @@ EER reporting
 CONFIG = {
     # ── Dataset selection ──────────────────────────────────────
     # Choices: "CASIA-MS" | "Palm-Auth" | "MPDv2" | "XJTU"
-    "train_data"           : "Palm-Auth",
-    "test_data"            : "Palm-Auth",   # used only when combined_evaluation_set=False
+    "train_data"           : "XJTU",
+    "test_data"            : "XJTU",   # used only when combined_evaluation_set=False
 
     # ── Dataset paths ──────────────────────────────────────────
     "casiams_data_root"    : "/home/pai-ng/Jamal/CASIA-MS-ROI",
