@@ -61,8 +61,8 @@ BASE_CONFIG = {
     "img_side"             : 128,
     "comp_weight"          : 0.8,    # channel vs. spatial competition weight
     "dropout"              : 0.5,
-    "arcface_s"            : 30.0,
-    "arcface_m"            : 0.50,
+    "arcface_s"            : 20.0,
+    "arcface_m"            : 0.30,
 
     # ── Loss ───────────────────────────────────────────────────
     "ce_weight"            : 0.8,
