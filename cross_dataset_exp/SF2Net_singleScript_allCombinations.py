@@ -77,7 +77,7 @@ BASE_CONFIG = {
     "lr"                   : 0.001,
     "lr_step"              : 17,     # proportional to official 50/3000 × 100
     "lr_gamma"             : 0.8,
-    "augment_factor"       : 2,      # triplet dataset expansion
+    "augment_factor"       : 4,      # triplet dataset expansion
 
     # ── Misc ───────────────────────────────────────────────────
     "base_results_dir"     : "./rst_sf2net_all",
