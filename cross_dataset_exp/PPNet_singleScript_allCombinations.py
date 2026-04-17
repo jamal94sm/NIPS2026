@@ -114,16 +114,16 @@ from matplotlib.backends.backend_pdf import PdfPages
 
 warnings.filterwarnings("ignore")
 
-ALLOWED_SPECTRA = {"green", "ir", "yellow", "pink", "white"}
+ALLOWED_SPECTRA = {"green", "ir", "yellow", "pink", "white", "red", "orange", "magenta", "blue"}
 
 N_HIGH = 150
 N_LOW  = 40
 
-TARGET_HIGH_CASIA = 29
+TARGET_HIGH_CASIA = 42
 TARGET_LOW_CASIA  = 15
-TARGET_HIGH_MPD   = 33
-TARGET_LOW_MPD    = 16
-TARGET_HIGH_XJTU  = 29
+TARGET_HIGH_MPD   = 42
+TARGET_LOW_MPD    = 20
+TARGET_HIGH_XJTU  = 42
 TARGET_LOW_XJTU   = 15
 
 XJTU_VARIATIONS = [
