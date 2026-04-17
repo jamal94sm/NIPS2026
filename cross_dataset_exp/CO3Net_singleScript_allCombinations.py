@@ -430,32 +430,26 @@ def parse_mpd_data(data_root, seed=42):
         if device not in ("h","m") or hand_side not in ("l","r"): continue
         id_dev[subject+"_"+hand_side][device].append(os.path.join(data_root, fname))
 
-    all_ids = list(id_dev.keys()); rng.shuffle(all_ids)
-    all_ids.sort(key=lambda i: len(id_dev[i].get("h",[]))+len(id_dev[i].get("m",[])),
-                 reverse=True)
-    if len(all_ids) < N_HIGH:
-        raise ValueError(f"MPDv2: need {N_HIGH} IDs, found {len(all_ids)}")
-    high_ids  = all_ids[:N_HIGH]
-    low_cands = [i for i in all_ids[N_HIGH:]
-                 if len(id_dev[i].get("h",[]))+len(id_dev[i].get("m",[]))>=TARGET_LOW_MPD]
-    if len(low_cands) < N_LOW:
-        raise ValueError("MPDv2: not enough low-group IDs")
-    low_ids = low_cands[:N_LOW]
-
-    def _sample(ident, target):
-        paths = id_dev[ident].get("h",[]) + id_dev[ident].get("m",[])
-        return rng.sample(paths, min(target, len(paths)))
+    # Select the 190 IDs with the most samples
+    all_ids = sorted(
+        id_dev.keys(),
+        key=lambda i: len(id_dev[i].get("h", [])) + len(id_dev[i].get("m", [])),
+        reverse=True)
+    if len(all_ids) < N_HIGH + N_LOW:
+        raise ValueError(f"MPDv2: need {N_HIGH + N_LOW} IDs, found {len(all_ids)}")
+    selected_ids = all_ids[:N_HIGH + N_LOW]   # top 190 by sample count
 
     id2paths = {}
-    for ident in high_ids: id2paths[ident] = _sample(ident, TARGET_HIGH_MPD)
-    for ident in low_ids:  id2paths[ident] = _sample(ident, TARGET_LOW_MPD)
-    actual = sum(len(v) for v in id2paths.values())
-    hc = [len(id2paths[i]) for i in high_ids]; lc = [len(id2paths[i]) for i in low_ids]
-    cutoff_h = len(id_dev[high_ids[-1]].get("h",[]))+len(id_dev[high_ids[-1]].get("m",[]))
-    cutoff_l = len(id_dev[low_ids[-1]].get("h",[]))+len(id_dev[low_ids[-1]].get("m",[]))
+    for ident in selected_ids:
+        paths = id_dev[ident].get("h", []) + id_dev[ident].get("m", [])
+        id2paths[ident] = paths   # keep ALL samples for each selected ID
+
+    counts  = [len(v) for v in id2paths.values()]
+    actual  = sum(counts)
+    cutoff  = counts[-1]   # sample count of the last-selected (lowest) ID
     print(f"  [MPDv2] ids={len(id2paths)}  total={actual}")
-    print(f"    High ({N_HIGH}×~{TARGET_HIGH_MPD}): min={min(hc)} max={max(hc)} mean={sum(hc)/N_HIGH:.1f} cutoff={cutoff_h}")
-    print(f"    Low  ({N_LOW}×~{TARGET_LOW_MPD}):  min={min(lc)} max={max(lc)} mean={sum(lc)/N_LOW:.1f} cutoff={cutoff_l}")
+    print(f"    min={min(counts)}  max={max(counts)}  "
+          f"mean={actual/len(id2paths):.1f}  cutoff={cutoff}")
     return id2paths
 
 
