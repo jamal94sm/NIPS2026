@@ -790,6 +790,59 @@ def print_and_save_table(results, train_datasets, test_datasets, out_path):
     print(f"\nTable saved to: {out_path}")
 
 
+
+def print_dataset_distributions(cfg):
+    """Parse all four datasets and print a summary distribution table."""
+    print(f"\n{'='*60}")
+    print(f"  DATASET DISTRIBUTIONS")
+    print(f"{'='*60}")
+
+    datasets = [
+        ("CASIA-MS",  lambda: parse_casia_ms(cfg["casiams_data_root"],
+                                             seed=cfg["random_seed"])),
+        ("Palm-Auth", lambda: parse_palm_auth_data(cfg["palm_auth_data_root"],
+                                                   use_scanner=cfg.get("use_scanner", False))),
+        ("MPDv2",     lambda: parse_mpd_data(cfg["mpd_data_root"],
+                                             seed=cfg["random_seed"])),
+        ("XJTU",      lambda: parse_xjtu_data(cfg["xjtu_data_root"],
+                                              seed=cfg["random_seed"])),
+    ]
+
+    col_w  = 12
+    header = (f"{'Dataset':<14}"
+              f"{'Subjects':>{col_w}}"
+              f"{'Total Imgs':>{col_w}}"
+              f"{'Min/Subj':>{col_w}}"
+              f"{'Max/Subj':>{col_w}}"
+              f"{'Mean/Subj':>{col_w}}"
+              f"{'Median/Subj':>{col_w}}")
+    sep = "─" * len(header)
+    print(f"\n{header}")
+    print(sep)
+
+    for ds_name, parser_fn in datasets:
+        try:
+            id2paths = parser_fn()
+            counts   = [len(v) for v in id2paths.values()]
+            n_subj   = len(counts)
+            total    = sum(counts)
+            mn, mx   = min(counts), max(counts)
+            mean     = total / n_subj
+            median   = float(np.median(counts))
+            print(f"{ds_name:<14}"
+                  f"{n_subj:>{col_w}}"
+                  f"{total:>{col_w}}"
+                  f"{mn:>{col_w}}"
+                  f"{mx:>{col_w}}"
+                  f"{mean:>{col_w}.1f}"
+                  f"{median:>{col_w}.1f}")
+        except Exception as e:
+            print(f"{ds_name:<14}  ERROR: {e}")
+
+    print(sep)
+    print()
+
+
 # ══════════════════════════════════════════════════════════════
 #  MAIN RUNNER
 # ══════════════════════════════════════════════════════════════
@@ -802,6 +855,8 @@ def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     base_results_dir = BASE_CONFIG.get("base_results_dir", "./rst_compnet_all")
     os.makedirs(base_results_dir, exist_ok=True)
+
+    print_dataset_distributions(BASE_CONFIG)
 
     print(f"\n{'='*60}")
     print(f"  CompNet — Full Cross-Dataset Experiment")
