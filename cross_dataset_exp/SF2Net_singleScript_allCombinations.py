@@ -121,7 +121,7 @@ except ImportError:
 
 warnings.filterwarnings("ignore")
 
-ALLOWED_SPECTRA = {"green", "ir", "yellow", "pink", "white"}
+ALLOWED_SPECTRA = {"green", "ir", "yellow", "pink", "white", "red", "orange", "magenta", "blue"}
 
 N_HIGH = 150
 N_LOW  = 40
