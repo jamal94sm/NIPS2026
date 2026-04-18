@@ -123,8 +123,8 @@ TARGET_HIGH_CASIA = 29
 TARGET_LOW_CASIA  = 15
 TARGET_HIGH_MPD   = 33
 TARGET_LOW_MPD    = 16
-TARGET_HIGH_XJTU  = 29
-TARGET_LOW_XJTU   = 15
+TARGET_HIGH_XJTU  = 30
+TARGET_LOW_XJTU   = 14
 
 XJTU_VARIATIONS = [
     ("iPhone", "Flash"),
@@ -344,6 +344,7 @@ def parse_mpd_data(data_root, seed=42):
     print(f"  [MPDv2] ids={len(id2paths)}  total={actual}")
     print(f"    High ({N_HIGH}×~{TARGET_HIGH_MPD}): min={min(hc)} max={max(hc)} mean={sum(hc)/N_HIGH:.1f} cutoff={cutoff_h}")
     print(f"    Low  ({N_LOW}×~{TARGET_LOW_MPD}):  min={min(lc)} max={max(lc)} mean={sum(lc)/N_LOW:.1f} cutoff={cutoff_l}")
+    return id2paths
 
 
 def parse_xjtu_data(data_root, seed=42):
