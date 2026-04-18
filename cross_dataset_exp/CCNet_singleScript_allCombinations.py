@@ -111,7 +111,8 @@ from matplotlib.backends.backend_pdf import PdfPages
 
 warnings.filterwarnings("ignore")
 
-ALLOWED_SPECTRA = {"green", "ir", "yellow", "pink", "white", "red", "orange", "magenta", "blue"}
+#ALLOWED_SPECTRA = {"green", "ir", "yellow", "pink", "white", "red", "orange", "magenta", "blue"}
+ALLOWED_SPECTRA = {"green", "ir", "yellow", "pink", "white", "blue"}
 
 N_HIGH = 150
 N_LOW  = 40
