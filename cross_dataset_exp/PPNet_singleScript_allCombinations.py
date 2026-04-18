@@ -806,21 +806,28 @@ def run_experiment(train_data, test_data, cfg, device=None):
 
 def print_and_save_table(results, train_datasets, test_datasets, out_path):
     col_w    = 14
-    td_label = [t.replace("-","") for t in test_datasets]
+    td_label = [t.replace("-","") for t in test_datasets] + ["Avg"]
     header   = f"{'Train\\Test':<14}" + "".join(f"{t:>{col_w}}" for t in td_label)
     sep      = "─" * len(header)
     lines    = []
-    for metric, idx, label in [("EER_bal (%)", 0, "EER_bal"), ("Rank-1 (%)", 1, "Rank-1")]:
-        lines.append(f"\n{label} Results")
+
+    for metric_label, idx in [("EER_bal (%)", 0), ("Rank-1 (%)", 1)]:
+        lines.append(f"\n{metric_label} Results")
         lines.append(sep); lines.append(header); lines.append(sep)
         for tr in train_datasets:
-            row = f"{tr.replace('-',''):<14}"
+            row  = f"{tr.replace('-',''):<14}"
+            vals = []
             for te in test_datasets:
                 val  = results.get((tr, te))
                 cell = f"{val[idx]:.2f}" if val is not None else "—"
                 row += f"{cell:>{col_w}}"
+                if val is not None:
+                    vals.append(val[idx])
+            avg_cell = f"{sum(vals)/len(vals):.2f}" if vals else "—"
+            row += f"{avg_cell:>{col_w}}"
             lines.append(row)
         lines.append(sep)
+
     text = "\n".join(lines)
     print(text)
     with open(out_path, "w") as f:
