@@ -45,7 +45,7 @@ CONFIG = {
 
     # ── Splitting ──────────────────────────────────────────────
     "train_subject_ratio"  : 0.80,
-    "test_gallery_ratio"   : 0.50,
+    "test_gallery_ratio"   : 0.10,
 
     # ── Palm-Auth toggle ───────────────────────────────────────
     "use_scanner"          : True,
