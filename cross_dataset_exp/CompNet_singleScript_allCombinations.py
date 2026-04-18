@@ -351,6 +351,7 @@ def parse_mpd_data(data_root, seed=42):
     print(f"  [MPDv2] ids={len(id2paths)}  total={actual}")
     print(f"    High ({N_HIGH}×~{TARGET_HIGH_MPD}): min={min(hc)} max={max(hc)} mean={sum(hc)/N_HIGH:.1f} cutoff={cutoff_h}")
     print(f"    Low  ({N_LOW}×~{TARGET_LOW_MPD}):  min={min(lc)} max={max(lc)} mean={sum(lc)/N_LOW:.1f} cutoff={cutoff_l}")
+    return id2paths
 
 def parse_xjtu_data(data_root, seed=42):
     rng      = random.Random(seed)
