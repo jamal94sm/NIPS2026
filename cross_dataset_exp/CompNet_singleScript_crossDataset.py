@@ -115,19 +115,17 @@ SEED = CONFIG["random_seed"]
 random.seed(SEED); np.random.seed(SEED)
 torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 
-ALLOWED_SPECTRA = {"green", "ir", "yellow", "pink", "white"}
+ALLOWED_SPECTRA = {"green", "ir", "yellow", "pink", "white", "blue"}
 
 N_HIGH = 150
 N_LOW  = 40
 
-TARGET_HIGH_CASIA = 29
+TARGET_HIGH_CASIA = 32
 TARGET_LOW_CASIA  = 15
-
-TARGET_HIGH_MPD = 33
-TARGET_LOW_MPD  = 16
-
-TARGET_HIGH_XJTU = 29
-TARGET_LOW_XJTU  = 15
+TARGET_HIGH_MPD   = 36
+TARGET_LOW_MPD    = 16
+TARGET_HIGH_XJTU  = 32
+TARGET_LOW_XJTU   = 15
 
 XJTU_VARIATIONS = [
     ("iPhone", "Flash"),
