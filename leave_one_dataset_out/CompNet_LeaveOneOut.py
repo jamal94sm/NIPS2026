@@ -53,7 +53,7 @@ BASE_CONFIG = {
 
     # ── Training ───────────────────────────────────────────────
     "batch_size"           : 128,
-    "num_epochs"           : 100,
+    "num_epochs"           : 300,
     "lr"                   : 0.001,
     "lr_step"              : 30,
     "lr_gamma"             : 0.8,
