@@ -42,7 +42,7 @@ CONFIG = {
 
     # Training
     "batch_size"           : 128,
-    "num_epochs"           : 300,
+    "num_epochs"           : 200,
     "lr"                   : 0.001,
     "lr_step"              : 30,
     "lr_gamma"             : 0.8,
