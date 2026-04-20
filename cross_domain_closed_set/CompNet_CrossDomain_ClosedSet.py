@@ -269,8 +269,8 @@ def parse_palm_auth_cross_domain(data_root, scanner_spectra, gallery_ratio=0.50,
             if len(parts) < 4: continue
             spectrum = parts[2].lower()
             if spectrum not in scanner_spectra: continue
-            # Use same identity key as perspective: parts[0]_parts[1]
-            identity = parts[0] + "_" + parts[1]
+            # Lowercase parts[1] so "Left"/"Right" matches perspective "left"/"right"
+            identity = parts[0] + "_" + parts[1].lower()
             scanner_paths[identity].append(os.path.join(scan_dir, fname))
 
     # ── Keep only shared identities ────────────────────────────────────────
