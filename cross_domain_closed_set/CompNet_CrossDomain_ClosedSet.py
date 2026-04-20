@@ -42,7 +42,7 @@ CONFIG = {
 
     # Training
     "batch_size"           : 128,
-    "num_epochs"           : 200,
+    "num_epochs"           : 300,
     "lr"                   : 0.001,
     "lr_step"              : 30,
     "lr_gamma"             : 0.8,
@@ -287,15 +287,11 @@ def _collect_scanner(data_root, scanner_spectra):
     return scanner_paths
 
 
-def _gallery_probe_split(id2paths, label_map, gallery_ratio, rng):
-    """50 % gallery / 50 % probe split per identity."""
-    gallery, probe = [], []
-    for ident, paths in id2paths.items():
-        paths = list(paths); rng.shuffle(paths)
-        n_gal = max(1, int(len(paths) * gallery_ratio))
-        for p in paths[:n_gal]: gallery.append((p, label_map[ident]))
-        for p in paths[n_gal:]: probe.append((p, label_map[ident]))
-    return gallery, probe
+def _all_samples(id2paths, label_map):
+    """Flatten id2paths into a flat (path, label) list — entire set as gallery or probe."""
+    return [(p, label_map[ident])
+            for ident, paths in id2paths.items()
+            for p in paths]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -329,26 +325,28 @@ def parse_setting_scanner(cond_paths, scanner_paths, gallery_ratio, seed):
                      for ident in shared_ids
                      for p in persp_all[ident]]
 
-    gallery_samples, probe_samples = _gallery_probe_split(
-        {ident: scanner_paths[ident] for ident in shared_ids},
-        label_map, gallery_ratio, rng)
+    # Gallery = ALL scanner images; Probe = ALL perspective images
+    gallery_samples = _all_samples(
+        {ident: scanner_paths[ident] for ident in shared_ids}, label_map)
+    probe_samples   = _all_samples(
+        {ident: list(persp_all[ident]) for ident in shared_ids}, label_map)
 
-    _print_stats("S1 | Perspective (all) → Scanner",
+    _print_stats("S_scanner | Perspective (all) → Scanner",
                  num_classes, len(train_samples),
                  len(gallery_samples), len(probe_samples))
     return train_samples, gallery_samples, probe_samples, num_classes
 
-def parse_setting_scanner_to_perspective(cond_paths, scanner_paths, gallery_ratio, seed):
-    """
-    S_scanner_to_persp — Scanner vs Smartphone
-    ───────────────────────────────────────────
-    Train  : roi_scanner (all spectra)
-    Test   : roi_perspective (all conditions), gallery + probe split
-    Closed : subjects present in both domains
-    """
-    rng = random.Random(seed)
 
-    # Merge all perspective conditions into one dict
+def parse_setting_scanner_to_perspective(cond_paths, scanner_paths, seed):
+    """
+    S_scanner_to_persp — Scanner (train) vs Smartphone (test)
+    ──────────────────────────────────────────────────────────
+    Train   : ALL roi_scanner images
+    Gallery : ALL roi_scanner images (same as train)
+    Probe   : ALL roi_perspective images
+    Closed  : subjects present in both domains
+    """
+    # Merge all perspective conditions
     persp_all = defaultdict(list)
     for cond_dict in cond_paths.values():
         for ident, paths in cond_dict.items():
@@ -361,31 +359,30 @@ def parse_setting_scanner_to_perspective(cond_paths, scanner_paths, gallery_rati
     label_map   = {ident: i for i, ident in enumerate(shared_ids)}
     num_classes = len(shared_ids)
 
-    train_samples = [(p, label_map[ident])
-                     for ident in shared_ids
-                     for p in scanner_paths[ident]]
-
-    gallery_samples, probe_samples = _gallery_probe_split(
-        {ident: persp_all[ident] for ident in shared_ids},
-        label_map, gallery_ratio, rng)
+    train_samples   = _all_samples(
+        {ident: scanner_paths[ident] for ident in shared_ids}, label_map)
+    gallery_samples = train_samples   # gallery = full training domain
+    probe_samples   = _all_samples(
+        {ident: list(persp_all[ident]) for ident in shared_ids}, label_map)
 
     _print_stats("S_scanner_to_persp | Scanner → Perspective (all)",
                  num_classes, len(train_samples),
                  len(gallery_samples), len(probe_samples))
     return train_samples, gallery_samples, probe_samples, num_classes
 
-
 def parse_setting_leave_one_condition(
-        target_condition, cond_paths, scanner_paths, gallery_ratio, seed):
+        target_condition, cond_paths, scanner_paths, seed):
     """
     S_C — Leave-one-condition-out
     ──────────────────────────────
     Train  : roi_perspective (all conditions except C) + roi_scanner
-    Test   : roi_perspective (condition C only), gallery + probe split
+    Gallery: ALL training images (same as train set)
+    Probe  : ALL roi_perspective images of condition C
     Closed : subjects that have at least one image of condition C
-    """
-    rng = random.Random(seed)
 
+    No splitting — the full training domain is the gallery; the full
+    test condition is the probe.
+    """
     test_id2paths = cond_paths.get(target_condition, {})
     if not test_id2paths:
         raise ValueError(f"No perspective images found for condition '{target_condition}'")
@@ -406,10 +403,20 @@ def parse_setting_leave_one_condition(
         for p in scanner_paths.get(ident, []):
             train_samples.append((p, label_map[ident]))
 
-    # Test = target condition images
-    gallery_samples, probe_samples = _gallery_probe_split(
-        {ident: test_id2paths[ident] for ident in shared_ids},
-        label_map, gallery_ratio, rng)
+    # Gallery = ALL training images (scanner + all non-target conditions)
+    # Probe   = ALL target-condition images
+    train_id2paths = defaultdict(list)
+    for cond, cond_dict in cond_paths.items():
+        if cond == target_condition:
+            continue
+        for ident in shared_ids:
+            train_id2paths[ident].extend(cond_dict.get(ident, []))
+    for ident in shared_ids:
+        train_id2paths[ident].extend(scanner_paths.get(ident, []))
+
+    gallery_samples = _all_samples(train_id2paths, label_map)
+    probe_samples   = _all_samples(
+        {ident: test_id2paths[ident] for ident in shared_ids}, label_map)
 
     _print_stats(
         f"S_{target_condition} | Perspective (¬{target_condition}) + Scanner → {target_condition}",
@@ -747,12 +754,10 @@ def main():
         "tag"        : "setting_scanner_to_persp",
         "label"      : "S_scanner_to_persp",
         "train_desc" : "Scanner (all spectra)",
-        "test_desc"  : "Perspective (all)",
+        "test_desc"  : "Perspective (all conditions)",
         "parser"     : lambda: parse_setting_scanner_to_perspective(
-                           cond_paths, scanner_paths,
-                           cfg["test_gallery_ratio"], seed),
+                           cond_paths, scanner_paths, seed),
     })
-
     # S_C: leave-one-condition-out for every condition present in the data
     conditions_found = sorted(cond_paths.keys())
     for cond in ALL_CONDITIONS:
@@ -766,8 +771,7 @@ def main():
             "train_desc" : f"Perspective (¬{c}) + Scanner",
             "test_desc"  : f"Perspective ({c})",
             "parser"     : (lambda c=c: parse_setting_leave_one_condition(
-                                c, cond_paths, scanner_paths,
-                                cfg["test_gallery_ratio"], seed)),
+                                c, cond_paths, scanner_paths, seed)),
         })
 
     print(f"\n  Total settings to run : {len(SETTINGS)}")
