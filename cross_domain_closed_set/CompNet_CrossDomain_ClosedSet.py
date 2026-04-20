@@ -1,45 +1,46 @@
 """
-CompNet — Cross-Domain Closed-Set Evaluation on Palm-Auth
+CompNet — Cross-Domain Closed-Set Evaluations on Palm-Auth
 ===========================================================
-Training domain : smartphone images  (roi_perspective)
-Test domain     : scanner images     (roi_scanner)
+All evaluations follow a closed-set protocol: the same subject IDs
+appear in both train and test splits.
 
-Protocol: CLOSED SET
-  - Exactly the same subject IDs appear in both train and test.
-  - Only subjects that have images in BOTH domains are included.
-  - Train  : ALL roi_perspective images for every shared subject.
-  - Gallery: 50 % of roi_scanner images per subject (random split).
-  - Probe  : remaining 50 % of roi_scanner images per subject.
+Settings
+────────
+  S1  │ Train : roi_perspective (all conditions)
+      │ Test  : roi_scanner
+
+  S2–S12  │ For each smartphone condition C:
+           │   Train : roi_perspective (all conditions except C) + roi_scanner
+           │   Test  : roi_perspective (condition C only)
+
+Conditions handled:
+  bf | close | far | fl | jf | pitch | roll | rnd | sf | text | wet
+  ("rnd" groups rnd_1 … rnd_5 together)
 
 Scanner spectra kept: green | ir | yellow | pink | white
 
-Results are saved to:
-  {BASE_RESULTS_DIR}/eval/          ← per-checkpoint score files
-  {BASE_RESULTS_DIR}/results.txt    ← final EER / Rank-1
-  {BASE_RESULTS_DIR}/train_curves.png
+Results saved to:
+  {BASE_RESULTS_DIR}/setting1/          ← S1 checkpoint scores + curves
+  {BASE_RESULTS_DIR}/setting_{C}/       ← one folder per condition
+  {BASE_RESULTS_DIR}/results_summary.txt
 """
 
 # ==============================================================
 #  CONFIG
 # ==============================================================
 CONFIG = {
-    # ── Dataset path ───────────────────────────────────────────
     "palm_auth_data_root"  : "/home/pai-ng/Jamal/smartphone_data",
-
-    # ── Scanner spectra to include ─────────────────────────────
     "scanner_spectra"      : {"green", "ir", "yellow", "pink", "white"},
-
-    # ── Gallery / probe split ratio (scanner side) ─────────────
     "test_gallery_ratio"   : 0.50,
 
-    # ── Model ──────────────────────────────────────────────────
+    # Model
     "img_side"             : 128,
     "embedding_dim"        : 512,
     "dropout"              : 0.25,
     "arcface_s"            : 30.0,
     "arcface_m"            : 0.50,
 
-    # ── Training ───────────────────────────────────────────────
+    # Training
     "batch_size"           : 128,
     "num_epochs"           : 300,
     "lr"                   : 0.001,
@@ -47,13 +48,17 @@ CONFIG = {
     "lr_gamma"             : 0.8,
     "augment_factor"       : 2,
 
-    # ── Misc ───────────────────────────────────────────────────
+    # Misc
     "base_results_dir"     : "./rst_compnet_crossdomain",
     "random_seed"          : 42,
     "save_every"           : 50,
     "eval_every"           : 50,
     "num_workers"          : 4,
 }
+
+# All smartphone conditions — "rnd" covers rnd_1 … rnd_5
+ALL_CONDITIONS = ["bf", "close", "far", "fl", "jf",
+                  "pitch", "roll", "rnd", "sf", "text", "wet"]
 # ==============================================================
 
 import os
@@ -217,29 +222,32 @@ class NormSingleROI:
 
 
 # ══════════════════════════════════════════════════════════════
-#  DATASET PARSER  (Palm-Auth, cross-domain, closed set)
+#  DATA COLLECTION HELPERS
 # ══════════════════════════════════════════════════════════════
 
-def parse_palm_auth_cross_domain(data_root, scanner_spectra, gallery_ratio=0.50, seed=42):
+def _condition_of(fname):
     """
-    Collect images from roi_perspective (train domain) and roi_scanner (test domain).
+    Extract the condition label from a roi_perspective filename.
 
-    Only subjects that have at least one image in BOTH domains are kept.
-    The same label map is used for all three splits → closed-set protocol.
-
-    Returns
-    -------
-    train_samples   : list of (path, label)  — smartphone / perspective
-    gallery_samples : list of (path, label)  — scanner, gallery half
-    probe_samples   : list of (path, label)  — scanner, probe half
-    num_classes     : int
+    Filename format: {id}_{side}_{condition}[_{extra}].jpg
+      e.g. 1_left_wet.jpg   → "wet"
+           1_left_rnd_1.jpg → "rnd"   (all rnd_* → "rnd")
+           1_right_bf.jpg   → "bf"
     """
-    rng = random.Random(seed)
+    stem  = os.path.splitext(fname)[0]          # "1_left_rnd_1"
+    parts = stem.split("_")                     # ["1","left","rnd","1"]
+    if len(parts) < 3:
+        return None
+    return parts[2].lower()                     # "rnd", "wet", "bf", …
 
-    # ── Collect perspective images ─────────────────────────────────────────
-    # Subject identity key: "{subject_folder}_{hand_id}" (e.g. "001_L")
-    # Filename pattern: {hand_id}_{session}_{condition}.jpg  → parts[0]_parts[1]
-    persp_paths = defaultdict(list)
+
+def _collect_perspective(data_root):
+    """
+    Returns:
+        cond_paths : condition → identity → [path, ...]
+    Identity key: "{id}_{side_lowercase}"  e.g. "1_left"
+    """
+    cond_paths = defaultdict(lambda: defaultdict(list))
     for subject_id in sorted(os.listdir(data_root)):
         subject_dir = os.path.join(data_root, subject_id)
         if not os.path.isdir(subject_dir): continue
@@ -249,14 +257,20 @@ def parse_palm_auth_cross_domain(data_root, scanner_spectra, gallery_ratio=0.50,
             if os.path.splitext(fname)[1].lower() not in IMG_EXTS: continue
             parts = os.path.splitext(fname)[0].split("_")
             if len(parts) < 3: continue
-            identity = parts[0] + "_" + parts[1]
-            persp_paths[identity].append(os.path.join(roi_dir, fname))
+            identity  = parts[0] + "_" + parts[1].lower()   # "1_left"
+            condition = parts[2].lower()                     # "wet", "rnd", …
+            cond_paths[condition][identity].append(
+                os.path.join(roi_dir, fname))
+    return cond_paths
 
-    # ── Collect scanner images ─────────────────────────────────────────────
-    # Filename pattern: {hand_id}_{session}_{spectrum}_{...}.jpg
-    # Subject folder acts as subject_id; scanner identity key: "{subject_id}_{spectrum}"
-    # We keep all spectra in scanner_spectra set.
-    # Identity must match perspective key, so we use subject_folder + hand_id.
+
+def _collect_scanner(data_root, scanner_spectra):
+    """
+    Returns:
+        scanner_paths : identity → [path, ...]
+    Identity key matches perspective: "{id}_{side_lowercase}"
+    Filename format: {id}_{Side}_{spectrum}_{rep}.jpg
+    """
     scanner_paths = defaultdict(list)
     for subject_id in sorted(os.listdir(data_root)):
         subject_dir = os.path.join(data_root, subject_id)
@@ -267,56 +281,155 @@ def parse_palm_auth_cross_domain(data_root, scanner_spectra, gallery_ratio=0.50,
             if os.path.splitext(fname)[1].lower() not in IMG_EXTS: continue
             parts = os.path.splitext(fname)[0].split("_")
             if len(parts) < 4: continue
-            spectrum = parts[2].lower()
-            if spectrum not in scanner_spectra: continue
-            # Lowercase parts[1] so "Left"/"Right" matches perspective "left"/"right"
+            if parts[2].lower() not in scanner_spectra: continue
             identity = parts[0] + "_" + parts[1].lower()
             scanner_paths[identity].append(os.path.join(scan_dir, fname))
+    return scanner_paths
 
-    # ── Keep only shared identities ────────────────────────────────────────
-    shared_ids = sorted(set(persp_paths.keys()) & set(scanner_paths.keys()))
-    if len(shared_ids) == 0:
-        raise ValueError("No shared identities found between perspective and scanner!")
 
-    label_map = {ident: i for i, ident in enumerate(shared_ids)}
+def _gallery_probe_split(id2paths, label_map, gallery_ratio, rng):
+    """50 % gallery / 50 % probe split per identity."""
+    gallery, probe = [], []
+    for ident, paths in id2paths.items():
+        paths = list(paths); rng.shuffle(paths)
+        n_gal = max(1, int(len(paths) * gallery_ratio))
+        for p in paths[:n_gal]: gallery.append((p, label_map[ident]))
+        for p in paths[n_gal:]: probe.append((p, label_map[ident]))
+    return gallery, probe
+
+
+# ══════════════════════════════════════════════════════════════
+#  PARSERS FOR EACH SETTING
+# ══════════════════════════════════════════════════════════════
+
+def parse_setting_scanner(cond_paths, scanner_paths, gallery_ratio, seed):
+    """
+    S1 — Smartphone (all conditions) vs Scanner
+    ─────────────────────────────────────────────
+    Train  : all roi_perspective images
+    Test   : roi_scanner images (gallery + probe split)
+    Closed : subjects with images in both domains
+    """
+    rng = random.Random(seed)
+
+    # Merge all conditions into one perspective dict
+    persp_all = defaultdict(list)
+    for cond_dict in cond_paths.values():
+        for ident, paths in cond_dict.items():
+            persp_all[ident].extend(paths)
+
+    shared_ids = sorted(set(persp_all.keys()) & set(scanner_paths.keys()))
+    if not shared_ids:
+        raise ValueError("S1: no shared identities found!")
+
+    label_map   = {ident: i for i, ident in enumerate(shared_ids)}
     num_classes = len(shared_ids)
 
-    # ── Build train samples (all perspective images) ───────────────────────
-    train_samples = []
-    for ident in shared_ids:
-        for path in persp_paths[ident]:
-            train_samples.append((path, label_map[ident]))
+    train_samples = [(p, label_map[ident])
+                     for ident in shared_ids
+                     for p in persp_all[ident]]
 
-    # ── Build gallery / probe (scanner images, 50/50 per identity) ─────────
-    gallery_samples, probe_samples = [], []
-    for ident in shared_ids:
-        paths = list(scanner_paths[ident])
-        rng.shuffle(paths)
-        n_gal = max(1, int(len(paths) * gallery_ratio))
-        for p in paths[:n_gal]: gallery_samples.append((p, label_map[ident]))
-        for p in paths[n_gal:]: probe_samples.append((p, label_map[ident]))
+    gallery_samples, probe_samples = _gallery_probe_split(
+        {ident: scanner_paths[ident] for ident in shared_ids},
+        label_map, gallery_ratio, rng)
 
-    # ── Stats ──────────────────────────────────────────────────────────────
-    p_counts = [len(persp_paths[i])   for i in shared_ids]
-    s_counts = [len(scanner_paths[i]) for i in shared_ids]
-    print(f"\n  [Palm-Auth Cross-Domain | Closed Set]")
-    print(f"    Shared subjects       : {num_classes}")
-    print(f"    Perspective (train)   : {len(train_samples)} images  "
-          f"(min={min(p_counts)} max={max(p_counts)} mean={sum(p_counts)/num_classes:.1f})")
-    print(f"    Scanner    (test)     : {len(gallery_samples)+len(probe_samples)} images  "
-          f"(min={min(s_counts)} max={max(s_counts)} mean={sum(s_counts)/num_classes:.1f})")
-    print(f"    Gallery / Probe       : {len(gallery_samples)} / {len(probe_samples)}")
-    print(f"    Spectra kept          : {sorted(scanner_spectra)}")
-
+    _print_stats("S1 | Perspective (all) → Scanner",
+                 num_classes, len(train_samples),
+                 len(gallery_samples), len(probe_samples))
     return train_samples, gallery_samples, probe_samples, num_classes
+
+def parse_setting_scanner_to_perspective(cond_paths, scanner_paths, gallery_ratio, seed):
+    """
+    S_scanner_to_persp — Scanner vs Smartphone
+    ───────────────────────────────────────────
+    Train  : roi_scanner (all spectra)
+    Test   : roi_perspective (all conditions), gallery + probe split
+    Closed : subjects present in both domains
+    """
+    rng = random.Random(seed)
+
+    # Merge all perspective conditions into one dict
+    persp_all = defaultdict(list)
+    for cond_dict in cond_paths.values():
+        for ident, paths in cond_dict.items():
+            persp_all[ident].extend(paths)
+
+    shared_ids = sorted(set(persp_all.keys()) & set(scanner_paths.keys()))
+    if not shared_ids:
+        raise ValueError("S_scanner_to_persp: no shared identities found!")
+
+    label_map   = {ident: i for i, ident in enumerate(shared_ids)}
+    num_classes = len(shared_ids)
+
+    train_samples = [(p, label_map[ident])
+                     for ident in shared_ids
+                     for p in scanner_paths[ident]]
+
+    gallery_samples, probe_samples = _gallery_probe_split(
+        {ident: persp_all[ident] for ident in shared_ids},
+        label_map, gallery_ratio, rng)
+
+    _print_stats("S_scanner_to_persp | Scanner → Perspective (all)",
+                 num_classes, len(train_samples),
+                 len(gallery_samples), len(probe_samples))
+    return train_samples, gallery_samples, probe_samples, num_classes
+
+
+def parse_setting_leave_one_condition(
+        target_condition, cond_paths, scanner_paths, gallery_ratio, seed):
+    """
+    S_C — Leave-one-condition-out
+    ──────────────────────────────
+    Train  : roi_perspective (all conditions except C) + roi_scanner
+    Test   : roi_perspective (condition C only), gallery + probe split
+    Closed : subjects that have at least one image of condition C
+    """
+    rng = random.Random(seed)
+
+    test_id2paths = cond_paths.get(target_condition, {})
+    if not test_id2paths:
+        raise ValueError(f"No perspective images found for condition '{target_condition}'")
+
+    shared_ids = sorted(test_id2paths.keys())
+    label_map   = {ident: i for i, ident in enumerate(shared_ids)}
+    num_classes = len(shared_ids)
+
+    # Train = all perspective conditions except the target + scanner
+    train_samples = []
+    for cond, cond_dict in cond_paths.items():
+        if cond == target_condition:
+            continue
+        for ident in shared_ids:
+            for p in cond_dict.get(ident, []):
+                train_samples.append((p, label_map[ident]))
+    for ident in shared_ids:
+        for p in scanner_paths.get(ident, []):
+            train_samples.append((p, label_map[ident]))
+
+    # Test = target condition images
+    gallery_samples, probe_samples = _gallery_probe_split(
+        {ident: test_id2paths[ident] for ident in shared_ids},
+        label_map, gallery_ratio, rng)
+
+    _print_stats(
+        f"S_{target_condition} | Perspective (¬{target_condition}) + Scanner → {target_condition}",
+        num_classes, len(train_samples),
+        len(gallery_samples), len(probe_samples))
+    return train_samples, gallery_samples, probe_samples, num_classes
+
+
+def _print_stats(name, num_classes, train_n, gallery_n, probe_n):
+    print(f"\n  [{name}]")
+    print(f"    Subjects (closed set) : {num_classes}")
+    print(f"    Train images          : {train_n}")
+    print(f"    Gallery / Probe       : {gallery_n} / {probe_n}")
 
 
 # ══════════════════════════════════════════════════════════════
 #  FIXED MODEL INITIALISATION
 # ══════════════════════════════════════════════════════════════
 
-def get_or_create_init_weights(net, cfg, num_classes, device):
-    cache_dir    = os.path.abspath(cfg["base_results_dir"])
+def get_or_create_init_weights(net, num_classes, cache_dir, device):
     os.makedirs(cache_dir, exist_ok=True)
     model_name   = type(net.module if isinstance(net, DataParallel) else net).__name__
     weights_path = os.path.join(cache_dir,
@@ -447,6 +560,146 @@ def evaluate(model, probe_loader, gallery_loader, device,
 
 
 # ══════════════════════════════════════════════════════════════
+#  EXPERIMENT RUNNER
+# ══════════════════════════════════════════════════════════════
+
+def run_experiment(train_samples, gallery_samples, probe_samples,
+                   num_classes, cfg, results_dir, device):
+    """Train CompNet and evaluate. Returns (final_eer, final_rank1)."""
+    os.makedirs(results_dir, exist_ok=True)
+    rst_eval = os.path.join(results_dir, "eval")
+    os.makedirs(rst_eval, exist_ok=True)
+
+    img_side       = cfg["img_side"]
+    batch_size     = cfg["batch_size"]
+    num_epochs     = cfg["num_epochs"]
+    augment_factor = cfg["augment_factor"]
+    nw             = cfg["num_workers"]
+    eval_every     = cfg["eval_every"]
+    save_every     = cfg["save_every"]
+
+    train_loader = DataLoader(
+        AugmentedDataset(train_samples, img_side, augment_factor),
+        batch_size=batch_size, shuffle=True, num_workers=nw, pin_memory=True)
+    gallery_loader = DataLoader(
+        SingleDataset(gallery_samples, img_side),
+        batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
+    probe_loader = DataLoader(
+        SingleDataset(probe_samples, img_side),
+        batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
+
+    net = CompNet(num_classes,
+                  embedding_dim = cfg["embedding_dim"],
+                  arcface_s     = cfg["arcface_s"],
+                  arcface_m     = cfg["arcface_m"],
+                  dropout       = cfg["dropout"])
+    net.to(device)
+    if torch.cuda.device_count() > 1:
+        net = DataParallel(net)
+
+    net = get_or_create_init_weights(
+        net, num_classes,
+        cache_dir = cfg["base_results_dir"],
+        device    = device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(net.parameters(), lr=cfg["lr"])
+    scheduler = lr_scheduler.StepLR(optimizer, cfg["lr_step"], cfg["lr_gamma"])
+
+    _net = net.module if isinstance(net, DataParallel) else net
+    pre_eer, pre_r1 = evaluate(_net, probe_loader, gallery_loader,
+                                device, out_dir=rst_eval, tag="ep-001_pretrain")
+    best_eer = pre_eer; last_eer = pre_eer; last_rank1 = pre_r1
+    torch.save(_net.state_dict(),
+               os.path.join(results_dir, "net_params_best_eer.pth"))
+
+    train_losses, train_accs = [], []
+
+    for epoch in range(num_epochs):
+        t_loss, t_acc = run_one_epoch(
+            net, train_loader, criterion, optimizer, device, "training")
+        scheduler.step()
+        train_losses.append(t_loss); train_accs.append(t_acc)
+        _net = net.module if isinstance(net, DataParallel) else net
+
+        if (epoch % eval_every == 0 and epoch > 0) or epoch == num_epochs - 1:
+            cur_eer, cur_rank1 = evaluate(
+                _net, probe_loader, gallery_loader,
+                device, out_dir=rst_eval, tag=f"ep{epoch:04d}")
+            last_eer, last_rank1 = cur_eer, cur_rank1
+            if cur_eer < best_eer:
+                best_eer = cur_eer
+                torch.save(_net.state_dict(),
+                           os.path.join(results_dir, "net_params_best_eer.pth"))
+                print(f"  *** New best EER: {best_eer*100:.4f}% ***")
+
+        if epoch % 10 == 0 or epoch == num_epochs - 1:
+            ts = time.strftime("%H:%M:%S")
+            eer_str   = f"{last_eer*100:.4f}%"  if not math.isnan(last_eer)   else "N/A"
+            rank1_str = f"{last_rank1:.2f}%"     if not math.isnan(last_rank1) else "N/A"
+            print(f"  [{ts}] ep {epoch:04d} | loss={t_loss:.4f} | acc={t_acc:.2f}% | "
+                  f"EER={eer_str}  Rank-1={rank1_str}")
+
+        if epoch % save_every == 0 or epoch == num_epochs - 1:
+            torch.save(_net.state_dict(),
+                       os.path.join(results_dir, "net_params.pth"))
+
+    best_path = os.path.join(results_dir, "net_params_best_eer.pth")
+    if not os.path.exists(best_path):
+        best_path = os.path.join(results_dir, "net_params.pth")
+    eval_net = net.module if isinstance(net, DataParallel) else net
+    eval_net.load_state_dict(torch.load(best_path, map_location=device))
+    final_eer, final_rank1 = evaluate(
+        eval_net, probe_loader, gallery_loader,
+        device, out_dir=rst_eval, tag="FINAL")
+
+    try:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        axes[0].plot(train_losses, 'b'); axes[0].set_title("Train Loss")
+        axes[0].set_xlabel("epoch"); axes[0].grid(True)
+        axes[1].plot(train_accs,   'b'); axes[1].set_title("Train Acc (%)")
+        axes[1].set_xlabel("epoch"); axes[1].grid(True)
+        fig.tight_layout()
+        fig.savefig(os.path.join(results_dir, "train_curves.png"))
+        plt.close(fig)
+    except Exception:
+        pass
+
+    return final_eer, final_rank1
+
+
+# ══════════════════════════════════════════════════════════════
+#  RESULTS SUMMARY TABLE
+# ══════════════════════════════════════════════════════════════
+
+def print_and_save_summary(all_results, out_path):
+    col_w  = 14
+    header = (f"{'Setting':<10}"
+              f"{'Train domain':<40}"
+              f"{'Test domain':<26}"
+              f"{'EER (%)':>{col_w}}"
+              f"{'Rank-1 (%)':>{col_w}}")
+    sep = "─" * len(header)
+    lines = ["\nCross-Domain Closed-Set Results — Palm-Auth", sep, header, sep]
+
+    for r in all_results:
+        eer_str   = f"{r['eer']:.2f}"   if r['eer']   is not None else "—"
+        rank1_str = f"{r['rank1']:.2f}" if r['rank1'] is not None else "—"
+        lines.append(f"{r['setting']:<10}"
+                     f"{r['train_desc']:<40}"
+                     f"{r['test_desc']:<26}"
+                     f"{eer_str:>{col_w}}"
+                     f"{rank1_str:>{col_w}}")
+    lines.append(sep)
+
+    text = "\n".join(lines)
+    print(text)
+    with open(out_path, "w") as f:
+        f.write(text + "\n")
+    print(f"\nSummary saved to: {out_path}")
+
+
+# ══════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════
 
@@ -459,145 +712,112 @@ def main():
     device           = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     base_results_dir = cfg["base_results_dir"]
     os.makedirs(base_results_dir, exist_ok=True)
-    rst_eval = os.path.join(base_results_dir, "eval")
-    os.makedirs(rst_eval, exist_ok=True)
 
     print(f"\n{'='*60}")
     print(f"  CompNet — Cross-Domain Closed-Set (Palm-Auth)")
-    print(f"  Train domain : roi_perspective (smartphone)")
-    print(f"  Test  domain : roi_scanner")
-    print(f"  Protocol     : closed set (shared IDs)")
-    print(f"  Device       : {device}")
-    print(f"  Epochs       : {cfg['num_epochs']}")
-    print(f"  Results dir  : {base_results_dir}")
+    print(f"  Protocol : closed set (shared IDs in train & test)")
+    print(f"  Device   : {device}")
+    print(f"  Epochs   : {cfg['num_epochs']}")
+    print(f"  Settings : 1 scanner + {len(ALL_CONDITIONS)} leave-one-condition-out")
+    print(f"  Results  : {base_results_dir}")
     print(f"{'='*60}")
 
-    # ── Parse dataset ─────────────────────────────────────────────────────
-    train_samples, gallery_samples, probe_samples, num_classes = \
-        parse_palm_auth_cross_domain(
-            data_root       = cfg["palm_auth_data_root"],
-            scanner_spectra = cfg["scanner_spectra"],
-            gallery_ratio   = cfg["test_gallery_ratio"],
-            seed            = seed,
-        )
+    # ── Pre-collect data once (shared across all settings) ────────────────
+    print("\n  Scanning dataset …")
+    cond_paths    = _collect_perspective(cfg["palm_auth_data_root"])
+    scanner_paths = _collect_scanner(cfg["palm_auth_data_root"],
+                                     cfg["scanner_spectra"])
+    print(f"  Perspective conditions found : {sorted(cond_paths.keys())}")
+    print(f"  Scanner identities found     : {len(scanner_paths)}")
 
-    # ── Data loaders ──────────────────────────────────────────────────────
-    img_side       = cfg["img_side"]
-    batch_size     = cfg["batch_size"]
-    augment_factor = cfg["augment_factor"]
-    nw             = cfg["num_workers"]
+    # ── Build settings list ───────────────────────────────────────────────
+    SETTINGS = []
 
-    train_loader = DataLoader(
-        AugmentedDataset(train_samples, img_side, augment_factor),
-        batch_size=batch_size, shuffle=True, num_workers=nw, pin_memory=True)
-    gallery_loader = DataLoader(
-        SingleDataset(gallery_samples, img_side),
-        batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
-    probe_loader = DataLoader(
-        SingleDataset(probe_samples, img_side),
-        batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
+    # S1: smartphone vs scanner
+    SETTINGS.append({
+        "tag"        : "setting_scanner",
+        "label"      : "S_scanner",
+        "train_desc" : "Perspective (all)",
+        "test_desc"  : "Scanner",
+        "parser"     : lambda: parse_setting_scanner(
+                           cond_paths, scanner_paths,
+                           cfg["test_gallery_ratio"], seed),
+    })
+    SETTINGS.append({
+        "tag"        : "setting_scanner_to_persp",
+        "label"      : "S_scanner_to_persp",
+        "train_desc" : "Scanner (all spectra)",
+        "test_desc"  : "Perspective (all)",
+        "parser"     : lambda: parse_setting_scanner_to_perspective(
+                           cond_paths, scanner_paths,
+                           cfg["test_gallery_ratio"], seed),
+    })
 
-    # ── Model ─────────────────────────────────────────────────────────────
-    net = CompNet(num_classes,
-                  embedding_dim = cfg["embedding_dim"],
-                  arcface_s     = cfg["arcface_s"],
-                  arcface_m     = cfg["arcface_m"],
-                  dropout       = cfg["dropout"])
-    net.to(device)
-    if torch.cuda.device_count() > 1:
-        net = DataParallel(net)
+    # S_C: leave-one-condition-out for every condition present in the data
+    conditions_found = sorted(cond_paths.keys())
+    for cond in ALL_CONDITIONS:
+        if cond not in conditions_found:
+            print(f"  [WARN] condition '{cond}' not found in data — skipping")
+            continue
+        c = cond  # capture for lambda closure
+        SETTINGS.append({
+            "tag"        : f"setting_{c}",
+            "label"      : f"S_{c}",
+            "train_desc" : f"Perspective (¬{c}) + Scanner",
+            "test_desc"  : f"Perspective ({c})",
+            "parser"     : (lambda c=c: parse_setting_leave_one_condition(
+                                c, cond_paths, scanner_paths,
+                                cfg["test_gallery_ratio"], seed)),
+        })
 
-    net = get_or_create_init_weights(net, cfg, num_classes, device)
+    print(f"\n  Total settings to run : {len(SETTINGS)}")
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(net.parameters(), lr=cfg["lr"])
-    scheduler = lr_scheduler.StepLR(optimizer, cfg["lr_step"], cfg["lr_gamma"])
+    # ── Run all settings ──────────────────────────────────────────────────
+    all_results = []
 
-    # ── Pre-training baseline (scanner → scanner, random weights) ─────────
-    _net = net.module if isinstance(net, DataParallel) else net
-    pre_eer, pre_r1 = evaluate(_net, probe_loader, gallery_loader,
-                                device, out_dir=rst_eval,
-                                tag="ep-001_pretrain")
-    best_eer = pre_eer; last_eer = pre_eer; last_rank1 = pre_r1
-    torch.save(_net.state_dict(),
-               os.path.join(base_results_dir, "net_params_best_eer.pth"))
+    for idx, s in enumerate(SETTINGS, 1):
+        print(f"\n{'='*60}")
+        print(f"  [{idx}/{len(SETTINGS)}] {s['label']}")
+        print(f"  Train : {s['train_desc']}")
+        print(f"  Test  : {s['test_desc']}")
+        print(f"{'='*60}")
 
-    train_losses, train_accs = [], []
+        results_dir = os.path.join(base_results_dir, s["tag"])
+        t_start     = time.time()
+        try:
+            train_s, gal_s, probe_s, n_cls = s["parser"]()
+            eer, rank1 = run_experiment(
+                train_s, gal_s, probe_s, n_cls, cfg, results_dir, device)
+            elapsed = time.time() - t_start
+            print(f"\n  ✓  {s['label']}:  EER={eer*100:.4f}%  "
+                  f"Rank-1={rank1:.2f}%  Time={elapsed/60:.1f} min")
+            with open(os.path.join(results_dir, "results.json"), "w") as f:
+                json.dump({"setting"     : s["label"],
+                           "train_desc"  : s["train_desc"],
+                           "test_desc"   : s["test_desc"],
+                           "num_classes" : n_cls,
+                           "EER_pct"     : eer * 100,
+                           "Rank1_pct"   : rank1}, f, indent=2)
+            all_results.append({"setting"    : s["label"],
+                                 "train_desc" : s["train_desc"],
+                                 "test_desc"  : s["test_desc"],
+                                 "eer"        : eer * 100,
+                                 "rank1"      : rank1})
+        except Exception as e:
+            print(f"\n  ✗  {s['label']} FAILED: {e}")
+            all_results.append({"setting"    : s["label"],
+                                 "train_desc" : s["train_desc"],
+                                 "test_desc"  : s["test_desc"],
+                                 "eer"        : None,
+                                 "rank1"      : None})
 
-    # ── Training loop ─────────────────────────────────────────────────────
-    for epoch in range(cfg["num_epochs"]):
-        t_loss, t_acc = run_one_epoch(
-            net, train_loader, criterion, optimizer, device, "training")
-        scheduler.step()
-        train_losses.append(t_loss); train_accs.append(t_acc)
-        _net = net.module if isinstance(net, DataParallel) else net
-
-        if (epoch % cfg["eval_every"] == 0 and epoch > 0) or epoch == cfg["num_epochs"] - 1:
-            cur_eer, cur_rank1 = evaluate(
-                _net, probe_loader, gallery_loader,
-                device, out_dir=rst_eval, tag=f"ep{epoch:04d}")
-            last_eer, last_rank1 = cur_eer, cur_rank1
-            if cur_eer < best_eer:
-                best_eer = cur_eer
-                torch.save(_net.state_dict(),
-                           os.path.join(base_results_dir, "net_params_best_eer.pth"))
-                print(f"  *** New best EER: {best_eer*100:.4f}% ***")
-
-        if epoch % 10 == 0 or epoch == cfg["num_epochs"] - 1:
-            ts        = time.strftime("%H:%M:%S")
-            eer_str   = f"{last_eer*100:.4f}%"  if not math.isnan(last_eer)   else "N/A"
-            rank1_str = f"{last_rank1:.2f}%"     if not math.isnan(last_rank1) else "N/A"
-            print(f"  [{ts}] ep {epoch:04d} | loss={t_loss:.4f} | acc={t_acc:.2f}% | "
-                  f"EER={eer_str}  Rank-1={rank1_str}")
-
-        if epoch % cfg["save_every"] == 0 or epoch == cfg["num_epochs"] - 1:
-            torch.save(_net.state_dict(),
-                       os.path.join(base_results_dir, "net_params.pth"))
-
-    # ── Final evaluation (best checkpoint) ────────────────────────────────
-    best_path = os.path.join(base_results_dir, "net_params_best_eer.pth")
-    if not os.path.exists(best_path):
-        best_path = os.path.join(base_results_dir, "net_params.pth")
-    eval_net = net.module if isinstance(net, DataParallel) else net
-    eval_net.load_state_dict(torch.load(best_path, map_location=device))
-    final_eer, final_rank1 = evaluate(
-        eval_net, probe_loader, gallery_loader,
-        device, out_dir=rst_eval, tag="FINAL")
-
-    # ── Save results ───────────────────────────────────────────────────────
-    result_txt = os.path.join(base_results_dir, "results.txt")
-    with open(result_txt, "w") as f:
-        f.write("CompNet — Cross-Domain Closed-Set (Palm-Auth)\n")
-        f.write("  Train domain : roi_perspective (smartphone)\n")
-        f.write("  Test  domain : roi_scanner\n")
-        f.write(f"  Subjects     : {num_classes}\n")
-        f.write(f"  Train images : {len(train_samples)}\n")
-        f.write(f"  Gallery      : {len(gallery_samples)}\n")
-        f.write(f"  Probe        : {len(probe_samples)}\n\n")
-        f.write(f"  EER    : {final_eer*100:.4f}%\n")
-        f.write(f"  Rank-1 : {final_rank1:.2f}%\n")
-    print(f"\n  Results saved to: {result_txt}")
-    print(f"  EER={final_eer*100:.4f}%  Rank-1={final_rank1:.2f}%")
-
-    with open(os.path.join(base_results_dir, "results_raw.json"), "w") as f:
-        json.dump({"EER_pct": final_eer*100, "Rank1_pct": final_rank1,
-                   "num_classes": num_classes,
-                   "train_images": len(train_samples),
-                   "gallery": len(gallery_samples),
-                   "probe": len(probe_samples)}, f, indent=2)
-
-    # ── Train curves ───────────────────────────────────────────────────────
-    try:
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-        axes[0].plot(train_losses, 'b'); axes[0].set_title("Train Loss")
-        axes[0].set_xlabel("epoch"); axes[0].grid(True)
-        axes[1].plot(train_accs,   'b'); axes[1].set_title("Train Acc (%)")
-        axes[1].set_xlabel("epoch"); axes[1].grid(True)
-        fig.tight_layout()
-        fig.savefig(os.path.join(base_results_dir, "train_curves.png"))
-        plt.close(fig)
-    except Exception:
-        pass
+    # ── Summary table ─────────────────────────────────────────────────────
+    print(f"\n\n{'='*60}")
+    print(f"  ALL {len(SETTINGS)} SETTINGS COMPLETE")
+    print(f"{'='*60}")
+    print_and_save_summary(
+        all_results,
+        os.path.join(base_results_dir, "results_summary.txt"))
 
 
 if __name__ == "__main__":
