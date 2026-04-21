@@ -797,21 +797,6 @@ def main():
                            train_ratio, gallery_ratio, seed),
     })
 
-    conditions_found = sorted(cond_paths.keys())
-    for cond_a, cond_b in PAIRED_CONDITIONS:
-        if cond_a not in conditions_found or cond_b not in conditions_found:
-            print(f"  [WARN] '{cond_a}' or '{cond_b}' not found in data — skipping")
-            continue
-        ca, cb = cond_a, cond_b
-        SETTINGS.append({
-            "tag"        : f"setting_{ca}_{cb}",
-            "label"      : f"S_{ca}_{cb}",
-            "train_desc" : f"Perspective (not {ca}/{cb}) + Scanner (train IDs)",
-            "test_desc"  : f"{ca}/{cb} (test IDs)",
-            "parser"     : (lambda ca=ca, cb=cb: parse_setting_paired_conditions(
-                                ca, cb, cond_paths, scanner_paths,
-                                train_ratio, seed)),
-        })
 
     print(f"\n  Total settings to run : {len(SETTINGS)}")
 
