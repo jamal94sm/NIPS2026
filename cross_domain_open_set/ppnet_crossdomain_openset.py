@@ -295,14 +295,13 @@ def parse_setting_scanner(cond_paths, scanner_paths,
         for ident, paths in cond_dict.items():
             persp_all[ident].extend(paths)
 
-    all_persp_ids  = sorted(persp_all.keys())          # 190 IDs
-    scanner_ids    = sorted(scanner_paths.keys())       # 148 IDs
+    all_persp_ids = sorted(persp_all.keys())       # 190 IDs
+    scanner_ids   = sorted(scanner_paths.keys())   # 148 IDs
 
-    # Pick n_test IDs from scanner IDs to form the test set
-    n_test  = len(all_persp_ids) - int(len(all_persp_ids) * train_id_ratio)  # 38
-    rng_obj = random.Random(seed)
-    test_ids  = sorted(rng_obj.sample(scanner_ids, n_test))
-    train_ids = sorted(set(all_persp_ids) - set(test_ids))                   # 152
+    # Pick n_test from scanner IDs to form the test set
+    n_test    = len(all_persp_ids) - int(len(all_persp_ids) * train_id_ratio)  # 38
+    test_ids  = sorted(random.Random(seed).sample(scanner_ids, n_test))
+    train_ids = sorted(set(all_persp_ids) - set(test_ids))                     # 152
 
     train_label_map = {ident: i for i, ident in enumerate(train_ids)}
     test_label_map  = {ident: i for i, ident in enumerate(test_ids)}
@@ -322,7 +321,6 @@ def parse_setting_scanner(cond_paths, scanner_paths,
                  len(train_ids), len(test_ids), len(train_samples),
                  len(gallery_samples), len(probe_samples))
     return train_samples, gallery_samples, probe_samples, num_train_cls
-
 
 def parse_setting_scanner_to_perspective(cond_paths, scanner_paths,
                                          train_id_ratio, gallery_ratio, seed):
