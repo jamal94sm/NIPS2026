@@ -410,26 +410,34 @@ def parse_setting_scanner(cond_paths, scanner_paths,
     """
     S_scanner — Perspective (train IDs) → Scanner (test IDs)
     ──────────────────────────────────────────────────────────
-    Shared IDs: those with both perspective and scanner images.
-    Train (80 %) : ALL perspective images for train IDs
-    Test  (20 %) : scanner images for test IDs → 50/50 gallery/probe
+    Split is based on scanner IDs only:
+      Train (80 %) : ALL perspective images for train IDs
+      Test  (20 %) : scanner images for test IDs → 50/50 gallery/probe
     """
     rng = random.Random(seed)
+
     persp_all = defaultdict(list)
     for cond_dict in cond_paths.values():
         for ident, paths in cond_dict.items():
             persp_all[ident].extend(paths)
 
-    shared_ids = sorted(set(persp_all.keys()) & set(scanner_paths.keys()))
-    train_ids, test_ids = _split_ids(shared_ids, train_id_ratio, seed)
+    # Base split on scanner IDs — all have scanner data
+    all_scanner_ids = sorted(scanner_paths.keys())
+    train_ids, test_ids = _split_ids(all_scanner_ids, train_id_ratio, seed)
 
     train_label_map = {ident: i for i, ident in enumerate(train_ids)}
     test_label_map  = {ident: i for i, ident in enumerate(test_ids)}
     num_train_cls   = len(train_ids)
 
-    train_samples = _all_samples({i: persp_all[i] for i in train_ids}, train_label_map)
+    # Train: perspective images for train IDs (skip any with no perspective data)
+    train_samples = _all_samples(
+        {i: persp_all[i] for i in train_ids if i in persp_all},
+        train_label_map)
+
+    # Test: scanner images for test IDs, split 50/50 gallery/probe
     gallery_samples, probe_samples = _gallery_probe_split(
-        {i: scanner_paths[i] for i in test_ids}, test_label_map, gallery_ratio, rng)
+        {i: scanner_paths[i] for i in test_ids},
+        test_label_map, gallery_ratio, rng)
 
     _print_stats("S_scanner | Perspective (train IDs) → Scanner (test IDs)",
                  len(train_ids), len(test_ids), len(train_samples),
