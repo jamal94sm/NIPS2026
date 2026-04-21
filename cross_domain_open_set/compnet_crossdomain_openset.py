@@ -301,9 +301,10 @@ def parse_setting_scanner(cond_paths, scanner_paths,
     """
     S_scanner — Perspective (train IDs) → Scanner (test IDs)
     ──────────────────────────────────────────────────────────
-    Split is based on scanner IDs only:
-      Train (80 %) : ALL perspective images for train IDs
-      Test  (20 %) : scanner images for test IDs → 50/50 gallery/probe
+    Split is based on ALL perspective IDs (190 total):
+      Train (80 % = 152 IDs) : ALL perspective images for train IDs
+      Test  (20 % = 38 IDs)  : scanner images for the test IDs
+                                that have scanner data
     """
     rng = random.Random(seed)
 
@@ -312,26 +313,31 @@ def parse_setting_scanner(cond_paths, scanner_paths,
         for ident, paths in cond_dict.items():
             persp_all[ident].extend(paths)
 
-    # Base split on scanner IDs — all have scanner data
-    all_scanner_ids = sorted(scanner_paths.keys())
-    train_ids, test_ids = _split_ids(all_scanner_ids, train_id_ratio, seed)
+    # Split based on ALL perspective IDs → 152 train / 38 test
+    all_persp_ids = sorted(persp_all.keys())
+    train_ids, test_ids = _split_ids(all_persp_ids, train_id_ratio, seed)
+
+    # For the test set, keep only those IDs that actually have scanner data
+    test_ids_with_scanner = [i for i in test_ids if i in scanner_paths]
+    if not test_ids_with_scanner:
+        raise ValueError("S_scanner: no test IDs have scanner data!")
 
     train_label_map = {ident: i for i, ident in enumerate(train_ids)}
-    test_label_map  = {ident: i for i, ident in enumerate(test_ids)}
+    test_label_map  = {ident: i for i, ident in enumerate(test_ids_with_scanner)}
     num_train_cls   = len(train_ids)
 
-    # Train: perspective images for train IDs (skip any with no perspective data)
+    # Train: perspective images for all 152 train IDs
     train_samples = _all_samples(
-        {i: persp_all[i] for i in train_ids if i in persp_all},
+        {i: persp_all[i] for i in train_ids},
         train_label_map)
 
-    # Test: scanner images for test IDs, split 50/50 gallery/probe
+    # Test: scanner images for test IDs that have scanner data, 50/50 split
     gallery_samples, probe_samples = _gallery_probe_split(
-        {i: scanner_paths[i] for i in test_ids},
+        {i: scanner_paths[i] for i in test_ids_with_scanner},
         test_label_map, gallery_ratio, rng)
 
     _print_stats("S_scanner | Perspective (train IDs) → Scanner (test IDs)",
-                 len(train_ids), len(test_ids), len(train_samples),
+                 len(train_ids), len(test_ids_with_scanner), len(train_samples),
                  len(gallery_samples), len(probe_samples))
     return train_samples, gallery_samples, probe_samples, num_train_cls
 
