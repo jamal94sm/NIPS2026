@@ -70,8 +70,18 @@ CONFIG = {
     "num_workers"          : 4,
 }
 
-ALL_CONDITIONS = ["bf", "close", "far", "fl", "jf",
-                  "pitch", "roll", "rnd", "sf", "text", "wet"]
+PAIRED_CONDITIONS = [
+    ("wet",  "text"),
+    ("wet",  "rnd"),
+    ("rnd",  "text"),
+    ("sf",   "roll"),
+    ("jf",   "pitch"),
+    ("bf",   "far"),
+    ("roll", "close"),
+    ("rnd",  "wet"),
+    ("fl",   "sf"),
+    ("roll", "pitch"),
+]
 # ==============================================================
 
 import os
@@ -601,31 +611,42 @@ def parse_setting_scanner_to_perspective(cond_paths, scanner_paths,
     return train_samples, gallery_samples, probe_samples, num_train_cls
 
 
-def parse_setting_leave_one_condition(target_condition, cond_paths, scanner_paths,
-                                      train_id_ratio, gallery_ratio, seed):
+def parse_setting_paired_conditions(cond_a, cond_b, cond_paths, scanner_paths,
+                                    train_id_ratio, seed):
     """
-    S_C — Leave-one-condition-out (open set)
-    ─────────────────────────────────────────
-    IDs with condition C images are split 80/20:
-      Train (80 %): perspective (¬C) + scanner for train IDs
-      Test  (20 %): condition C images for test IDs → 50/50 gallery/probe
+    S_{A}_{B} — Paired-condition open-set
+    ──────────────────────────────────────
+    Eligible IDs: those that have at least one image in BOTH cond_A and cond_B.
+    Split 80/20 by ID:
+      Train (80 %): perspective (all except cond_A and cond_B) + scanner, train IDs only
+      Test  (20 %): one image from cond_A  → gallery
+                    one image from cond_B  → probe
+    Each test ID contributes exactly 1 gallery sample + 1 probe sample.
     """
     rng = random.Random(seed)
-    test_id2paths = cond_paths.get(target_condition, {})
-    if not test_id2paths:
-        raise ValueError(f"No images for condition '{target_condition}'")
 
-    all_cond_ids = sorted(test_id2paths.keys())
-    train_ids, test_ids = _split_ids(all_cond_ids, train_id_ratio, seed)
+    paths_a = cond_paths.get(cond_a, {})
+    paths_b = cond_paths.get(cond_b, {})
+    if not paths_a:
+        raise ValueError(f"No images for condition '{cond_a}'")
+    if not paths_b:
+        raise ValueError(f"No images for condition '{cond_b}'")
+
+    eligible_ids = sorted(set(paths_a.keys()) & set(paths_b.keys()))
+    if not eligible_ids:
+        raise ValueError(f"No IDs have both '{cond_a}' and '{cond_b}' images")
+
+    train_ids, test_ids = _split_ids(eligible_ids, train_id_ratio, seed)
 
     train_label_map = {ident: i for i, ident in enumerate(train_ids)}
     test_label_map  = {ident: i for i, ident in enumerate(test_ids)}
     num_train_cls   = len(train_ids)
 
-    # Train = non-target perspective + scanner, for train_ids only
+    # Train: all perspective except both test conditions + scanner, train IDs only
     train_samples = []
     for cond, cond_dict in cond_paths.items():
-        if cond == target_condition: continue
+        if cond in (cond_a, cond_b):
+            continue
         for ident in train_ids:
             for p in cond_dict.get(ident, []):
                 train_samples.append((p, train_label_map[ident]))
@@ -633,14 +654,19 @@ def parse_setting_leave_one_condition(target_condition, cond_paths, scanner_path
         for p in scanner_paths.get(ident, []):
             train_samples.append((p, train_label_map[ident]))
 
-    # Test = condition C samples for test_ids, split gallery/probe
-    gallery_samples, probe_samples = _gallery_probe_split(
-        {i: test_id2paths[i] for i in test_ids},
-        test_label_map, gallery_ratio, rng)
+    # Test: 1 sample from cond_A → gallery, 1 sample from cond_B → probe
+    gallery_samples = []
+    probe_samples   = []
+    for ident in test_ids:
+        label = test_label_map[ident]
+        a_imgs = list(paths_a[ident]); rng.shuffle(a_imgs)
+        b_imgs = list(paths_b[ident]); rng.shuffle(b_imgs)
+        gallery_samples.append((a_imgs[0], label))
+        probe_samples.append((b_imgs[0], label))
 
     _print_stats(
-        f"S_{target_condition} | Perspective (¬{target_condition}) + Scanner (train IDs)"
-        f" → {target_condition} (test IDs)",
+        f"S_{cond_a}_{cond_b} | Perspective (not {cond_a}/{cond_b}) + Scanner"
+        f" -> {cond_a}/{cond_b}",
         len(train_ids), len(test_ids), len(train_samples),
         len(gallery_samples), len(probe_samples))
     return train_samples, gallery_samples, probe_samples, num_train_cls
@@ -1027,7 +1053,7 @@ def main():
     print(f"  Gallery/Probe: {gallery_ratio*100:.0f}/{(1-gallery_ratio)*100:.0f} sample split")
     print(f"  Device    : {device}")
     print(f"  Epochs    : {cfg['num_epochs']}")
-    print(f"  Settings  : 2 scanner + {len(ALL_CONDITIONS)} leave-one-condition-out")
+    print(f"  Settings  : 2 scanner + {len(PAIRED_CONDITIONS)} paired-condition")
     print(f"  Results   : {base_results_dir}")
     print(f"{'='*60}")
 
@@ -1061,19 +1087,19 @@ def main():
     })
 
     conditions_found = sorted(cond_paths.keys())
-    for cond in ALL_CONDITIONS:
-        if cond not in conditions_found:
-            print(f"  [WARN] condition '{cond}' not found — skipping")
+    for cond_a, cond_b in PAIRED_CONDITIONS:
+        if cond_a not in conditions_found or cond_b not in conditions_found:
+            print(f"  [WARN] '{cond_a}' or '{cond_b}' not found in data — skipping")
             continue
-        c = cond
+        ca, cb = cond_a, cond_b
         SETTINGS.append({
-            "tag"        : f"setting_{c}",
-            "label"      : f"S_{c}",
-            "train_desc" : f"Perspective (¬{c}) + Scanner (train IDs)",
-            "test_desc"  : f"Perspective ({c}) (test IDs)",
-            "parser"     : (lambda c=c: parse_setting_leave_one_condition(
-                                c, cond_paths, scanner_paths,
-                                train_ratio, gallery_ratio, seed)),
+            "tag"        : f"setting_{ca}_{cb}",
+            "label"      : f"S_{ca}_{cb}",
+            "train_desc" : f"Perspective (not {ca}/{cb}) + Scanner (train IDs)",
+            "test_desc"  : f"{ca}/{cb} (test IDs)",
+            "parser"     : (lambda ca=ca, cb=cb: parse_setting_paired_conditions(
+                                ca, cb, cond_paths, scanner_paths,
+                                train_ratio, seed)),
         })
 
     print(f"\n  Total settings to run : {len(SETTINGS)}")
