@@ -410,9 +410,9 @@ def parse_setting_scanner(cond_paths, scanner_paths,
     """
     S_scanner — Perspective (train IDs) → Scanner (test IDs)
     ──────────────────────────────────────────────────────────
-    Split is based on scanner IDs only:
-      Train (80 %) : ALL perspective images for train IDs
-      Test  (20 %) : scanner images for test IDs → 50/50 gallery/probe
+    1. From IDs that HAVE scanner data, select 38 (20% of 190) as test IDs.
+    2. Test  : scanner images for those 38 IDs → 50/50 gallery/probe
+    3. Train : the remaining 152 IDs (all perspective images, NO scanner)
     """
     rng = random.Random(seed)
 
@@ -421,20 +421,25 @@ def parse_setting_scanner(cond_paths, scanner_paths,
         for ident, paths in cond_dict.items():
             persp_all[ident].extend(paths)
 
-    # Base split on scanner IDs — all have scanner data
-    all_scanner_ids = sorted(scanner_paths.keys())
-    train_ids, test_ids = _split_ids(all_scanner_ids, train_id_ratio, seed)
+    all_persp_ids  = sorted(persp_all.keys())          # 190 IDs
+    scanner_ids    = sorted(scanner_paths.keys())       # 148 IDs
+
+    # Pick n_test IDs from scanner IDs to form the test set
+    n_test  = len(all_persp_ids) - int(len(all_persp_ids) * train_id_ratio)  # 38
+    rng_obj = random.Random(seed)
+    test_ids  = sorted(rng_obj.sample(scanner_ids, n_test))
+    train_ids = sorted(set(all_persp_ids) - set(test_ids))                   # 152
 
     train_label_map = {ident: i for i, ident in enumerate(train_ids)}
     test_label_map  = {ident: i for i, ident in enumerate(test_ids)}
     num_train_cls   = len(train_ids)
 
-    # Train: perspective images for train IDs (skip any with no perspective data)
+    # Train: perspective only for all 152 train IDs
     train_samples = _all_samples(
         {i: persp_all[i] for i in train_ids if i in persp_all},
         train_label_map)
 
-    # Test: scanner images for test IDs, split 50/50 gallery/probe
+    # Test: scanner images for the 38 test IDs, 50/50 gallery/probe
     gallery_samples, probe_samples = _gallery_probe_split(
         {i: scanner_paths[i] for i in test_ids},
         test_label_map, gallery_ratio, rng)
@@ -443,7 +448,6 @@ def parse_setting_scanner(cond_paths, scanner_paths,
                  len(train_ids), len(test_ids), len(train_samples),
                  len(gallery_samples), len(probe_samples))
     return train_samples, gallery_samples, probe_samples, num_train_cls
-
 
 def parse_setting_scanner_to_perspective(cond_paths, scanner_paths,
                                          train_id_ratio, gallery_ratio, seed):
