@@ -1,29 +1,29 @@
 """
 SF2Net — Cross-Domain Open-Set Evaluations on Palm-Auth
-=========================================================
-All evaluations follow an open-set protocol: subject IDs are split
-80 % / 20 % into disjoint train and test partitions.
+==========================================================
+All evaluations follow a closed-set protocol: the same subject IDs
+appear in both train and test splits.
 
-  train_ratio = 0.80  (152 / 190 IDs used for training)
-  test_ratio  = 0.20  (38 / 190 IDs used for evaluation only)
+Settings
+────────
+  S_scanner         │ Train : roi_perspective (all conditions)
+                    │ Gallery: roi_scanner  |  Probe: roi_perspective
 
-Gallery and probe are built from the TEST IDs only, with a 50 / 50
-sample-level split so every test identity appears in both sets.
+  S_scanner_to_persp│ Train : roi_scanner
+                    │ Gallery: roi_scanner  |  Probe: roi_perspective
 
-Settings (13 total)
-────────────────────
-  S_scanner         │ Train : perspective (all)  for train IDs
-                    │ Test  : scanner            for test IDs
-
-  S_scanner_to_persp│ Train : scanner            for scanner IDs
-                    │ Test  : perspective (all)  for IDs with NO scanner data
-
-  S_C (×11)         │ Train : perspective (¬C) + scanner  for train IDs
-                    │ Test  : perspective (C)              for test IDs
+  S_C (×11)         │ Train : roi_perspective (all except C) + roi_scanner
+                    │ Gallery: full train set  |  Probe: condition C
 
 Conditions: bf | close | far | fl | jf | pitch | roll | rnd | sf | text | wet
+  ("rnd" groups rnd_1 … rnd_5 together)
 
 Scanner spectra kept: green | ir | yellow | pink | white
+
+Model / loss: exact SF2Net (multi-order Gabor + SE + dual ViT,
+  ce_weight×CE + tl_weight×TripletLoss(SRT), triplet sampling)
+Matching metric: cosine similarity on L2-normalised 1024-d embeddings
+EER: EER_all (all pairs) + EER_bal (balanced 1:1 impostor sampling)
 
 Results saved to:
   {BASE_RESULTS_DIR}/setting_scanner/
@@ -39,23 +39,28 @@ CONFIG = {
     "scanner_spectra"      : {"green", "ir", "yellow", "pink", "white"},
 
     # Open-set split
-    "train_id_ratio"       : 0.80,   # fraction of IDs used for training
-    "test_gallery_ratio"   : 0.50,   # sample-level gallery/probe split
+    "train_id_ratio"       : 0.80,
+    "test_gallery_ratio"   : 0.50,
 
-    # Model
+    # Model (official SF2Net)
     "img_side"             : 128,
-    "embedding_dim"        : 512,
-    "dropout"              : 0.25,
+    "vit_floor_num"        : 10,
+    "cnn_vit_weight"       : 0.7,
+    "dropout"              : 0.5,
     "arcface_s"            : 30.0,
     "arcface_m"            : 0.50,
 
+    # Loss (official SF2Net)
+    "ce_weight"            : 0.7,
+    "tl_weight"            : 0.3,
+
     # Training
-    "batch_size"             : 256,
-    "num_epochs"             : 200,
-    "lr"             : 0.001,
-    "lr_step"             : 17,
+    "batch_size"           : 256,
+    "num_epochs"           : 200,
+    "lr"                   : 0.001,
+    "lr_step"              : 17,
     "lr_gamma"             : 0.8,
-    "augment_factor"             : 4,
+    "augment_factor"       : 4,
 
     # Misc
     "base_results_dir"     : "./rst_sf2net_crossdomain_openset",
@@ -416,6 +421,7 @@ class SF2Net(nn.Module):
 
 class NormSingleROI:
     def __init__(self, outchannels=1): self.outchannels = outchannels
+
     def __call__(self, tensor):
         c, h, w = tensor.size(); tensor = tensor.view(c, h * w)
         idx = tensor > 0; t = tensor[idx]
@@ -431,7 +437,11 @@ class NormSingleROI:
 # ══════════════════════════════════════════════════════════════
 
 def _collect_perspective(data_root):
-    """condition → identity → [path, ...]"""
+    """
+    Returns cond_paths: condition → identity → [path, ...]
+    Identity key: "{id}_{side_lowercase}"  e.g. "1_left"
+    "rnd" covers rnd_1…rnd_5 (parts[2] == "rnd" for all).
+    """
     cond_paths = defaultdict(lambda: defaultdict(list))
     for subject_id in sorted(os.listdir(data_root)):
         subject_dir = os.path.join(data_root, subject_id)
@@ -449,7 +459,10 @@ def _collect_perspective(data_root):
 
 
 def _collect_scanner(data_root, scanner_spectra):
-    """identity → [path, ...]"""
+    """
+    Returns scanner_paths: identity → [path, ...]
+    Lowercase side so keys match perspective: "{id}_{side_lowercase}"
+    """
     scanner_paths = defaultdict(list)
     for subject_id in sorted(os.listdir(data_root)):
         subject_dir = os.path.join(data_root, subject_id)
@@ -464,6 +477,13 @@ def _collect_scanner(data_root, scanner_spectra):
             identity = parts[0] + "_" + parts[1].lower()
             scanner_paths[identity].append(os.path.join(scan_dir, fname))
     return scanner_paths
+
+
+def _all_samples(id2paths, label_map):
+    """Flatten id2paths → flat (path, label) list."""
+    return [(p, label_map[ident])
+            for ident, paths in id2paths.items()
+            for p in paths]
 
 
 def _split_ids(ids, train_ratio, seed):
@@ -500,6 +520,7 @@ def _gallery_probe_split(id2paths, label_map, gallery_ratio, rng):
 # ══════════════════════════════════════════════════════════════
 #  PARSERS — OPEN-SET SETTINGS
 # ══════════════════════════════════════════════════════════════
+
 
 def parse_setting_scanner(cond_paths, scanner_paths,
                           train_id_ratio, gallery_ratio, seed):
@@ -632,6 +653,7 @@ def _print_stats(name, n_train_ids, n_test_ids, train_n, gallery_n, probe_n):
     print(f"    Gallery / Probe       : {gallery_n} / {probe_n}")
 
 
+
 # ══════════════════════════════════════════════════════════════
 #  FIXED MODEL INITIALISATION
 # ══════════════════════════════════════════════════════════════
@@ -713,61 +735,55 @@ class SingleDataset(Dataset):
         self.samples   = samples
         self.transform = T.Compose([T.Resize(img_side), T.ToTensor(),
                                     NormSingleROI(outchannels=1)])
+
     def __len__(self): return len(self.samples)
+
     def __getitem__(self, idx):
         path, label = self.samples[idx]
         return self.transform(Image.open(path).convert("L")), label
 
 
-class AugmentedDataset(Dataset):
-    def __init__(self, samples, img_side=128, augment_factor=1):
-        self.samples = samples; self.augment_factor = augment_factor
-        self.aug_transform = T.Compose([
-            T.Resize(img_side),
-            T.RandomChoice([
-                T.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
-                T.RandomResizedCrop(img_side, scale=(0.8,1.0), ratio=(1.0,1.0)),
-                T.RandomPerspective(distortion_scale=0.15, p=1),
-                T.RandomChoice([
-                    T.RandomRotation(10, interpolation=Image.BICUBIC,
-                                     expand=False, center=(0.5*img_side, 0.0)),
-                    T.RandomRotation(10, interpolation=Image.BICUBIC,
-                                     expand=False, center=(0.0, 0.5*img_side)),
-                ]),
-            ]),
-            T.ToTensor(), NormSingleROI(outchannels=1),
-        ])
-    def __len__(self): return len(self.samples) * self.augment_factor
-    def __getitem__(self, index):
-        real_idx = index % len(self.samples)
-        path, label = self.samples[real_idx]
-        return self.aug_transform(Image.open(path).convert("L")), label
-
-
 # ══════════════════════════════════════════════════════════════
-#  TRAINING
+#  TRAINING  (SF2Net triplet loss — unchanged from official)
 # ══════════════════════════════════════════════════════════════
 
-def run_one_epoch(model, loader, criterion, optimizer, device, phase):
+def run_one_epoch(model, loader, criterion, tl_criterion,
+                  optimizer, device, phase, ce_weight=0.7, tl_weight=0.3):
+    """CE + TripletLoss(SRT) composite loss."""
     is_train = (phase == "training")
     model.train() if is_train else model.eval()
     running_loss = 0.0; running_correct = 0; total = 0
     ctx = torch.enable_grad() if is_train else torch.no_grad()
     with ctx:
-        for data, target in loader:
-            data, target = data.to(device), target.to(device)
+        for datas, targets in loader:
+            anchor   = datas[0].to(device)
+            positive = datas[1].to(device)
+            negative = datas[2].to(device)
+            t_anchor = targets[0].to(device)
+            t_pos    = targets[1].to(device)
+            t_neg    = targets[2].to(device)
+
             if is_train: optimizer.zero_grad()
-            output = model(data, target if is_train else None)
-            loss   = criterion(output, target)
+
+            out_a, fe_a = model(anchor,   t_anchor if is_train else None)
+            out_p, fe_p = model(positive, t_pos    if is_train else None)
+            out_n, fe_n = model(negative, t_neg    if is_train else None)
+
+            ce_loss          = criterion(out_a, t_anchor)
+            tl_loss, _, _, _ = tl_criterion(out_a, out_p, out_n)
+            loss             = ce_weight * ce_loss + tl_weight * tl_loss
+
             if is_train: loss.backward(); optimizer.step()
-            running_loss    += loss.item() * data.size(0)
-            running_correct += output.data.max(1)[1].eq(target).sum().item()
-            total           += data.size(0)
+
+            running_loss    += loss.item() * anchor.size(0)
+            running_correct += out_a.data.max(1)[1].eq(t_anchor).sum().item()
+            total           += anchor.size(0)
+
     return running_loss / max(total, 1), 100.0 * running_correct / max(total, 1)
 
 
 # ══════════════════════════════════════════════════════════════
-#  EVALUATION
+#  EVALUATION  (cosine similarity, EER_all + EER_bal, argmax Rank-1)
 # ══════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -779,20 +795,30 @@ def extract_features(model, loader, device):
     return np.concatenate(feats), np.concatenate(labels)
 
 
-def compute_eer(scores_array):
+def _single_eer(genuine, impostor):
+    if genuine.mean() < impostor.mean():
+        genuine = -genuine; impostor = -impostor
+    y   = np.concatenate([np.ones(len(genuine)), np.zeros(len(impostor))])
+    s   = np.concatenate([genuine, impostor])
+    fpr, tpr, _ = roc_curve(y, s, pos_label=1)
+    return brentq(lambda x: 1.0 - x - interp1d(fpr, tpr)(x), 0.0, 1.0)
+
+
+def compute_eer(scores_array, n_trials=10, seed=42):
+    rng  = np.random.RandomState(seed)
     ins  = scores_array[scores_array[:, 1] ==  1, 0]
     outs = scores_array[scores_array[:, 1] == -1, 0]
-    if len(ins) == 0 or len(outs) == 0: return 1.0, 0.0
-    y   = np.concatenate([np.ones(len(ins)), np.zeros(len(outs))])
-    s   = np.concatenate([ins, outs])
-    fpr, tpr, thresholds = roc_curve(y, s, pos_label=1)
-    eer    = brentq(lambda x: 1.0 - x - interp1d(fpr, tpr)(x), 0.0, 1.0)
-    thresh = float(interp1d(fpr, thresholds)(eer))
-    return eer, thresh
+    if len(ins) == 0 or len(outs) == 0: return 1.0, 1.0
+    eer_all = _single_eer(ins.copy(), outs.copy())
+    n_imp   = min(len(ins), len(outs))
+    eers    = [_single_eer(ins.copy(), rng.choice(outs, size=n_imp, replace=False))
+               for _ in range(n_trials)]
+    return eer_all, float(np.mean(eers))
 
 
 def evaluate(model, probe_loader, gallery_loader, device,
              out_dir=".", tag="eval"):
+    """Cosine-similarity evaluation. Returns (eer_all, eer_bal, rank1)."""
     probe_feats,   probe_labels   = extract_features(model, probe_loader,   device)
     gallery_feats, gallery_labels = extract_features(model, gallery_loader, device)
     n_probe    = len(probe_feats)
@@ -804,8 +830,8 @@ def evaluate(model, probe_loader, gallery_loader, device,
             scores_list.append(float(sim_matrix[i, j]))
             labels_list.append(1 if probe_labels[i] == gallery_labels[j] else -1)
 
-    scores_arr = np.column_stack([scores_list, labels_list])
-    eer, _     = compute_eer(scores_arr)
+    scores_arr       = np.column_stack([scores_list, labels_list])
+    eer_all, eer_bal = compute_eer(scores_arr)
 
     nn_idx  = np.argmax(sim_matrix, axis=1)
     correct = sum(probe_labels[i] == gallery_labels[nn_idx[i]] for i in range(n_probe))
@@ -815,8 +841,9 @@ def evaluate(model, probe_loader, gallery_loader, device,
     with open(os.path.join(out_dir, f"scores_{tag}.txt"), "w") as f:
         for s, l in zip(scores_list, labels_list): f.write(f"{s} {l}\n")
 
-    print(f"  [{tag}]  EER={eer*100:.4f}%  Rank-1={rank1:.2f}%")
-    return eer, rank1
+    print(f"  [{tag}]  EER_all={eer_all*100:.4f}%  "
+          f"EER_bal={eer_bal*100:.4f}%  Rank-1={rank1:.2f}%")
+    return eer_all, eer_bal, rank1
 
 
 # ══════════════════════════════════════════════════════════════
@@ -825,6 +852,7 @@ def evaluate(model, probe_loader, gallery_loader, device,
 
 def run_experiment(train_samples, gallery_samples, probe_samples,
                    num_classes, cfg, results_dir, device):
+    """Train SF2Net and evaluate. Returns (final_eer_bal, final_rank1)."""
     os.makedirs(results_dir, exist_ok=True)
     rst_eval = os.path.join(results_dir, "eval")
     os.makedirs(rst_eval, exist_ok=True)
@@ -836,6 +864,13 @@ def run_experiment(train_samples, gallery_samples, probe_samples,
     nw             = cfg["num_workers"]
     eval_every     = cfg["eval_every"]
     save_every     = cfg["save_every"]
+    vit_floor_num  = cfg["vit_floor_num"]
+    cnn_vit_weight = cfg["cnn_vit_weight"]
+    dropout        = cfg["dropout"]
+    arcface_s      = cfg["arcface_s"]
+    arcface_m      = cfg["arcface_m"]
+    ce_weight      = cfg["ce_weight"]
+    tl_weight      = cfg["tl_weight"]
 
     train_loader = DataLoader(
         TripletDataset(train_samples, img_side, augment_factor),
@@ -847,67 +882,78 @@ def run_experiment(train_samples, gallery_samples, probe_samples,
         SingleDataset(probe_samples, img_side),
         batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True)
 
-    net = SF2Net(num_classes=num_classes, vit_floor_num=cfg["vit_floor_num"],
-                  weight=cfg["cnn_vit_weight"], dropout=cfg["dropout"],
-                  arcface_s=cfg["arcface_s"], arcface_m=cfg["arcface_m"])
+    # ── Model ─────────────────────────────────────────────────────────────
+    net = SF2Net(num_classes=num_classes, vit_floor_num=vit_floor_num,
+                 weight=cnn_vit_weight, dropout=dropout,
+                 arcface_s=arcface_s, arcface_m=arcface_m)
     net.to(device)
     if torch.cuda.device_count() > 1:
         net = DataParallel(net)
 
-    net = get_or_create_init_weights(net, num_classes,
-                                     cfg["base_results_dir"], device)
+    net = get_or_create_init_weights(
+        net, num_classes,
+        cache_dir = cfg["base_results_dir"],
+        device    = device)
 
     criterion    = nn.CrossEntropyLoss()
     tl_criterion = TripletLoss(distance="SRT")
-    optimizer = optim.Adam(net.parameters(), lr=cfg["lr"])
-    scheduler = lr_scheduler.StepLR(optimizer, cfg["lr_step"], cfg["lr_gamma"])
+    optimizer    = optim.Adam(net.parameters(), lr=cfg["lr"])
+    scheduler    = lr_scheduler.StepLR(optimizer, cfg["lr_step"], cfg["lr_gamma"])
 
+    # ── Pre-training baseline ─────────────────────────────────────────────
     _net = net.module if isinstance(net, DataParallel) else net
-    pre_eer, pre_r1 = evaluate(_net, probe_loader, gallery_loader,
-                                device, out_dir=rst_eval, tag="ep-001_pretrain")
-    best_eer = pre_eer; last_eer = pre_eer; last_rank1 = pre_r1
+    pre_eer_all, pre_eer_bal, pre_r1 = evaluate(
+        _net, probe_loader, gallery_loader,
+        device, out_dir=rst_eval, tag="ep-001_pretrain")
+    best_eer     = pre_eer_bal
+    last_eer_all = pre_eer_all; last_eer_bal = pre_eer_bal; last_rank1 = pre_r1
     torch.save(_net.state_dict(),
                os.path.join(results_dir, "net_params_best_eer.pth"))
 
     train_losses, train_accs = [], []
 
+    # ── Training loop ─────────────────────────────────────────────────────
     for epoch in range(num_epochs):
         t_loss, t_acc = run_one_epoch(
             net, train_loader, criterion, tl_criterion,
             optimizer, device, "training",
-            ce_weight=cfg["ce_weight"], tl_weight=cfg["tl_weight"])
+            ce_weight=ce_weight, tl_weight=tl_weight)
         scheduler.step()
         train_losses.append(t_loss); train_accs.append(t_acc)
         _net = net.module if isinstance(net, DataParallel) else net
 
         if (epoch % eval_every == 0 and epoch > 0) or epoch == num_epochs - 1:
-            cur_eer, cur_rank1 = evaluate(
+            cur_eer_all, cur_eer_bal, cur_rank1 = evaluate(
                 _net, probe_loader, gallery_loader,
                 device, out_dir=rst_eval, tag=f"ep{epoch:04d}")
-            last_eer, last_rank1 = cur_eer, cur_rank1
-            if cur_eer < best_eer:
-                best_eer = cur_eer
+            last_eer_all = cur_eer_all; last_eer_bal = cur_eer_bal
+            last_rank1   = cur_rank1
+            if cur_eer_bal < best_eer:
+                best_eer = cur_eer_bal
                 torch.save(_net.state_dict(),
                            os.path.join(results_dir, "net_params_best_eer.pth"))
-                print(f"  *** New best EER: {best_eer*100:.4f}% ***")
+                print(f"  *** New best EER_bal: {best_eer*100:.4f}% ***")
 
         if epoch % 10 == 0 or epoch == num_epochs - 1:
             ts = time.strftime("%H:%M:%S")
-            eer_str   = f"{last_eer*100:.4f}%"  if not math.isnan(last_eer)   else "N/A"
-            rank1_str = f"{last_rank1:.2f}%"     if not math.isnan(last_rank1) else "N/A"
+            eer_str = (f"EER_all={last_eer_all*100:.4f}% | "
+                       f"EER_bal={last_eer_bal*100:.4f}%"
+                       if not math.isnan(last_eer_all) else "N/A")
+            rank1_str = f"{last_rank1:.2f}%" if not math.isnan(last_rank1) else "N/A"
             print(f"  [{ts}] ep {epoch:04d} | loss={t_loss:.4f} | acc={t_acc:.2f}% | "
-                  f"EER={eer_str}  Rank-1={rank1_str}")
+                  f"{eer_str} | Rank-1={rank1_str}")
 
         if epoch % save_every == 0 or epoch == num_epochs - 1:
             torch.save(_net.state_dict(),
                        os.path.join(results_dir, "net_params.pth"))
 
+    # ── Final evaluation (best checkpoint) ────────────────────────────────
     best_path = os.path.join(results_dir, "net_params_best_eer.pth")
     if not os.path.exists(best_path):
         best_path = os.path.join(results_dir, "net_params.pth")
     eval_net = net.module if isinstance(net, DataParallel) else net
     eval_net.load_state_dict(torch.load(best_path, map_location=device))
-    final_eer, final_rank1 = evaluate(
+    final_eer_all, final_eer_bal, final_rank1 = evaluate(
         eval_net, probe_loader, gallery_loader,
         device, out_dir=rst_eval, tag="FINAL")
 
@@ -923,7 +969,7 @@ def run_experiment(train_samples, gallery_samples, probe_samples,
     except Exception:
         pass
 
-    return final_eer, final_rank1
+    return final_eer_bal, final_rank1
 
 
 # ══════════════════════════════════════════════════════════════
