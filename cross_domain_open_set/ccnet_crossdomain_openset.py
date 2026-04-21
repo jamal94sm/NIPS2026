@@ -421,14 +421,13 @@ def parse_setting_scanner(cond_paths, scanner_paths,
         for ident, paths in cond_dict.items():
             persp_all[ident].extend(paths)
 
-    all_persp_ids  = sorted(persp_all.keys())          # 190 IDs
-    scanner_ids    = sorted(scanner_paths.keys())       # 148 IDs
+    all_persp_ids = sorted(persp_all.keys())       # 190 IDs
+    scanner_ids   = sorted(scanner_paths.keys())   # 148 IDs
 
-    # Pick n_test IDs from scanner IDs to form the test set
-    n_test  = len(all_persp_ids) - int(len(all_persp_ids) * train_id_ratio)  # 38
-    rng_obj = random.Random(seed)
-    test_ids  = sorted(rng_obj.sample(scanner_ids, n_test))
-    train_ids = sorted(set(all_persp_ids) - set(test_ids))                   # 152
+    # Pick n_test from scanner IDs to form the test set
+    n_test    = len(all_persp_ids) - int(len(all_persp_ids) * train_id_ratio)  # 38
+    test_ids  = sorted(random.Random(seed).sample(scanner_ids, n_test))
+    train_ids = sorted(set(all_persp_ids) - set(test_ids))                     # 152
 
     train_label_map = {ident: i for i, ident in enumerate(train_ids)}
     test_label_map  = {ident: i for i, ident in enumerate(test_ids)}
@@ -559,6 +558,48 @@ def get_or_create_init_weights(net, num_classes, cache_dir, device):
 # ══════════════════════════════════════════════════════════════
 #  PYTORCH DATASETS
 # ══════════════════════════════════════════════════════════════
+
+class PairedDataset(Dataset):
+    """
+    CCNet training dataset: returns two augmented views of the same identity
+    for SupConLoss. Falls back to self-pairing when a class has only 1 sample.
+    """
+    def __init__(self, samples, img_side=128, augment_factor=1):
+        self.samples        = samples
+        self.augment_factor = augment_factor
+        self.label2idxs     = defaultdict(list)
+        for i, (_, lab) in enumerate(samples):
+            self.label2idxs[lab].append(i)
+        self.aug_transform = T.Compose([
+            T.Resize(img_side),
+            T.RandomChoice([
+                T.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
+                T.RandomResizedCrop(img_side, scale=(0.8,1.0), ratio=(1.0,1.0)),
+                T.RandomPerspective(distortion_scale=0.15, p=1),
+                T.RandomChoice([
+                    T.RandomRotation(10, expand=False,
+                                     center=(0.5*img_side, 0.0)),
+                    T.RandomRotation(10, expand=False,
+                                     center=(0.0, 0.5*img_side)),
+                ]),
+            ]),
+            T.ToTensor(), NormSingleROI(outchannels=1),
+        ])
+
+    def __len__(self): return len(self.samples) * self.augment_factor
+
+    def __getitem__(self, index):
+        real_idx     = index % len(self.samples)
+        path1, label = self.samples[real_idx]
+        idxs = self.label2idxs[label]
+        idx2 = real_idx
+        while idx2 == real_idx and len(idxs) > 1:
+            idx2 = random.choice(idxs)
+        path2 = self.samples[idx2][0]
+        img1  = self.aug_transform(Image.open(path1).convert("L"))
+        img2  = self.aug_transform(Image.open(path2).convert("L"))
+        return [img1, img2], label
+
 
 class SingleDataset(Dataset):
     def __init__(self, samples, img_side=128):
