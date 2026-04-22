@@ -352,7 +352,11 @@ def generate_all_splits(cond_paths, scanner_paths, train_id_ratio, seed):
         if not eligible_ids:
             print(f"  [WARN] No IDs with both '{cond_a}' and '{cond_b}' — skipping split")
             continue
-        train_ids, test_ids = _split_ids(eligible_ids, train_id_ratio, seed)
+        # n_test fixed at 20% of ALL perspective IDs, capped by eligible count
+        n_test    = len(all_persp_ids) - int(len(all_persp_ids) * train_id_ratio)
+        n_test    = min(n_test, len(eligible_ids))
+        test_ids  = sorted(_random.Random(seed).sample(eligible_ids, n_test))
+        train_ids = sorted(set(all_persp_ids) - set(test_ids))  # 190 - n_test
         key = f"S_{cond_a}_{cond_b}"
         splits[key] = {"train_ids": train_ids, "test_ids": test_ids}
 
