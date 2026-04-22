@@ -501,6 +501,10 @@ def parse_setting_paired_conditions(cond_a, cond_b, cond_paths, scanner_paths,
             gallery_samples.append((b_imgs[0], label))
             probe_samples.append((a_imgs[0], label))
 
+        # Fixed assignment: condition A always → gallery, condition B always → probe
+        #gallery_samples.append((a_imgs[0], label))
+        #probe_samples.append((b_imgs[0], label))
+
     _print_stats(
         f"S_{cond_a}_{cond_b} | Perspective (not {cond_a}/{cond_b}) + Scanner"
         f" -> {cond_a}/{cond_b}",
