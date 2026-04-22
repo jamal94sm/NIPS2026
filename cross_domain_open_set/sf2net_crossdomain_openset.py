@@ -78,10 +78,13 @@ PAIRED_CONDITIONS = [
     ("jf",   "pitch"),
     ("bf",   "far"),
     ("roll", "close"),
-    ("rnd",  "wet"),
+    ("far",  "jf"),
     ("fl",   "sf"),
     ("roll", "pitch"),
 ]
+
+# Shared splits file — all models load this to ensure identical train/test IDs
+SPLITS_FILE = "./palm_auth_openset_splits.json"
 # ==============================================================
 
 import os
@@ -532,14 +535,88 @@ def _gallery_probe_split(id2paths, label_map, gallery_ratio, rng):
 # ══════════════════════════════════════════════════════════════
 
 
-def parse_setting_scanner(cond_paths, scanner_paths,
-                          train_id_ratio, gallery_ratio, seed):
+# ══════════════════════════════════════════════════════════════
+#  TRAIN/TEST ID SPLIT PERSISTENCE
+# ══════════════════════════════════════════════════════════════
+
+def generate_all_splits(cond_paths, scanner_paths, train_id_ratio, seed):
     """
-    S_scanner — Perspective (train IDs) → Scanner (test IDs)
-    ──────────────────────────────────────────────────────────
-    1. From IDs that HAVE scanner data, select 38 (20% of 190) as test IDs.
-    2. Test  : scanner images for those 38 IDs → 50/50 gallery/probe
-    3. Train : the remaining 152 IDs (all perspective images, NO scanner)
+    Determine train/test ID splits for all 12 settings and return as a dict.
+    This is called once and saved to SPLITS_FILE so every model uses
+    identical splits for a fair comparison.
+    """
+    import random as _random
+
+    persp_all = defaultdict(list)
+    for cond_dict in cond_paths.values():
+        for ident, paths in cond_dict.items():
+            persp_all[ident].extend(paths)
+
+    all_persp_ids = sorted(persp_all.keys())
+    scanner_ids   = sorted(scanner_paths.keys())
+    n_test = len(all_persp_ids) - int(len(all_persp_ids) * train_id_ratio)
+
+    splits = {}
+
+    # S_scanner: test from scanner IDs, train = rest of all perspective IDs
+    test_ids  = sorted(_random.Random(seed).sample(scanner_ids, n_test))
+    train_ids = sorted(set(all_persp_ids) - set(test_ids))
+    splits["S_scanner"] = {"train_ids": train_ids, "test_ids": test_ids}
+
+    # S_scanner_to_persp: train = all scanner IDs, test = no-scanner perspective IDs
+    no_scanner_ids = sorted(set(all_persp_ids) - set(scanner_ids))
+    splits["S_scanner_to_persp"] = {
+        "train_ids": scanner_ids,
+        "test_ids" : no_scanner_ids,
+    }
+
+    # Paired-condition settings
+    for cond_a, cond_b in PAIRED_CONDITIONS:
+        paths_a = cond_paths.get(cond_a, {})
+        paths_b = cond_paths.get(cond_b, {})
+        eligible_ids = sorted(set(paths_a.keys()) & set(paths_b.keys()))
+        if not eligible_ids:
+            print(f"  [WARN] No IDs with both '{cond_a}' and '{cond_b}' — skipping split")
+            continue
+        # n_test fixed at 20% of ALL perspective IDs, capped by eligible count
+        n_test    = len(all_persp_ids) - int(len(all_persp_ids) * train_id_ratio)
+        n_test    = min(n_test, len(eligible_ids))
+        test_ids  = sorted(_random.Random(seed).sample(eligible_ids, n_test))
+        train_ids = sorted(set(all_persp_ids) - set(test_ids))  # 190 - n_test
+        key = f"S_{cond_a}_{cond_b}"
+        splits[key] = {"train_ids": train_ids, "test_ids": test_ids}
+
+    return splits
+
+
+def load_or_generate_splits(cond_paths, scanner_paths, train_id_ratio, seed):
+    """
+    Load splits from SPLITS_FILE if it exists; otherwise generate, save, and return them.
+    Prints a clear message so the user knows which path was taken.
+    """
+    if os.path.exists(SPLITS_FILE):
+        with open(SPLITS_FILE) as f:
+            splits = json.load(f)
+        print(f"  Loaded existing ID splits from: {SPLITS_FILE}")
+        # Print summary
+        for key, val in splits.items():
+            print(f"    {key:<30}  train={len(val['train_ids'])}  test={len(val['test_ids'])}")
+    else:
+        print(f"  Generating ID splits (seed={seed}) → {SPLITS_FILE}")
+        splits = generate_all_splits(cond_paths, scanner_paths, train_id_ratio, seed)
+        with open(SPLITS_FILE, "w") as f:
+            json.dump(splits, f, indent=2)
+        print(f"  Splits saved to: {SPLITS_FILE}")
+        for key, val in splits.items():
+            print(f"    {key:<30}  train={len(val['train_ids'])}  test={len(val['test_ids'])}")
+    return splits
+
+def parse_setting_scanner(cond_paths, scanner_paths,
+                          splits, gallery_ratio, seed):
+    """
+    S_scanner — uses pre-computed splits for fair cross-model comparison.
+    Train (80 %): ALL perspective images for train IDs
+    Test  (20 %): scanner images for test IDs → 50/50 gallery/probe
     """
     rng = random.Random(seed)
 
@@ -548,101 +625,80 @@ def parse_setting_scanner(cond_paths, scanner_paths,
         for ident, paths in cond_dict.items():
             persp_all[ident].extend(paths)
 
-    all_persp_ids = sorted(persp_all.keys())       # 190 IDs
-    scanner_ids   = sorted(scanner_paths.keys())   # 148 IDs
-
-    # Pick n_test from scanner IDs to form the test set
-    n_test    = len(all_persp_ids) - int(len(all_persp_ids) * train_id_ratio)  # 38
-    test_ids  = sorted(random.Random(seed).sample(scanner_ids, n_test))
-    train_ids = sorted(set(all_persp_ids) - set(test_ids))                     # 152
+    train_ids = splits["train_ids"]
+    test_ids  = splits["test_ids"]
 
     train_label_map = {ident: i for i, ident in enumerate(train_ids)}
     test_label_map  = {ident: i for i, ident in enumerate(test_ids)}
     num_train_cls   = len(train_ids)
 
-    # Train: perspective only for all 152 train IDs
     train_samples = _all_samples(
         {i: persp_all[i] for i in train_ids if i in persp_all},
         train_label_map)
 
-    # Test: scanner images for the 38 test IDs, 50/50 gallery/probe
     gallery_samples, probe_samples = _gallery_probe_split(
-        {i: scanner_paths[i] for i in test_ids},
+        {i: scanner_paths[i] for i in test_ids if i in scanner_paths},
         test_label_map, gallery_ratio, rng)
 
-    _print_stats("S_scanner | Perspective (train IDs) → Scanner (test IDs)",
+    _print_stats("S_scanner | Perspective (train IDs) -> Scanner (test IDs)",
                  len(train_ids), len(test_ids), len(train_samples),
                  len(gallery_samples), len(probe_samples))
     return train_samples, gallery_samples, probe_samples, num_train_cls
 
+
 def parse_setting_scanner_to_perspective(cond_paths, scanner_paths,
-                                         train_id_ratio, gallery_ratio, seed):
+                                         splits, gallery_ratio, seed):
     """
-    S_scanner_to_persp — Scanner (scanner IDs) → Perspective (no-scanner IDs)
-    ────────────────────────────────────────────────────────────────────────────
-    Train : ALL scanner images for IDs that HAVE scanner data
-    Test  : ALL perspective images for IDs that have NO scanner data
-            → 50/50 gallery/probe by samples
+    S_scanner_to_persp — uses pre-computed splits.
+    Train: ALL scanner images for scanner IDs
+    Test : ALL perspective images for no-scanner IDs → 50/50 gallery/probe
     """
     rng = random.Random(seed)
+
     persp_all = defaultdict(list)
     for cond_dict in cond_paths.values():
         for ident, paths in cond_dict.items():
             persp_all[ident].extend(paths)
 
-    scanner_ids    = sorted(scanner_paths.keys())
-    no_scanner_ids = sorted(set(persp_all.keys()) - set(scanner_ids))
+    train_ids = splits["train_ids"]   # scanner IDs
+    test_ids  = splits["test_ids"]    # no-scanner perspective IDs
 
-    if not no_scanner_ids:
-        raise ValueError("S_scanner_to_persp: every perspective ID also has scanner data!")
-
-    train_label_map = {ident: i for i, ident in enumerate(scanner_ids)}
-    test_label_map  = {ident: i for i, ident in enumerate(no_scanner_ids)}
-    num_train_cls   = len(scanner_ids)
+    train_label_map = {ident: i for i, ident in enumerate(train_ids)}
+    test_label_map  = {ident: i for i, ident in enumerate(test_ids)}
+    num_train_cls   = len(train_ids)
 
     train_samples = _all_samples(scanner_paths, train_label_map)
+
     gallery_samples, probe_samples = _gallery_probe_split(
-        {i: persp_all[i] for i in no_scanner_ids},
+        {i: persp_all[i] for i in test_ids if i in persp_all},
         test_label_map, gallery_ratio, rng)
 
-    _print_stats("S_scanner_to_persp | Scanner (all) → Perspective (no-scanner IDs)",
-                 len(scanner_ids), len(no_scanner_ids), len(train_samples),
+    _print_stats("S_scanner_to_persp | Scanner (all) -> Perspective (no-scanner IDs)",
+                 len(train_ids), len(test_ids), len(train_samples),
                  len(gallery_samples), len(probe_samples))
     return train_samples, gallery_samples, probe_samples, num_train_cls
 
 
 def parse_setting_paired_conditions(cond_a, cond_b, cond_paths, scanner_paths,
-                                    train_id_ratio, seed):
+                                    splits, seed):
     """
-    S_{A}_{B} — Paired-condition open-set
-    ──────────────────────────────────────
-    Eligible IDs: those that have at least one image in BOTH cond_A and cond_B.
-    Split 80/20 by ID:
-      Train (80 %): perspective (all except cond_A and cond_B) + scanner, train IDs only
-      Test  (20 %): one image from cond_A  → gallery
-                    one image from cond_B  → probe
-    Each test ID contributes exactly 1 gallery sample + 1 probe sample.
+    S_{A}_{B} — uses pre-computed splits for fair cross-model comparison.
+    Train: perspective (all except cond_A and cond_B) + scanner, train IDs only
+    Test : 1 image from cond_A -> gallery, 1 image from cond_B -> probe, test IDs only
     """
     rng = random.Random(seed)
 
     paths_a = cond_paths.get(cond_a, {})
     paths_b = cond_paths.get(cond_b, {})
-    if not paths_a:
-        raise ValueError(f"No images for condition '{cond_a}'")
-    if not paths_b:
-        raise ValueError(f"No images for condition '{cond_b}'")
 
-    eligible_ids = sorted(set(paths_a.keys()) & set(paths_b.keys()))
-    if not eligible_ids:
-        raise ValueError(f"No IDs have both '{cond_a}' and '{cond_b}' images")
-
-    train_ids, test_ids = _split_ids(eligible_ids, train_id_ratio, seed)
+    train_ids = splits["train_ids"]
+    test_ids  = splits["test_ids"]
 
     train_label_map = {ident: i for i, ident in enumerate(train_ids)}
     test_label_map  = {ident: i for i, ident in enumerate(test_ids)}
     num_train_cls   = len(train_ids)
 
-    # Train: all perspective except both test conditions + scanner, train IDs only
+    # Train: all perspective except both test conditions + scanner, train IDs
     train_samples = []
     for cond, cond_dict in cond_paths.items():
         if cond in (cond_a, cond_b):
@@ -654,15 +710,22 @@ def parse_setting_paired_conditions(cond_a, cond_b, cond_paths, scanner_paths,
         for p in scanner_paths.get(ident, []):
             train_samples.append((p, train_label_map[ident]))
 
-    # Test: 1 sample from cond_A → gallery, 1 sample from cond_B → probe
+    # Test: 1 sample from cond_A, 1 from cond_B, randomly assigned to gallery/probe
     gallery_samples = []
     probe_samples   = []
     for ident in test_ids:
-        label = test_label_map[ident]
-        a_imgs = list(paths_a[ident]); rng.shuffle(a_imgs)
-        b_imgs = list(paths_b[ident]); rng.shuffle(b_imgs)
-        gallery_samples.append((a_imgs[0], label))
-        probe_samples.append((b_imgs[0], label))
+        label  = test_label_map[ident]
+        a_imgs = list(paths_a.get(ident, [])); rng.shuffle(a_imgs)
+        b_imgs = list(paths_b.get(ident, [])); rng.shuffle(b_imgs)
+        if not a_imgs or not b_imgs:
+            continue
+        # Random assignment: coin flip decides which condition goes to gallery
+        if rng.random() < 0.5:
+            gallery_samples.append((a_imgs[0], label))
+            probe_samples.append((b_imgs[0], label))
+        else:
+            gallery_samples.append((b_imgs[0], label))
+            probe_samples.append((a_imgs[0], label))
 
     _print_stats(
         f"S_{cond_a}_{cond_b} | Perspective (not {cond_a}/{cond_b}) + Scanner"
@@ -1064,6 +1127,11 @@ def main():
     print(f"  Perspective conditions found : {sorted(cond_paths.keys())}")
     print(f"  Scanner identities found     : {len(scanner_paths)}")
 
+    # ── Load or generate shared ID splits ───────────────────────────────────
+    all_splits = load_or_generate_splits(
+        cond_paths, scanner_paths, train_ratio, seed)
+
+    # ── Build settings list ───────────────────────────────────────────────────
     SETTINGS = []
 
     SETTINGS.append({
@@ -1073,7 +1141,7 @@ def main():
         "test_desc"  : "Scanner (test IDs)",
         "parser"     : lambda: parse_setting_scanner(
                            cond_paths, scanner_paths,
-                           train_ratio, gallery_ratio, seed),
+                           all_splits["S_scanner"], gallery_ratio, seed),
     })
 
     SETTINGS.append({
@@ -1083,7 +1151,7 @@ def main():
         "test_desc"  : "Perspective (no-scanner IDs)",
         "parser"     : lambda: parse_setting_scanner_to_perspective(
                            cond_paths, scanner_paths,
-                           train_ratio, gallery_ratio, seed),
+                           all_splits["S_scanner_to_persp"], gallery_ratio, seed),
     })
 
     conditions_found = sorted(cond_paths.keys())
@@ -1092,6 +1160,10 @@ def main():
             print(f"  [WARN] '{cond_a}' or '{cond_b}' not found in data — skipping")
             continue
         ca, cb = cond_a, cond_b
+        split_key = f"S_{ca}_{cb}"
+        if split_key not in all_splits:
+            print(f"  [WARN] No split found for {split_key} — skipping")
+            continue
         SETTINGS.append({
             "tag"        : f"setting_{ca}_{cb}",
             "label"      : f"S_{ca}_{cb}",
@@ -1099,10 +1171,10 @@ def main():
             "test_desc"  : f"{ca}/{cb} (test IDs)",
             "parser"     : (lambda ca=ca, cb=cb: parse_setting_paired_conditions(
                                 ca, cb, cond_paths, scanner_paths,
-                                train_ratio, seed)),
+                                all_splits[f"S_{ca}_{cb}"], seed)),
         })
 
-    print(f"\n  Total settings to run : {len(SETTINGS)}")
+        print(f"\n  Total settings to run : {len(SETTINGS)}")
 
     all_results = []
 
