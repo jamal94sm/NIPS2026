@@ -1,29 +1,43 @@
 """
 CompNet — Cross-Domain Closed-Set Evaluations on Palm-Auth
-===========================================================
+==========================================================
 All evaluations follow a closed-set protocol: the same subject IDs
-appear in both train and test splits.
+appear in both train and test splits. Gallery and probe are both drawn
+from the TEST domain (not the training domain), split at the sample level.
 
-Settings
-────────
-  S1  │ Train : roi_perspective (all conditions)
-      │ Test  : roi_scanner
+Settings (12 total)
+────────────────────
+  S_scanner         │ Train : roi_perspective (all conditions, 190 IDs)
+                    │ Gallery: 50% of scanner samples  (148 shared IDs)
+                    │ Probe  : 50% of scanner samples  (148 shared IDs)
 
-  S2–S12  │ For each smartphone condition C:
-           │   Train : roi_perspective (all conditions except C) + roi_scanner
-           │   Test  : roi_perspective (condition C only)
+  S_scanner_to_persp│ Train : roi_scanner (148 IDs)
+                    │ Gallery: 50% of perspective samples (148 shared IDs)
+                    │ Probe  : 50% of perspective samples (148 shared IDs)
 
-Conditions handled:
-  bf | close | far | fl | jf | pitch | roll | rnd | sf | text | wet
-  ("rnd" groups rnd_1 … rnd_5 together)
+  S_(A,B) (×10)     │ Train : roi_perspective (all except A and B) + roi_scanner
+                    │ Gallery: ALL condition A images  (first test domain)
+                    │ Probe  : ALL condition B images  (second test domain)
+
+Paired conditions:
+  (wet,text) (wet,rnd) (rnd,text) (sf,roll) (jf,pitch)
+  (bf,far) (roll,close) (far,jf) (fl,sf) (roll,pitch)
 
 Scanner spectra kept: green | ir | yellow | pink | white
 
+Model / loss: CompNet — CE + ArcFace
+Matching metric: cosine similarity on normalised 512-d embeddings
+EER: EER (single)
+
+Gallery/probe splits for S_scanner and S_scanner_to_persp are saved to
+  palm_auth_closedset_splits.json on first run and reused by all models.
+
 Results saved to:
-  {BASE_RESULTS_DIR}/setting1/          ← S1 checkpoint scores + curves
-  {BASE_RESULTS_DIR}/setting_{C}/       ← one folder per condition
+  {BASE_RESULTS_DIR}/setting_scanner/
+  {BASE_RESULTS_DIR}/setting_{A}_{B}/
   {BASE_RESULTS_DIR}/results_summary.txt
 """
+
 
 # ==============================================================
 #  CONFIG
@@ -42,7 +56,7 @@ CONFIG = {
 
     # Training
     "batch_size"           : 128,
-    "num_epochs"           : 200,
+    "num_epochs"           : 300,
     "lr"                   : 0.001,
     "lr_step"              : 30,
     "lr_gamma"             : 0.8,
