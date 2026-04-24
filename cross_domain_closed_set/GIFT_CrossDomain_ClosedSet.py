@@ -82,7 +82,7 @@ PAIRED_CONDITIONS = [
 # Model
 BATCH_SIZE    = 32
 LR            = 1e-4
-WARMUP_EPOCHS = 10
+WARMUP_EPOCHS = 3
 EPOCHS        = 200
 EMB_DIM       = 128
 ARC_MARGIN    = 0.3
