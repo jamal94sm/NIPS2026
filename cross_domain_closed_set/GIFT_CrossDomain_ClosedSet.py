@@ -513,7 +513,8 @@ def get_loss_weights(epoch):
     if epoch < WARMUP_EPOCHS:
         return 0.0, 0.0
     ramp = min((epoch - WARMUP_EPOCHS) / 20.0, 1.0)
-    return ALPHA_FINAL * ramp, BETA_FINAL * ramp
+    #return ALPHA_FINAL * ramp, BETA_FINAL * ramp
+    return ALPHA_FINAL, BETA_FINAL
 
 
 def train_one_epoch(model, discriminators, criterion_arc,
