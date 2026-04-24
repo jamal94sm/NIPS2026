@@ -853,7 +853,7 @@ def run_experiment(train_samples, gallery_samples, probe_samples,
                 student, probe_loader, gallery_loader,
                 rst_eval, f"P2_ep{epoch:04d}")
             delta  = (p1_eer - cur_eer) * 100
-            marker = "  *** new best ***" if cur_eer < best_s2_eer else ""
+            marker = "  *** new best ***" if cur_rank1 > best_rank1 else ""
             log(f"  P2 ep {epoch:03d}/{S2_EPOCHS}  "
                 f"L={loss_t_m.avg:.4f} Ls={loss_s_m.avg:.4f} "
                 f"Lu={loss_u_m.avg:.4f} Ld={loss_d_m.avg:.4f}  "
