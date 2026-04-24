@@ -753,7 +753,7 @@ def run_experiment(train_samples, gallery_samples, probe_samples,
             cur_eer, cur_rank1 = evaluate(
                 teacher, probe_loader, gallery_loader,
                 rst_eval, f"P1_ep{epoch:04d}")
-            marker = "  *** new best ***" if cur_eer < best_eer else ""
+            marker = "  *** new best ***" if cur_rank1 > best_rank1 else ""
             log(f"  P1 ep {epoch:03d}/{S1_EPOCHS}  loss={loss_m.avg:.4f}"
                 f"  EER={cur_eer*100:.4f}%  Rank-1={cur_rank1:.2f}%{marker}")
             if cur_rank1 > best_rank1:
@@ -1010,3 +1010,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+  
