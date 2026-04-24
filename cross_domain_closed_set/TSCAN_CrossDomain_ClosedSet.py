@@ -102,7 +102,7 @@ S1_BATCH_SIZE    = 64
 S1_WARMUP_EPOCHS = 5
 
 # ── Stage 2 ───────────────────────────────────────────────────────────────────
-S2_EPOCHS        = 60
+S2_EPOCHS        = 1
 S2_LR_HEAD       = 1e-4
 S2_LR_LAYER4     = 1e-5
 S2_WEIGHT_DECAY  = 5e-4
