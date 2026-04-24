@@ -724,7 +724,7 @@ def run_experiment(train_samples, gallery_samples, probe_samples,
     s1_scheduler = make_warmup_cosine_scheduler(
         s1_optimizer, S1_WARMUP_EPOCHS, S1_EPOCHS)
 
-    best_eer      = float("inf")
+    best_rank1    = 0.0
     best_teacher  = None
     best_adaface  = None
     ckpt_path     = os.path.join(results_dir, "best_phase1.pt")
@@ -756,8 +756,8 @@ def run_experiment(train_samples, gallery_samples, probe_samples,
             marker = "  *** new best ***" if cur_eer < best_eer else ""
             log(f"  P1 ep {epoch:03d}/{S1_EPOCHS}  loss={loss_m.avg:.4f}"
                 f"  EER={cur_eer*100:.4f}%  Rank-1={cur_rank1:.2f}%{marker}")
-            if cur_eer < best_eer:
-                best_eer     = cur_eer
+            if cur_rank1 > best_rank1:
+                best_rank1   = cur_rank1
                 best_teacher = copy.deepcopy(teacher.state_dict())
                 best_adaface = copy.deepcopy(adaface.state_dict())
                 torch.save({"teacher": best_teacher, "adaface": best_adaface},
@@ -796,7 +796,7 @@ def run_experiment(train_samples, gallery_samples, probe_samples,
     s2_scheduler = make_warmup_cosine_scheduler(
         s2_optimizer, S2_WARMUP_EPOCHS, S2_EPOCHS)
 
-    best_s2_eer   = p1_eer
+    best_s2_rank1 = p1_rank1
     best_student  = copy.deepcopy(student.state_dict())
     ckpt_path_s2  = os.path.join(results_dir, "best_phase2.pt")
     total_steps   = len(s2_src_loader) * S2_EPOCHS
@@ -859,9 +859,9 @@ def run_experiment(train_samples, gallery_samples, probe_samples,
                 f"Lu={loss_u_m.avg:.4f} Ld={loss_d_m.avg:.4f}  "
                 f"EER={cur_eer*100:.4f}%  Rank-1={cur_rank1:.2f}%  "
                 f"ΔEER={delta:+.2f}%{marker}")
-            if cur_eer < best_s2_eer:
-                best_s2_eer  = cur_eer
-                best_student = copy.deepcopy(student.state_dict())
+            if cur_rank1 > best_s2_rank1:
+                best_s2_rank1 = cur_rank1
+                best_student  = copy.deepcopy(student.state_dict())
                 torch.save({"student": best_student}, ckpt_path_s2)
         else:
             if epoch % 10 == 0:
