@@ -82,7 +82,7 @@ PAIRED_CONDITIONS = [
 # Model
 BATCH_SIZE    = 32
 LR            = 1e-4
-WARMUP_EPOCHS = 3
+WARMUP_EPOCHS = 10
 EPOCHS        = 200
 EMB_DIM       = 128
 ARC_MARGIN    = 0.3
@@ -96,6 +96,7 @@ BETA_FINAL    = 10.0
 GAMMA         = 0.2
 
 # Training
+AUGMENT_FACTOR = 4   # repeat each training image N times with different augmentations
 EVAL_EVERY    = 5
 NUM_WORKERS   = 4
 GRAD_CLIP     = 1.0
@@ -135,9 +136,13 @@ IMAGENET_STD  = [0.5, 0.5, 0.5]
 
 def train_transform():
     return transforms.Compose([
-        transforms.Resize((112, 112)),
+        transforms.Resize((128, 128)),
+        transforms.RandomCrop(112),
         transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2),
+        transforms.RandomRotation(degrees=15),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2),
+        transforms.RandomGrayscale(p=0.1),
+        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),
         transforms.ToTensor(),
         transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
@@ -168,7 +173,12 @@ class PalmAuthDataset(Dataset):
         return self.transform(img), label
 
 
-def make_loader(samples, train=False, batch_size=32, shuffle=False):
+def make_loader(samples, train=False, batch_size=32, shuffle=False,
+              augment_factor=1):
+    # Repeat samples so each image is seen augment_factor times per epoch
+    # with a different random augmentation each time
+    if train and augment_factor > 1:
+        samples = samples * augment_factor
     ds = PalmAuthDataset(samples, train=train)
     return DataLoader(ds, batch_size=min(batch_size, len(ds)),
                       shuffle=shuffle, num_workers=NUM_WORKERS,
@@ -634,7 +644,8 @@ def run_experiment(train_samples, gallery_samples, probe_samples,
     os.makedirs(rst_eval, exist_ok=True)
 
     train_loader   = make_loader(train_samples,   train=True,
-                                 batch_size=BATCH_SIZE, shuffle=True)
+                                 batch_size=BATCH_SIZE, shuffle=True,
+                                 augment_factor=AUGMENT_FACTOR)
     gallery_loader = make_loader(gallery_samples, train=False, batch_size=128)
     probe_loader   = make_loader(probe_samples,   train=False, batch_size=128)
 
@@ -650,7 +661,7 @@ def run_experiment(train_samples, gallery_samples, probe_samples,
 
     optimizer = optim.RMSprop(
         list(model.parameters()) + list(criterion_arc.parameters()),
-        lr=LR, weight_decay=1e-4)
+        lr=LR, weight_decay=1e-3)
     opt_disc  = optim.RMSprop(discriminators.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer, step_size=30, gamma=0.1)
