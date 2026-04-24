@@ -82,11 +82,11 @@ PAIRED_CONDITIONS = [
 # Model
 BATCH_SIZE    = 32
 LR            = 1e-4
-WARMUP_EPOCHS = 10
+WARMUP_EPOCHS = 0
 EPOCHS        = 100
 EMB_DIM       = 128
-ARC_MARGIN    = 0.3
-ARC_SCALE     = 16
+ARC_MARGIN    = 0.4
+ARC_SCALE     = 20
 
 # Loss weights
 ALPHA_FINAL   = 15.0
@@ -139,7 +139,7 @@ def train_transform():
         transforms.Resize((128, 128)),
         transforms.RandomCrop(112),
         transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(degrees=15),
+        transforms.RandomRotation(degrees=5),
         transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2),
         transforms.RandomGrayscale(p=0.1),
         transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),
