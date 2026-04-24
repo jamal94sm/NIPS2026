@@ -94,7 +94,7 @@ ADAFACE_MMIN    = 0.25
 ADAFACE_S       = 32.0
 
 # ── Stage 1 ───────────────────────────────────────────────────────────────────
-S1_EPOCHS        = 100
+S1_EPOCHS        = 1
 S1_LR_HEAD       = 1e-3
 S1_LR_LAYER4     = 1e-4
 S1_WEIGHT_DECAY  = 5e-4
