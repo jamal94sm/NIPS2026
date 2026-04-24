@@ -129,12 +129,17 @@ def log(msg):
 # Palm-Auth images are RGB — loaded as-is with convert("RGB")
 # ─────────────────────────────────────────────────────────────────────────────
 
+IMAGENET_MEAN = [0.5, 0.5, 0.5]
+IMAGENET_STD  = [0.5, 0.5, 0.5]
+
+
 def train_transform():
     return transforms.Compose([
         transforms.Resize((112, 112)),
         transforms.RandomHorizontalFlip(),
         transforms.ColorJitter(brightness=0.2, contrast=0.2),
         transforms.ToTensor(),
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
 
 
@@ -142,6 +147,7 @@ def eval_transform():
     return transforms.Compose([
         transforms.Resize((112, 112)),
         transforms.ToTensor(),
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
 
 
