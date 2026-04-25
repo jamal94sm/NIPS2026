@@ -698,16 +698,6 @@ def main():
         cond_paths, scanner_paths, TEST_GALLERY_RATIO, SEED)
 
     SETTINGS = []
-    SETTINGS.append({"tag": "setting_scanner", "label": "S_scanner",
-                     "train_desc": "Perspective (all 190 IDs)",
-                     "test_desc": "Scanner 50/50 gallery/probe",
-                     "parser": lambda: parse_setting_scanner(
-                         cond_paths, scanner_paths, all_splits, SEED)})
-    SETTINGS.append({"tag": "setting_scanner_to_persp", "label": "S_scanner_to_persp",
-                     "train_desc": "Scanner (148 IDs)",
-                     "test_desc": "Perspective 50/50 gallery/probe",
-                     "parser": lambda: parse_setting_scanner_to_perspective(
-                         cond_paths, scanner_paths, all_splits, SEED)})
 
     conditions_found = sorted(cond_paths.keys())
     for cond_a, cond_b in PAIRED_CONDITIONS:
@@ -719,6 +709,20 @@ def main():
                          "test_desc": f"gallery:{ca} / probe:{cb}",
                          "parser": (lambda ca=ca, cb=cb: parse_setting_paired_conditions(
                              ca, cb, cond_paths, scanner_paths, SEED))})
+      
+    SETTINGS.append({"tag": "setting_scanner", "label": "S_scanner",
+                     "train_desc": "Perspective (all 190 IDs)",
+                     "test_desc": "Scanner 50/50 gallery/probe",
+                     "parser": lambda: parse_setting_scanner(
+                         cond_paths, scanner_paths, all_splits, SEED)})
+  
+    SETTINGS.append({"tag": "setting_scanner_to_persp", "label": "S_scanner_to_persp",
+                     "train_desc": "Scanner (148 IDs)",
+                     "test_desc": "Perspective 50/50 gallery/probe",
+                     "parser": lambda: parse_setting_scanner_to_perspective(
+                         cond_paths, scanner_paths, all_splits, SEED)})
+
+    
 
     log(f"\nTotal settings to run : {len(SETTINGS)}")
     all_results = []
