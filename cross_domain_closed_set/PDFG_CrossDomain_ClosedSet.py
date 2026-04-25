@@ -82,17 +82,17 @@ PAIRED_CONDITIONS = [
 ]
 
 FEATURE_DIM     = 128
-ARCFACE_S       = 64.0
-ARCFACE_M       = 0.5
+ARCFACE_S       = 20.0
+ARCFACE_M       = 0.3
 TRIPLET_MARGIN  = 0.4
 ALPHA           = 0.1
 BETA            = 1.0
 LAM             = 0.8
 
-BATCH_SIZE      = 8
+BATCH_SIZE      = 16
 LR              = 1e-4
-EPOCHS          = 200
-PRETRAIN_EPOCHS = 20
+EPOCHS          = 100
+PRETRAIN_EPOCHS = 30
 EVAL_EVERY      = 5
 
 SEED   = 42
