@@ -79,13 +79,13 @@ PAIRED_CONDITIONS = [
 BATCH_SIZE   = 32
 LR           = 1e-3
 WEIGHT_DECAY = 1e-4
-EPOCHS       = 100
+EPOCHS       = 200
 LAMB         = 0.2      # SupCon weight
 MARGIN       = 0.3      # ArcFace margin
 SCALE        = 16       # ArcFace scale
 EVAL_EVERY   = 5
 NUM_WORKERS  = 4
-IMG_SIZE     = 112
+IMG_SIZE     = 224
 SEED         = 42
 
 DEVICE   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -112,25 +112,27 @@ base_transform = transforms.Compose([
                          std=[0.229, 0.224, 0.225]),
 ])
 
-aug_transform = transforms.Compose([
-    transforms.Resize(IMG_SIZE),
-    transforms.RandomChoice([
-        transforms.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
-        transforms.RandomResizedCrop(IMG_SIZE, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
-        transforms.RandomPerspective(distortion_scale=0.15, p=1),
+def _make_aug():
+    """CompNet-style augmentation — one random transform picked each call."""
+    return transforms.Compose([
+        transforms.Resize(IMG_SIZE),
         transforms.RandomChoice([
-            transforms.RandomRotation(10, interpolation=Image.BICUBIC,
-                                      expand=False,
-                                      center=(int(0.5*IMG_SIZE), 0)),
-            transforms.RandomRotation(10, interpolation=Image.BICUBIC,
-                                      expand=False,
-                                      center=(0, int(0.5*IMG_SIZE))),
+            transforms.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
+            transforms.RandomResizedCrop(IMG_SIZE, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
+            transforms.RandomPerspective(distortion_scale=0.15, p=1),
+            transforms.RandomChoice([
+                transforms.RandomRotation(10, interpolation=Image.BICUBIC,
+                                          expand=False,
+                                          center=(int(0.5*IMG_SIZE), 0)),
+                transforms.RandomRotation(10, interpolation=Image.BICUBIC,
+                                          expand=False,
+                                          center=(0, int(0.5*IMG_SIZE))),
+            ]),
         ]),
-    ]),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225]),
-])
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -138,14 +140,25 @@ aug_transform = transforms.Compose([
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TrainDataset(Dataset):
-    """Returns (img_orig, img_aug, label) for training."""
+    """
+    Returns (img_orig, aug1, aug2, aug3, label) — 4× augmentation per image.
+    img_orig : base transform only (no augmentation)
+    aug1-3   : three independently sampled CompNet-style augmentations
+    In the training loop these are stacked into a 4× batch:
+      [orig | aug1 | aug2 | aug3]
+    so each original image is seen 4 times per epoch with different augmentations.
+    """
     def __init__(self, samples):
         self.samples = samples
     def __len__(self): return len(self.samples)
     def __getitem__(self, idx):
         path, label = self.samples[idx]
         img = Image.open(path).convert("RGB")
-        return base_transform(img), aug_transform(img), label
+        return (base_transform(img),
+                _make_aug()(img),
+                _make_aug()(img),
+                _make_aug()(img),
+                label)
 
 
 class EvalDataset(Dataset):
@@ -358,19 +371,10 @@ class ConvNeXtFinetune(nn.Module):
     def __init__(self):
         super().__init__()
         backbone = timm.create_model('convnextv2_tiny', pretrained=True, num_classes=0)
-
-        # Freeze entire backbone first
         for p in backbone.parameters(): p.requires_grad = False
-
-        # Unfreeze only the LAST block of stage 3 (reduces 15.49M → ~5M params)
-        n_blocks = len(backbone.stages[3].blocks)
-        for p in backbone.stages[3].blocks[n_blocks - 1].parameters():
-            p.requires_grad = True
-
-        # Always unfreeze final norm
+        for p in backbone.stages[3].parameters(): p.requires_grad = True
         if hasattr(backbone, 'norm'):
             for p in backbone.norm.parameters(): p.requires_grad = True
-
         self.backbone  = backbone
         self.embed_dim = backbone.num_features
 
@@ -483,16 +487,18 @@ def run_experiment(train_samples, gallery_samples, probe_samples,
         ep_loss = 0.0; ep_arc = 0.0; ep_con = 0.0
         ep_corr = 0;   ep_tot = 0
 
-        for img_orig, img_aug, y_i in train_loader:
+        for img_orig, aug1, aug2, aug3, y_i in train_loader:
             img_orig = img_orig.to(DEVICE)
-            img_aug  = img_aug.to(DEVICE)
+            aug1     = aug1.to(DEVICE)
+            aug2     = aug2.to(DEVICE)
+            aug3     = aug3.to(DEVICE)
             y_i      = y_i.to(DEVICE)
 
-            # Stack original + augmented → 2× batch
-            # original: no augmentation (stable anchor for ArcFace)
-            # augmented: CompNet-style random aug (positive view for SupCon)
-            imgs_all = torch.cat([img_orig, img_aug], dim=0)
-            y_all    = torch.cat([y_i, y_i], dim=0)
+            # Stack: original + 3 augmented views → 4× batch
+            # original: stable anchor (no augmentation)
+            # aug1-3  : three independently sampled CompNet-style augmentations
+            imgs_all = torch.cat([img_orig, aug1, aug2, aug3], dim=0)
+            y_all    = torch.cat([y_i, y_i, y_i, y_i], dim=0)
 
             optimizer.zero_grad()
             emb_all  = model(imgs_all)        # [2B, D]  L2-normalised
