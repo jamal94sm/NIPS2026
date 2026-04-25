@@ -9,24 +9,22 @@ Evaluation   : Cross-Domain Closed-Set (12 settings)
                gallery vs probe → EER + Rank-1
 Checkpoint   : saved by best Rank-1
 
-D1 / D2 split:
-  The training domain is always split 50/50 per identity (N=2 heads):
-    D1 = first half of each identity's images
-    D2 = second half of each identity's images
-  Fourier augmentation is applied between D1↔D2 during training.
-  At eval, extract_avg() averages both head features → single L2-norm vector.
+Fourier augmentation:
+  Within each training batch, a random permutation of batch indices provides
+  the "style" images for Fourier augmentation — no D1/D2 split needed.
+  N=1 head. At eval, extract_avg() → same as extract(x, 0) for N=1.
 
 Settings (12 total)
 ────────────────────
-  S_scanner         │ Train : perspective (all, 190 IDs) → D1/D2 split
+  S_scanner         │ Train : perspective (all, 190 IDs)
                     │ Gallery: 50% scanner (148 IDs)
                     │ Probe  : 50% scanner (148 IDs)
 
-  S_scanner_to_persp│ Train : scanner (148 IDs) → D1/D2 split
+  S_scanner_to_persp│ Train : scanner (148 IDs)
                     │ Gallery: 50% perspective (148 IDs)
                     │ Probe  : 50% perspective (148 IDs)
 
-  S_(A,B) (×10)     │ Train : perspective(¬A,¬B) + scanner → D1/D2 split
+  S_(A,B) (×10)     │ Train : perspective(¬A,¬B) + scanner
                     │ Gallery: ALL condition A images
                     │ Probe  : ALL condition B images
 
@@ -82,25 +80,33 @@ PAIRED_CONDITIONS = [
 ]
 
 FEATURE_DIM     = 128
-ARCFACE_S       = 20.0
-ARCFACE_M       = 0.3
+ARCFACE_S       = 32.0
+ARCFACE_M       = 0.35
 TRIPLET_MARGIN  = 0.4
 ALPHA           = 0.1
 BETA            = 1.0
 LAM             = 0.8
 
-BATCH_SIZE      = 16
+BATCH_SIZE      = 32
 LR              = 1e-4
 EPOCHS          = 100
-PRETRAIN_EPOCHS = 30
+PRETRAIN_EPOCHS = 20
 EVAL_EVERY      = 5
 
 SEED   = 42
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IMG_EXTS = {".jpg", ".jpeg", ".bmp", ".png"}
 
-# N=2 always: D1 and D2 from training domain split
+# N=2 heads: D1 and D2 are condition-based splits (same conditions for all IDs)
 N = 2
+
+# Conditions assigned to D1 and D2 — same split applied to all settings.
+# For scanner-only training (S_scanner_to_persp), scanner spectra are split
+# between D1 (D1_SCANNER_SPECTRA) and D2 (the rest).
+D1_CONDITIONS      = ["bf", "close", "far", "fl", "jf"]
+D2_CONDITIONS      = ["pitch", "roll", "rnd", "sf", "text", "wet"]
+D1_SCANNER_SPECTRA = {"green", "ir"}      # scanner spectra → D1
+D2_SCANNER_SPECTRA = {"yellow", "pink", "white"}  # scanner spectra → D2
 
 
 def set_seed(seed):
@@ -173,17 +179,56 @@ def _all_samples(id2paths, label_map):
             for p in paths]
 
 
-def _split_d1_d2(id2paths, label_map, seed):
-    """50/50 sample split per identity → D1 (first half) and D2 (second half)."""
-    rng = random.Random(seed)
+def _condition_split_d1_d2(cond_paths, scanner_paths, label_map, eligible_ids,
+                            exclude_conds=()):
+    """
+    Condition-based D1/D2 split: same conditions for all IDs.
+      D1 = images from D1_CONDITIONS (minus excluded test conditions)
+           + scanner images from D1_SCANNER_SPECTRA
+      D2 = images from D2_CONDITIONS (minus excluded test conditions)
+           + scanner images from D2_SCANNER_SPECTRA
+    """
     d1, d2 = [], []
-    for ident in sorted(id2paths.keys()):
-        paths = list(id2paths[ident])
-        rng.shuffle(paths)
-        half = max(1, len(paths) // 2)
-        for p in paths[:half]: d1.append((p, label_map[ident]))
-        for p in paths[half:]: d2.append((p, label_map[ident]))
+    for ident in eligible_ids:
+        lbl = label_map[ident]
+        for cond in D1_CONDITIONS:
+            if cond in exclude_conds: continue
+            for p in cond_paths.get(cond, {}).get(ident, []):
+                d1.append((p, lbl))
+        for cond in D2_CONDITIONS:
+            if cond in exclude_conds: continue
+            for p in cond_paths.get(cond, {}).get(ident, []):
+                d2.append((p, lbl))
+        for p in scanner_paths.get(ident, []):
+            # Split scanner by spectra
+            fname = os.path.basename(p)
+            parts = os.path.splitext(fname)[0].split("_")
+            spec  = parts[2].lower() if len(parts) >= 3 else ""
+            if spec in D1_SCANNER_SPECTRA:
+                d1.append((p, lbl))
+            else:
+                d2.append((p, lbl))
     return d1, d2
+
+
+def _scanner_split_d1_d2(scanner_paths, label_map, eligible_ids):
+    """
+    For scanner-only training (S_scanner_to_persp):
+    Split scanner images by spectra into D1 and D2.
+    """
+    d1, d2 = [], []
+    for ident in eligible_ids:
+        lbl = label_map[ident]
+        for p in scanner_paths.get(ident, []):
+            fname = os.path.basename(p)
+            parts = os.path.splitext(fname)[0].split("_")
+            spec  = parts[2].lower() if len(parts) >= 3 else ""
+            if spec in D1_SCANNER_SPECTRA:
+                d1.append((p, lbl))
+            else:
+                d2.append((p, lbl))
+    return d1, d2
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -257,8 +302,8 @@ def parse_setting_scanner(cond_paths, scanner_paths, stored_splits, seed):
     scanner_ids     = sorted(scanner_paths.keys())
     train_label_map = {ident: i for i, ident in enumerate(all_persp_ids)}
     test_label_map  = {ident: i for i, ident in enumerate(scanner_ids)}
-    d1, d2 = _split_d1_d2(
-        {i: persp_all[i] for i in all_persp_ids}, train_label_map, seed)
+    d1, d2 = _condition_split_d1_d2(
+        cond_paths, {}, train_label_map, all_persp_ids, exclude_conds=())
     gallery, probe = _gallery_probe_split_from_stored(
         {i: scanner_paths[i] for i in scanner_ids}, test_label_map,
         stored_splits["S_scanner"])
@@ -275,7 +320,7 @@ def parse_setting_scanner_to_perspective(cond_paths, scanner_paths, stored_split
     scanner_ids     = sorted(scanner_paths.keys())
     train_label_map = {ident: i for i, ident in enumerate(scanner_ids)}
     test_label_map  = {ident: i for i, ident in enumerate(scanner_ids)}
-    d1, d2 = _split_d1_d2(dict(scanner_paths), train_label_map, seed)
+    d1, d2 = _scanner_split_d1_d2(scanner_paths, train_label_map, scanner_ids)
     gallery, probe = _gallery_probe_split_from_stored(
         {i: persp_all[i] for i in scanner_ids}, test_label_map,
         stored_splits["S_scanner_to_persp"])
@@ -298,7 +343,10 @@ def parse_setting_paired_conditions(cond_a, cond_b, cond_paths, scanner_paths, s
             train_id2paths[ident].extend(cond_dict.get(ident, []))
     for ident in eligible_ids:
         train_id2paths[ident].extend(scanner_paths.get(ident, []))
-    d1, d2  = _split_d1_d2(train_id2paths, label_map, seed)
+    # D1/D2 condition-based split — exclude test conditions from both groups
+    d1, d2 = _condition_split_d1_d2(
+        cond_paths, scanner_paths, label_map, eligible_ids,
+        exclude_conds=(cond_a, cond_b))
     gallery = _all_samples({i: paths_a[i] for i in eligible_ids}, label_map)
     probe   = _all_samples({i: paths_b[i] for i in eligible_ids}, label_map)
     _print_stats(f"S_{cond_a}_{cond_b}", len(eligible_ids), len(eligible_ids),
@@ -309,7 +357,8 @@ def parse_setting_paired_conditions(cond_a, cond_b, cond_paths, scanner_paths, s
 def _print_stats(name, n_train, n_test, d1_n, d2_n, gallery_n, probe_n):
     log(f"  [{name}]")
     log(f"    Train IDs / Test IDs : {n_train} / {n_test}")
-    log(f"    D1 / D2              : {d1_n} / {d2_n}")
+    log(f"    D1 ({','.join(D1_CONDITIONS)}) : {d1_n}")
+    log(f"    D2 ({','.join(D2_CONDITIONS)}) : {d2_n}")
     log(f"    Gallery / Probe      : {gallery_n} / {probe_n}")
 
 
@@ -499,6 +548,10 @@ class _Inf:
 
 def run_experiment(d1_samples, d2_samples, gallery_samples, probe_samples,
                    num_classes, results_dir):
+    """
+    N=2 heads trained on condition-based D1 and D2.
+    Fourier augmentation mixes images from D1 with style from D2 and vice versa.
+    """
     os.makedirs(results_dir, exist_ok=True)
     rst_eval = os.path.join(results_dir, "eval"); os.makedirs(rst_eval, exist_ok=True)
 
@@ -590,7 +643,7 @@ def run_experiment(d1_samples, d2_samples, gallery_samples, probe_samples,
                         sty = sty[torch.randint(sty.size(0), (src_imgs.size(0),), device=DEVICE)]
                     aug[(i,j)] = (fourier_augment_batch(src_imgs, sty, LAM), src_lbl)
             optimizer.zero_grad()
-            loss       = torch.tensor(0.0, device=DEVICE)
+            loss = torch.tensor(0.0, device=DEVICE)
             orig_feats = []
             for i, (src_imgs, src_lbl) in enumerate(batches):
                 feat  = model.extract(src_imgs, i)
@@ -682,7 +735,9 @@ def main():
     log("=" * 72)
     log(f"PDFG — Cross-Domain Closed-Set (Palm-Auth)")
     log(f"Device  : {DEVICE}")
-    log(f"N heads : {N}  (D1 and D2 from training domain 50/50 split)")
+    log(f"N heads : {N}  (condition-based D1/D2 split)")
+    log(f"D1 conds: {D1_CONDITIONS}")
+    log(f"D2 conds: {D2_CONDITIONS}")
     log(f"Epochs  : Pretrain={PRETRAIN_EPOCHS}  Main={EPOCHS}")
     log(f"Settings: 2 scanner + {len(PAIRED_CONDITIONS)} paired-condition")
     log(f"Results : {SAVE_DIR}")
@@ -698,6 +753,16 @@ def main():
         cond_paths, scanner_paths, TEST_GALLERY_RATIO, SEED)
 
     SETTINGS = []
+    SETTINGS.append({"tag": "setting_scanner", "label": "S_scanner",
+                     "train_desc": "Perspective (all 190 IDs)",
+                     "test_desc": "Scanner 50/50 gallery/probe",
+                     "parser": lambda: parse_setting_scanner(
+                         cond_paths, scanner_paths, all_splits, SEED)})
+    SETTINGS.append({"tag": "setting_scanner_to_persp", "label": "S_scanner_to_persp",
+                     "train_desc": "Scanner (148 IDs)",
+                     "test_desc": "Perspective 50/50 gallery/probe",
+                     "parser": lambda: parse_setting_scanner_to_perspective(
+                         cond_paths, scanner_paths, all_splits, SEED)})
 
     conditions_found = sorted(cond_paths.keys())
     for cond_a, cond_b in PAIRED_CONDITIONS:
@@ -709,20 +774,6 @@ def main():
                          "test_desc": f"gallery:{ca} / probe:{cb}",
                          "parser": (lambda ca=ca, cb=cb: parse_setting_paired_conditions(
                              ca, cb, cond_paths, scanner_paths, SEED))})
-      
-    SETTINGS.append({"tag": "setting_scanner", "label": "S_scanner",
-                     "train_desc": "Perspective (all 190 IDs)",
-                     "test_desc": "Scanner 50/50 gallery/probe",
-                     "parser": lambda: parse_setting_scanner(
-                         cond_paths, scanner_paths, all_splits, SEED)})
-  
-    SETTINGS.append({"tag": "setting_scanner_to_persp", "label": "S_scanner_to_persp",
-                     "train_desc": "Scanner (148 IDs)",
-                     "test_desc": "Perspective 50/50 gallery/probe",
-                     "parser": lambda: parse_setting_scanner_to_perspective(
-                         cond_paths, scanner_paths, all_splits, SEED)})
-
-    
 
     log(f"\nTotal settings to run : {len(SETTINGS)}")
     all_results = []
