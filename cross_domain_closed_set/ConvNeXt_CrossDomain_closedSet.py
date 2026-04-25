@@ -79,13 +79,13 @@ PAIRED_CONDITIONS = [
 BATCH_SIZE   = 32
 LR           = 1e-3
 WEIGHT_DECAY = 1e-4
-EPOCHS       = 200
+EPOCHS       = 100
 LAMB         = 0.2      # SupCon weight
 MARGIN       = 0.3      # ArcFace margin
 SCALE        = 16       # ArcFace scale
 EVAL_EVERY   = 5
 NUM_WORKERS  = 4
-IMG_SIZE     = 224
+IMG_SIZE     = 112
 SEED         = 42
 
 DEVICE   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -358,10 +358,19 @@ class ConvNeXtFinetune(nn.Module):
     def __init__(self):
         super().__init__()
         backbone = timm.create_model('convnextv2_tiny', pretrained=True, num_classes=0)
+
+        # Freeze entire backbone first
         for p in backbone.parameters(): p.requires_grad = False
-        for p in backbone.stages[3].parameters(): p.requires_grad = True
+
+        # Unfreeze only the LAST block of stage 3 (reduces 15.49M → ~5M params)
+        n_blocks = len(backbone.stages[3].blocks)
+        for p in backbone.stages[3].blocks[n_blocks - 1].parameters():
+            p.requires_grad = True
+
+        # Always unfreeze final norm
         if hasattr(backbone, 'norm'):
             for p in backbone.norm.parameters(): p.requires_grad = True
+
         self.backbone  = backbone
         self.embed_dim = backbone.num_features
 
