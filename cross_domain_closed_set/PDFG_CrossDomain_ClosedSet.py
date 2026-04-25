@@ -696,7 +696,7 @@ def run_experiment(d1_samples, d2_samples, gallery_samples, probe_samples,
         elif (epoch + 1) % (EVAL_EVERY // 2) == 0:
             log(f"  P2 ep {epoch+1:03d}/{EPOCHS}  loss={ll['total']:.4f}  acc={avg_acc:.2f}%")
 
-    ckpt = torch.load(ckpt_path, map_location=DEVICE)
+    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
     model.load_state_dict(ckpt["model"])
     final_eer, final_rank1 = evaluate(model, gal_loader, prb_loader, rst_eval, "FINAL")
     log(f"  Best Rank-1={best_rank1:.2f}%  Final: EER={final_eer*100:.4f}%  Rank-1={final_rank1:.2f}%")
