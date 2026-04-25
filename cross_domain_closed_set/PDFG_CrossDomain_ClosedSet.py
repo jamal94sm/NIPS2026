@@ -89,7 +89,7 @@ LAM             = 0.8
 
 BATCH_SIZE      = 32
 LR              = 1e-4
-EPOCHS          = 100
+EPOCHS          = 200
 PRETRAIN_EPOCHS = 20
 EVAL_EVERY      = 5
 
@@ -103,10 +103,10 @@ N = 2
 # Conditions assigned to D1 and D2 — same split applied to all settings.
 # For scanner-only training (S_scanner_to_persp), scanner spectra are split
 # between D1 (D1_SCANNER_SPECTRA) and D2 (the rest).
-D1_CONDITIONS      = ["bf", "close", "far", "fl", "jf"]
-D2_CONDITIONS      = ["pitch", "roll", "rnd", "sf", "text", "wet"]
-D1_SCANNER_SPECTRA = {"green", "ir"}      # scanner spectra → D1
-D2_SCANNER_SPECTRA = {"yellow", "pink", "white"}  # scanner spectra → D2
+D1_CONDITIONS      = ["bf", "close", "far", "fl", "jf", "roll"]
+D2_CONDITIONS      = ["pitch", "rnd", "sf", "text", "wet"]
+D1_SCANNER_SPECTRA = {"white", "ir"}      # scanner spectra → D1
+D2_SCANNER_SPECTRA = {"yellow", "pink", "green"}  # scanner spectra → D2
 
 
 def set_seed(seed):
