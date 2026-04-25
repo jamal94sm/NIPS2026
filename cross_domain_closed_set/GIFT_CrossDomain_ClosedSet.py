@@ -698,7 +698,7 @@ def run_experiment(train_samples, gallery_samples, probe_samples,
                 log(f"  *** New best Rank-1: {best_rank1:.2f}% ***")
 
     # Reload best checkpoint for final reported result
-    ckpt = torch.load(ckpt_path, map_location=DEVICE)
+    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
     model.load_state_dict(ckpt["model"])
     final_eer, final_rank1 = evaluate(
         model, probe_loader, gallery_loader, rst_eval, "FINAL")
