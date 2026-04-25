@@ -58,42 +58,34 @@ set_seed(SEED)
 # AUGMENTATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-general_aug = transforms.Compose([
-    transforms.RandomResizedCrop(size=224, scale=(0.9, 1.0), ratio=(0.95, 1.05)),
-    transforms.RandomAffine(degrees=10, translate=(0.05, 0.05)),
-    transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0, hue=0),
-    transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.2),
-    transforms.RandomApply([transforms.RandomAdjustSharpness(sharpness_factor=2.0)], p=0.2),
-    transforms.RandomApply([transforms.RandomAutocontrast()], p=0.2),
-])
+IMG_SIZE = 224
 
-to_tensor = transforms.Compose([
-    transforms.Resize((224, 224)),
+base_transform = transforms.Compose([
+    transforms.Resize(IMG_SIZE),
     transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225]),
 ])
 
-
-def label_guided_fft_mixup(x, labels):
-    """Label-guided FFT amplitude mixup (from original code)."""
-    B, C, H, W = x.shape
-    fft = torch.fft.fft2(x, dim=(-2, -1))
-    amp, pha = torch.abs(fft), torch.angle(fft)
-    amp_shifted = torch.fft.fftshift(amp, dim=(-2, -1))
-
-    sorted_idx    = torch.argsort(labels)
-    target_idx    = torch.roll(sorted_idx, shifts=B // 2, dims=0)
-    amp_trg       = amp_shifted[target_idx]
-    beta          = np.random.uniform(0.01, 0.20)
-    b             = int(np.floor(np.amin((H, W)) * beta))
-    c_h, c_w      = H // 2, W // 2
-
-    if b > 0:
-        amp_shifted[..., c_h-b:c_h+b, c_w-b:c_w+b] = \
-            amp_trg[..., c_h-b:c_h+b, c_w-b:c_w+b]
-
-    amp_mixed = torch.fft.ifftshift(amp_shifted, dim=(-2, -1))
-    result    = torch.fft.ifft2(amp_mixed * torch.exp(1j * pha), dim=(-2, -1)).real
-    return torch.clamp(result, 0, 1)
+aug_transform = transforms.Compose([
+    transforms.Resize(IMG_SIZE),
+    transforms.RandomChoice([
+        transforms.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
+        transforms.RandomResizedCrop(IMG_SIZE, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
+        transforms.RandomPerspective(distortion_scale=0.15, p=1),
+        transforms.RandomChoice([
+            transforms.RandomRotation(10, interpolation=Image.BICUBIC,
+                                      expand=False,
+                                      center=(int(0.5*IMG_SIZE), 0)),
+            transforms.RandomRotation(10, interpolation=Image.BICUBIC,
+                                      expand=False,
+                                      center=(0, int(0.5*IMG_SIZE))),
+        ]),
+    ]),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225]),
+])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,6 +111,8 @@ print(f"Shared identity space: {num_total_classes} identities")
 class CASIADataset(Dataset):
     """
     Training  : returns (img_orig, img_aug, label)
+                img_orig = base transform (no augmentation)
+                img_aug  = CompNet-style random augmentation
     Inference : returns (img_orig, label)
     """
     def __init__(self, data_path, domains, label_map, train=True):
@@ -145,11 +139,9 @@ class CASIADataset(Dataset):
     def __getitem__(self, idx):
         path, label = self.samples[idx]
         img = Image.open(path).convert("RGB")
-        img_orig = to_tensor(img)
         if self.train:
-            img_aug = to_tensor(general_aug(img))
-            return img_orig, img_aug, label
-        return img_orig, label
+            return base_transform(img), aug_transform(img), label
+        return base_transform(img), label
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -230,25 +222,25 @@ def extract_embeddings(model, loader):
 
 
 @torch.no_grad()
-def evaluate(model, reg_loader, qry_loader, epoch):
-    reg_feats, reg_labels = extract_embeddings(model, reg_loader)
-    qry_feats, qry_labels = extract_embeddings(model, qry_loader)
+def evaluate(model, gal_loader, prb_loader, epoch):
+    gal_feats, gal_labels = extract_embeddings(model, gal_loader)
+    prb_feats, prb_labels = extract_embeddings(model, prb_loader)
 
-    sim    = torch.mm(qry_feats, reg_feats.t())
+    sim    = torch.mm(prb_feats, gal_feats.t())
     nn_idx = sim.argmax(dim=1)
-    acc    = (reg_labels[nn_idx] == qry_labels).float().mean().item() * 100
+    acc    = (gal_labels[nn_idx] == prb_labels).float().mean().item() * 100
 
     sim_np = sim.numpy()
     gen_scores, imp_scores = [], []
-    for i in range(len(qry_labels)):
-        for j in range(len(reg_labels)):
+    for i in range(len(prb_labels)):
+        for j in range(len(gal_labels)):
             s = sim_np[i, j]
-            if qry_labels[i] == reg_labels[j]: gen_scores.append(s)
+            if prb_labels[i] == gal_labels[j]: gen_scores.append(s)
             else:                               imp_scores.append(s)
     eer = compute_eer(gen_scores, imp_scores)
 
-    print(f"\n  ┌─ Epoch {epoch} | reg={TRAIN_DOMAINS} ({len(reg_labels)}) "
-          f"| query={TEST_DOMAINS[0]} ({len(qry_labels)})")
+    print(f"\n  ┌─ Epoch {epoch} | gallery={len(gal_labels)} "
+          f"| probe={len(prb_labels)} | domain={TEST_DOMAINS[0]}")
     print(f"  │  Rank-1 : {acc:6.2f}%")
     print(f"  │  EER    : {eer:5.2f}%")
     print(f"  └{'─'*55}")
@@ -265,19 +257,42 @@ def main():
     print(f"Epochs: {EPOCHS}   LR: {LR}   λ_SupCon: {LAMB}\n")
 
     # ── Datasets ──────────────────────────────────────────────────────────────
-    train_ds = CASIADataset(DATA_PATH, TRAIN_DOMAINS, shared_label_map, train=True)
-    reg_ds   = CASIADataset(DATA_PATH, TRAIN_DOMAINS, shared_label_map, train=False)
-    qry_ds   = CASIADataset(DATA_PATH, TEST_DOMAINS,  shared_label_map, train=False)
+    # ── Collect test-domain samples, split per-ID 50/50 into gallery/probe ──
+    test_ds_all = CASIADataset(DATA_PATH, TEST_DOMAINS, shared_label_map, train=False)
+    by_id = {}
+    for path, label in test_ds_all.samples:
+        by_id.setdefault(label, []).append(path)
 
+    rng = random.Random(SEED)
+    gallery_samples, probe_samples = [], []
+    for label, paths in sorted(by_id.items()):
+        paths = list(paths); rng.shuffle(paths)
+        n_gal = max(1, len(paths) // 2)
+        n_gal = min(n_gal, len(paths) - 1) if len(paths) > 1 else n_gal
+        for p in paths[:n_gal]: gallery_samples.append((p, label))
+        for p in paths[n_gal:]: probe_samples.append((p, label))
+
+    class _SampleDataset(Dataset):
+        def __init__(self, samples):
+            self.samples = samples
+        def __len__(self): return len(self.samples)
+        def __getitem__(self, idx):
+            path, label = self.samples[idx]
+            return base_transform(Image.open(path).convert("RGB")), label
+
+    train_ds     = CASIADataset(DATA_PATH, TRAIN_DOMAINS, shared_label_map, train=True)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
-    reg_loader   = DataLoader(reg_ds,   batch_size=BATCH_SIZE, shuffle=False,
-                              num_workers=NUM_WORKERS, pin_memory=True)
-    qry_loader   = DataLoader(qry_ds,   batch_size=BATCH_SIZE, shuffle=False,
-                              num_workers=NUM_WORKERS, pin_memory=True)
+    gal_loader   = DataLoader(_SampleDataset(gallery_samples), batch_size=BATCH_SIZE,
+                              shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    prb_loader   = DataLoader(_SampleDataset(probe_samples),   batch_size=BATCH_SIZE,
+                              shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
 
-    print(f"Train images : {len(train_ds)}")
-    print(f"Reg   images : {len(reg_ds)}   Query images: {len(qry_ds)}")
+    print(f"Train images   : {len(train_ds)}")
+    print(f"Gallery images : {len(gallery_samples)}   "
+          f"Probe images: {len(probe_samples)}")
+    print(f"Test IDs       : {len(by_id)}")
+
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model   = ConvNeXtFinetune().to(DEVICE)
@@ -316,21 +331,20 @@ def main():
             img_aug  = img_aug.to(DEVICE)
             y_i      = y_i.to(DEVICE)
 
-            # FFT mixup on original images
-            img_fft  = label_guided_fft_mixup(img_orig, y_i)
-
-            # Stack: original + spatial aug + FFT aug  (3× per sample)
-            imgs_all = torch.cat([img_orig, img_aug, img_fft], dim=0)
-            y_all    = torch.cat([y_i, y_i, y_i], dim=0)
+            # Stack: original + augmented  (2× per sample)
+            # img_orig: no augmentation (base transform only)
+            # img_aug : CompNet-style random augmentation
+            imgs_all = torch.cat([img_orig, img_aug], dim=0)
+            y_all    = torch.cat([y_i, y_i], dim=0)
 
             optimizer.zero_grad()
-            emb_all  = model(imgs_all)         # [3B, D]  L2-normalised
-            proj_all = proj(emb_all)           # [3B, 128]
+            emb_all  = model(imgs_all)    # [2B, D]  L2-normalised
+            proj_all = proj(emb_all)      # [2B, 128]
 
             # ArcFace on all views
             loss_arc = criterion_arc(emb_all, y_all)
 
-            # SupCon on projected embeddings
+            # SupCon on projected embeddings — original and aug form a positive pair
             loss_con = criterion_supcon(proj_all, y_all)
 
             loss = loss_arc + LAMB * loss_con
@@ -356,7 +370,7 @@ def main():
               f"con={ep_con/n:.4f}  train_acc={avg_acc:.2f}%")
 
         if epoch % EVAL_EVERY == 0 or epoch == EPOCHS:
-            acc, eer = evaluate(model, reg_loader, qry_loader, epoch)
+            acc, eer = evaluate(model, gal_loader, prb_loader, epoch)
             if acc > best_rank1:
                 best_rank1 = acc
                 torch.save({"epoch": epoch, "model": model.state_dict(),
