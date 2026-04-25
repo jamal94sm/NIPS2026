@@ -90,7 +90,7 @@ ARC_SCALE     = 20
 
 # Loss weights
 ALPHA_FINAL   = 1.0 # 15
-BETA_FINAL    = 10.0 # 10
+BETA_FINAL    = 20.0 # 10
 
 # FSM
 GAMMA         = 0.2
