@@ -79,13 +79,13 @@ PAIRED_CONDITIONS = [
 BATCH_SIZE   = 32
 LR           = 1e-3
 WEIGHT_DECAY = 1e-4
-EPOCHS       = 200
+EPOCHS       = 100
 LAMB         = 0.2      # SupCon weight
 MARGIN       = 0.3      # ArcFace margin
 SCALE        = 16       # ArcFace scale
 EVAL_EVERY   = 5
 NUM_WORKERS  = 4
-IMG_SIZE     = 224
+IMG_SIZE     = 112
 SEED         = 42
 
 DEVICE   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
