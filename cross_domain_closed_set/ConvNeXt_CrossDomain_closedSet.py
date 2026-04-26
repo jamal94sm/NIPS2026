@@ -597,7 +597,22 @@ def main():
         cond_paths, scanner_paths, TEST_GALLERY_RATIO, SEED)
 
     SETTINGS = []
-
+  
+    conditions_found = sorted(cond_paths.keys())
+    for cond_a, cond_b in PAIRED_CONDITIONS:
+        if cond_a not in conditions_found or cond_b not in conditions_found:
+            log(f"  [WARN] '{cond_a}' or '{cond_b}' not found — skipping")
+            continue
+        ca, cb = cond_a, cond_b
+        SETTINGS.append({
+            "tag"        : f"setting_{ca}_{cb}",
+            "label"      : f"S_{ca}_{cb}",
+            "train_desc" : f"Perspective(not {ca}/{cb}) + Scanner",
+            "test_desc"  : f"gallery:{ca} / probe:{cb}",
+            "parser"     : (lambda ca=ca, cb=cb: parse_setting_paired_conditions(
+                                ca, cb, cond_paths, scanner_paths, SEED)),
+        })
+      
     SETTINGS.append({
         "tag"        : "setting_scanner",
         "label"      : "S_scanner",
@@ -615,20 +630,7 @@ def main():
                            cond_paths, scanner_paths, all_splits, SEED),
     })
 
-    conditions_found = sorted(cond_paths.keys())
-    for cond_a, cond_b in PAIRED_CONDITIONS:
-        if cond_a not in conditions_found or cond_b not in conditions_found:
-            log(f"  [WARN] '{cond_a}' or '{cond_b}' not found — skipping")
-            continue
-        ca, cb = cond_a, cond_b
-        SETTINGS.append({
-            "tag"        : f"setting_{ca}_{cb}",
-            "label"      : f"S_{ca}_{cb}",
-            "train_desc" : f"Perspective(not {ca}/{cb}) + Scanner",
-            "test_desc"  : f"gallery:{ca} / probe:{cb}",
-            "parser"     : (lambda ca=ca, cb=cb: parse_setting_paired_conditions(
-                                ca, cb, cond_paths, scanner_paths, SEED)),
-        })
+    
 
     log(f"\nTotal settings to run : {len(SETTINGS)}")
     all_results = []
