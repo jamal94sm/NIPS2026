@@ -1,0 +1,501 @@
+"""
+model_comparison.py
+===================
+Compares all biometric models on:
+  - Total parameters
+  - Trainable parameters
+  - FLOPs for a single 1×C×112×112 inference
+
+Models: CompNet, PPNet, CCNet, CO3Net, SF2Net,
+        PalmBridge (CompNet backbone), ConvNeXt, DINOv2
+
+Run on the server:
+    python model_comparison.py
+"""
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import timm
+from fvcore.nn import FlopCountAnalysis, parameter_count_table
+
+DEVICE = torch.device("cpu")   # FLOPs measured on CPU
+
+
+# ══════════════════════════════════════════════════════════════
+#  SHARED COMPONENTS
+# ══════════════════════════════════════════════════════════════
+
+# ── CompNet / PalmBridge Gabor backbone ───────────────────────
+
+class LearnableGaborLayer(nn.Module):
+    def __init__(self, num_filters=32, kernel_size=15):
+        super().__init__()
+        n = num_filters; ks = kernel_size
+        self.theta = nn.Parameter(torch.linspace(0.0, math.pi, n + 1)[:-1])
+        self.sigma = nn.Parameter(torch.full((n,), 3.0))
+        self.lambd = nn.Parameter(torch.full((n,), 6.0))
+        self.psi   = nn.Parameter(torch.zeros(n))
+        self.gamma = nn.Parameter(torch.full((n,), 0.5))
+        half = ks // 2
+        ys = torch.arange(-half, half + 1, dtype=torch.float32)
+        xs = torch.arange(-half, half + 1, dtype=torch.float32)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+        self.register_buffer("xx", xx)
+        self.register_buffer("yy", yy)
+        self.ks = ks
+
+    def _build_filters(self):
+        theta = self.theta
+        sigma = self.sigma.abs().clamp(min=0.5)
+        lambd = self.lambd.abs().clamp(min=1.0)
+        psi   = self.psi
+        gamma = self.gamma.abs().clamp(min=0.1)
+        xx = self.xx.unsqueeze(0); yy = self.yy.unsqueeze(0)
+        cos_t = torch.cos(theta).view(-1, 1, 1)
+        sin_t = torch.sin(theta).view(-1, 1, 1)
+        sigma = sigma.view(-1, 1, 1); lambd = lambd.view(-1, 1, 1)
+        psi   = psi.view(-1, 1, 1);   gamma = gamma.view(-1, 1, 1)
+        x_rot =  xx * cos_t + yy * sin_t
+        y_rot = -xx * sin_t + yy * cos_t
+        envelope = torch.exp(-(x_rot**2 + gamma**2 * y_rot**2) / (2.0 * sigma**2))
+        kernel   = envelope * torch.cos(2.0 * math.pi * x_rot / lambd + psi)
+        kernel   = kernel - kernel.mean(dim=(1, 2), keepdim=True)
+        return kernel.unsqueeze(1).contiguous()
+
+    def forward(self, x):
+        return F.conv2d(x, self._build_filters(), padding=self.ks // 2)
+
+
+class CompetitivePool(nn.Module):
+    def forward(self, x):
+        out, _ = x.abs().max(dim=1, keepdim=True)
+        return out
+
+
+class CompNetBackbone(nn.Module):
+    """Shared backbone for CompNet and PalmBridge."""
+    def __init__(self, feature_dim=512):
+        super().__init__()
+        self.gabor   = LearnableGaborLayer()
+        self.compete = CompetitivePool()
+        self.gbn     = nn.BatchNorm2d(1)
+
+        def _block(cin, cout):
+            return nn.Sequential(
+                nn.Conv2d(cin,  cout, 3, padding=1, bias=False),
+                nn.BatchNorm2d(cout), nn.ReLU(inplace=True),
+                nn.Conv2d(cout, cout, 3, padding=1, bias=False),
+                nn.BatchNorm2d(cout), nn.ReLU(inplace=True),
+            )
+
+        self.block1 = _block(1,   32);  self.pool1 = nn.MaxPool2d(2)
+        self.block2 = _block(32,  64);  self.pool2 = nn.MaxPool2d(2)
+        self.block3 = _block(64,  128); self.pool3 = nn.MaxPool2d(2)
+        self.block4 = _block(128, 256); self.gap   = nn.AdaptiveAvgPool2d((4, 4))
+        self.embed  = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(256 * 4 * 4, feature_dim, bias=False),
+            nn.BatchNorm1d(feature_dim),
+        )
+
+    def forward(self, x):
+        g = F.relu(self.gabor(x))
+        g = self.gbn(self.compete(g))
+        f = self.pool1(self.block1(g))
+        f = self.pool2(self.block2(f))
+        f = self.pool3(self.block3(f))
+        f = self.gap(self.block4(f))
+        return F.normalize(self.embed(f), p=2, dim=1)
+
+
+# ══════════════════════════════════════════════════════════════
+#  COMPNET
+# ══════════════════════════════════════════════════════════════
+
+class CompNet(nn.Module):
+    def __init__(self, num_classes=190, feature_dim=512):
+        super().__init__()
+        self.backbone = CompNetBackbone(feature_dim)
+
+    def forward(self, x):
+        return self.backbone(x)
+
+
+# ══════════════════════════════════════════════════════════════
+#  PPNET  (CE + Contrastive, L2 distance matching)
+# ══════════════════════════════════════════════════════════════
+
+class PPNet(nn.Module):
+    def __init__(self, num_classes=190, feature_dim=512):
+        super().__init__()
+        self.gabor   = LearnableGaborLayer()
+        self.compete = CompetitivePool()
+        self.gbn     = nn.BatchNorm2d(1)
+
+        def _block(cin, cout):
+            return nn.Sequential(
+                nn.Conv2d(cin,  cout, 3, padding=1, bias=False),
+                nn.BatchNorm2d(cout), nn.ReLU(inplace=True),
+                nn.Conv2d(cout, cout, 3, padding=1, bias=False),
+                nn.BatchNorm2d(cout), nn.ReLU(inplace=True),
+            )
+
+        self.block1 = _block(1,   32);  self.pool1 = nn.MaxPool2d(2)
+        self.block2 = _block(32,  64);  self.pool2 = nn.MaxPool2d(2)
+        self.block3 = _block(64,  128); self.pool3 = nn.MaxPool2d(2)
+        self.block4 = _block(128, 256); self.gap   = nn.AdaptiveAvgPool2d((4, 4))
+        self.embed  = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(256 * 4 * 4, feature_dim, bias=False),
+            nn.BatchNorm1d(feature_dim),
+        )
+        self.l2_reg = nn.Linear(feature_dim, feature_dim)
+
+    def forward(self, x):
+        g = F.relu(self.gabor(x))
+        g = self.gbn(self.compete(g))
+        f = self.pool1(self.block1(g))
+        f = self.pool2(self.block2(f))
+        f = self.pool3(self.block3(f))
+        f = self.gap(self.block4(f))
+        z = self.embed(f)
+        return z   # L2 distance used at eval
+
+
+# ══════════════════════════════════════════════════════════════
+#  CCNET / CO3NET  (Gabor Competitive Block)
+# ══════════════════════════════════════════════════════════════
+
+class GaborConv2d(nn.Module):
+    def __init__(self, ch_in, ch_out, ksize, stride=1, padding=0, init_ratio=1.):
+        super().__init__()
+        r = init_ratio
+        self.ch_in = ch_in; self.ch_out = ch_out
+        self.ksize  = ksize; self.stride = stride; self.padding = padding
+        self.gamma  = nn.Parameter(torch.FloatTensor([2.0]))
+        self.sigma  = nn.Parameter(torch.FloatTensor([9.2 * r]))
+        self.theta  = nn.Parameter(
+            torch.arange(ch_out).float() * math.pi / ch_out, requires_grad=False)
+        self.f      = nn.Parameter(torch.FloatTensor([0.057 / r]))
+        self.psi    = nn.Parameter(torch.FloatTensor([0.0]), requires_grad=False)
+
+    def _build_bank(self):
+        xm  = self.ksize // 2
+        rng = torch.arange(-xm, xm + 1).float()
+        y   = rng.view(1, -1).repeat(self.ch_out, self.ch_in, self.ksize, 1)
+        x   = rng.view(-1, 1).repeat(self.ch_out, self.ch_in, 1, self.ksize)
+        x   = x.to(self.sigma.device); y = y.to(self.sigma.device)
+        th  = self.theta.view(-1, 1, 1, 1)
+        xt  =  x * torch.cos(th) + y * torch.sin(th)
+        yt  = -x * torch.sin(th) + y * torch.cos(th)
+        gb  = -torch.exp(
+            -0.5 * ((self.gamma * xt) ** 2 + yt ** 2)
+            / (8 * self.sigma.view(-1, 1, 1, 1) ** 2)
+        ) * torch.cos(2 * math.pi * self.f.view(-1, 1, 1, 1) * xt
+                      + self.psi.view(-1, 1, 1, 1))
+        return gb - gb.mean(dim=[2, 3], keepdim=True)
+
+    def forward(self, x):
+        return F.conv2d(x, self._build_bank(), stride=self.stride, padding=self.padding)
+
+
+class SELayer(nn.Module):
+    def __init__(self, ch):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc   = nn.Sequential(
+            nn.Linear(ch, ch, bias=False), nn.ReLU(inplace=True),
+            nn.Linear(ch, ch, bias=False), nn.Sigmoid())
+    def forward(self, x):
+        b, c, _, _ = x.shape
+        return x * self.fc(self.pool(x).view(b, c)).view(b, c, 1, 1)
+
+
+class CompetitiveBlock(nn.Module):
+    def __init__(self, ch_in, n_comp, ksize, weight=0.8, init_ratio=1., o1=32):
+        super().__init__()
+        nc2 = n_comp * 2; nc4 = n_comp * 4
+        self.g1 = GaborConv2d(ch_in, n_comp, ksize, 2, ksize // 2, init_ratio)
+        self.g2 = GaborConv2d(nc2, nc2, ksize, 2, ksize // 2, init_ratio)
+        if ksize == 35:
+            self.c1a = nn.Conv2d(ch_in,  n_comp, 7, 1, 0)
+            self.c1b = nn.Conv2d(n_comp, n_comp, 5, 2, 5)
+            self.c2a = nn.Conv2d(nc2,    nc2,    7, 1, 0)
+            self.c2b = nn.Conv2d(nc2,    nc2,    5, 2, 5)
+        elif ksize == 17:
+            self.c1a = nn.Conv2d(ch_in,  n_comp, 5, 1, 0)
+            self.c1b = nn.Conv2d(n_comp, n_comp, 3, 2, 3)
+            self.c2a = nn.Conv2d(nc2,    nc2,    5, 1, 0)
+            self.c2b = nn.Conv2d(nc2,    nc2,    3, 2, 3)
+        else:
+            self.c1a = nn.Conv2d(ch_in,  n_comp, 3, 1, 0)
+            self.c1b = nn.Conv2d(n_comp, n_comp, 1, 2, 1)
+            self.c2a = nn.Conv2d(nc2,    nc2,    3, 1, 0)
+            self.c2b = nn.Conv2d(nc2,    nc2,    1, 2, 1)
+        self.sm_c = nn.Softmax(dim=1)
+        self.sm_h = nn.Softmax(dim=2)
+        self.sm_w = nn.Softmax(dim=3)
+        self.se1  = SELayer(nc2); self.se2 = SELayer(nc4)
+        self.ppu1 = nn.Conv2d(nc2, o1 // 2, 5, 2, 0)
+        self.ppu2 = nn.Conv2d(nc4, o1 // 2, 5, 2, 0)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.wc   = weight; self.ws = (1. - weight) / 2.
+
+    def _compete(self, x):
+        return self.wc * self.sm_c(x) + self.ws * (self.sm_h(x) + self.sm_w(x))
+
+    def forward(self, x):
+        f  = torch.cat([self.g1(x), self.c1b(self.c1a(x))], dim=1)
+        x1 = self.pool(self.ppu1(self.se1(self._compete(f))))
+        f  = torch.cat([self.g2(f), self.c2b(self.c2a(f))], dim=1)
+        x2 = self.pool(self.ppu2(self.se2(self._compete(f))))
+        return torch.cat([x1.flatten(1), x2.flatten(1)], dim=1)
+
+
+class CCNet(nn.Module):
+    """1-channel input, feature_dim=2048."""
+    def __init__(self, num_classes=190):
+        super().__init__()
+        self.cb1 = CompetitiveBlock(1, 9, 35, 0.8, 1.00)
+        self.cb2 = CompetitiveBlock(1, 36, 17, 0.8, 0.50)
+        self.cb3 = CompetitiveBlock(1, 9,  7, 0.8, 0.25)
+        self.fc  = nn.Linear(13152, 2048)
+        self.bn  = nn.BatchNorm1d(2048)
+
+    def forward(self, x):
+        f = torch.cat([self.cb1(x), self.cb2(x), self.cb3(x)], dim=1)
+        return F.normalize(self.bn(self.fc(f)), p=2, dim=1)
+
+
+class CO3Net(nn.Module):
+    """Same architecture as CCNet."""
+    def __init__(self, num_classes=190):
+        super().__init__()
+        self.cb1 = CompetitiveBlock(1, 9, 35, 0.8, 1.00)
+        self.cb2 = CompetitiveBlock(1, 36, 17, 0.8, 0.50)
+        self.cb3 = CompetitiveBlock(1, 9,  7, 0.8, 0.25)
+        self.fc  = nn.Linear(13152, 2048)
+        self.bn  = nn.BatchNorm1d(2048)
+
+    def forward(self, x):
+        f = torch.cat([self.cb1(x), self.cb2(x), self.cb3(x)], dim=1)
+        return F.normalize(self.bn(self.fc(f)), p=2, dim=1)
+
+
+# ══════════════════════════════════════════════════════════════
+#  SF2NET  (Gabor + Triplet, 1024-d)
+# ══════════════════════════════════════════════════════════════
+
+class SF2Net(nn.Module):
+    def __init__(self, num_classes=190, feature_dim=1024):
+        super().__init__()
+        self.gabor   = LearnableGaborLayer()
+        self.compete = CompetitivePool()
+        self.gbn     = nn.BatchNorm2d(1)
+
+        def _block(cin, cout):
+            return nn.Sequential(
+                nn.Conv2d(cin,  cout, 3, padding=1, bias=False),
+                nn.BatchNorm2d(cout), nn.ReLU(inplace=True),
+                nn.Conv2d(cout, cout, 3, padding=1, bias=False),
+                nn.BatchNorm2d(cout), nn.ReLU(inplace=True),
+            )
+
+        self.block1 = _block(1,   64);  self.pool1 = nn.MaxPool2d(2)
+        self.block2 = _block(64,  128); self.pool2 = nn.MaxPool2d(2)
+        self.block3 = _block(128, 256); self.pool3 = nn.MaxPool2d(2)
+        self.block4 = _block(256, 512); self.gap   = nn.AdaptiveAvgPool2d((4, 4))
+        self.embed  = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(512 * 4 * 4, feature_dim, bias=False),
+            nn.BatchNorm1d(feature_dim),
+        )
+
+    def forward(self, x):
+        g = F.relu(self.gabor(x))
+        g = self.gbn(self.compete(g))
+        f = self.pool1(self.block1(g))
+        f = self.pool2(self.block2(f))
+        f = self.pool3(self.block3(f))
+        f = self.gap(self.block4(f))
+        return F.normalize(self.embed(f), p=2, dim=1)
+
+
+# ══════════════════════════════════════════════════════════════
+#  PALMBRIDGE  (CompNet backbone + codebook)
+# ══════════════════════════════════════════════════════════════
+
+class PalmBridgeModel(nn.Module):
+    """CompNet backbone only — codebook is separate (not counted in inference)."""
+    def __init__(self, feature_dim=512, num_pb_vectors=512):
+        super().__init__()
+        self.backbone = CompNetBackbone(feature_dim)
+        # PalmBridge codebook P ∈ R^{K×D}
+        self.P = nn.Parameter(
+            F.normalize(torch.randn(num_pb_vectors, feature_dim), p=2, dim=1))
+        self.W_ORI = 0.7; self.W_MAP = 0.3
+
+    def forward(self, x):
+        z = self.backbone(x)
+        # Nearest-vector lookup (argmin L2)
+        dists   = (z.pow(2).sum(1, keepdim=True)
+                   + self.P.pow(2).sum(1).unsqueeze(0)
+                   - 2.0 * (z @ self.P.t()))
+        z_tilde = self.P[dists.argmin(dim=1)]
+        return F.normalize(self.W_ORI * z + self.W_MAP * z_tilde, p=2, dim=1)
+
+
+# ══════════════════════════════════════════════════════════════
+#  CONVNEXT
+# ══════════════════════════════════════════════════════════════
+
+class ConvNeXtModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone  = timm.create_model('convnextv2_tiny', pretrained=False, num_classes=0)
+        self.embed_dim = self.backbone.num_features
+
+    def forward(self, x):
+        return F.normalize(self.backbone(x), p=2, dim=1)
+
+
+# ══════════════════════════════════════════════════════════════
+#  DINOV2
+# ══════════════════════════════════════════════════════════════
+
+class DINOv2Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone  = torch.hub.load(
+            'facebookresearch/dinov2', 'dinov2_vits14', verbose=False)
+        self.embed_dim = 384
+
+    def forward(self, x):
+        out = self.backbone.forward_features(x)
+        return F.normalize(out["x_norm_clstoken"], p=2, dim=1)
+
+
+# ══════════════════════════════════════════════════════════════
+#  ANALYSIS
+# ══════════════════════════════════════════════════════════════
+
+def count_params(model):
+    total     = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+
+def count_flops(model, input_tensor):
+    """Return GFLOPs for a single forward pass."""
+    try:
+        model.eval()
+        flops = FlopCountAnalysis(model, input_tensor)
+        flops.unsupported_ops_warnings(False)
+        flops.uncalled_modules_warnings(False)
+        return flops.total() / 1e9   # GFLOPs
+    except Exception as e:
+        print(f"    [FLOP count failed: {e}]")
+        return float("nan")
+
+
+def fmt_params(n):
+    if n >= 1e6: return f"{n/1e6:.2f} M"
+    if n >= 1e3: return f"{n/1e3:.1f} K"
+    return str(n)
+
+
+def run():
+    # All models evaluated on 224×224 input
+    # Grayscale models: 1×224×224
+    # RGB models (ConvNeXt, DINOv2): 3×224×224
+    x1  = torch.zeros(1, 1, 224, 224)   # grayscale 224×224
+    x3  = torch.zeros(1, 3, 224, 224)   # RGB 224×224
+
+    MODELS = [
+        ("CompNet",              lambda: CompNet(),         x1),
+        ("PPNet",                lambda: PPNet(),           x1),
+        ("CCNet",                lambda: CCNet(),           x1),
+        ("CO3Net",               lambda: CO3Net(),          x1),
+        ("SF2Net",               lambda: SF2Net(),          x1),
+        ("PalmBridge",           lambda: PalmBridgeModel(), x1),
+        ("ConvNeXtV2-Tiny",      lambda: ConvNeXtModel(),  x3),
+        ("DINOv2 ViT-S/14",     lambda: DINOv2Model(),    x3),
+    ]
+
+    col = {"model": 20, "total": 12, "trainable": 14, "flops": 10, "input": 16, "feat": 8}
+    header = (f"{'Model':<{col['model']}}"
+              f"{'Total Params':>{col['total']}}"
+              f"{'Trainable':>{col['trainable']}}"
+              f"{'GFLOPs':>{col['flops']}}"
+              f"{'Input size':>{col['input']}}"
+              f"{'Feat dim':>{col['feat']}}")
+    sep = "─" * len(header)
+
+    print("\n" + "=" * len(header))
+    print("Model Comparison — Parameters & FLOPs (single sample, input 224×224)")
+    print("=" * len(header))
+    print(header)
+    print(sep)
+
+    results = []
+    for name, build_fn, x in MODELS:
+        print(f"  Analysing {name} ...", flush=True)
+        try:
+            model = build_fn().to(DEVICE).eval()
+            total, trainable = count_params(model)
+            gflops           = count_flops(model, x)
+
+            with torch.no_grad():
+                out = model(x)
+            feat_dim = out.shape[-1]
+
+            c, h, w = x.shape[1], x.shape[2], x.shape[3]
+            input_str = f"{c}×{h}×{w}"
+
+            results.append({
+                "name": name, "total": total, "trainable": trainable,
+                "gflops": gflops, "input": input_str, "feat": feat_dim,
+            })
+
+            gflops_str = f"{gflops:.3f}" if not math.isnan(gflops) else "N/A"
+            print(f"  {'':2}{name:<{col['model']-2}}"
+                  f"{fmt_params(total):>{col['total']}}"
+                  f"{fmt_params(trainable):>{col['trainable']}}"
+                  f"{gflops_str:>{col['flops']}}"
+                  f"{input_str:>{col['input']}}"
+                  f"{feat_dim:>{col['feat']}}")
+
+        except Exception as e:
+            print(f"  ERROR — {name}: {e}")
+
+    print(sep)
+
+    # Save to txt
+    out_path = "model_comparison.txt"
+    with open(out_path, "w") as f:
+        f.write("Model Comparison — Parameters & FLOPs (input 224×224)\n")
+        f.write(sep + "\n")
+        f.write(header + "\n")
+        f.write(sep + "\n")
+        for r in results:
+            gflops_str = f"{r['gflops']:.3f}" if not math.isnan(r['gflops']) else "N/A"
+            f.write(f"{r['name']:<{col['model']}}"
+                    f"{fmt_params(r['total']):>{col['total']}}"
+                    f"{fmt_params(r['trainable']):>{col['trainable']}}"
+                    f"{gflops_str:>{col['flops']}}"
+                    f"{r['input']:>{col['input']}}"
+                    f"{r['feat']:>{col['feat']}}\n")
+        f.write(sep + "\n")
+        f.write("\nNotes:\n")
+        f.write("  - GFLOPs measured for a single sample (batch=1)\n")
+        f.write("  - Grayscale models (CompNet/PPNet/CCNet/CO3Net/SF2Net/PalmBridge): input 1×112×112\n")
+        f.write("  - RGB models (ConvNeXt/DINOv2): input 3×112×112 / 3×224×224\n")
+        f.write("  - DINOv2 requires input size multiple of patch_size=14 → 224×224\n")
+        f.write("  - PalmBridge includes codebook P ∈ R^{512×512} in parameter count\n")
+    print(f"\nTable saved to: {out_path}")
+
+
+if __name__ == "__main__":
+    run()
