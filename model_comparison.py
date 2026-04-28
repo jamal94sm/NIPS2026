@@ -4,7 +4,7 @@ model_comparison.py
 Compares all biometric models on:
   - Total parameters
   - Trainable parameters
-  - FLOPs for a single 1×C×112×112 inference
+  - GFLOPs for a single forward pass (batch=1, input 224×224)
 
 Models: CompNet, PPNet, CCNet, CO3Net, SF2Net,
         PalmBridge (CompNet backbone), ConvNeXt, DINOv2
@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
-from fvcore.nn import FlopCountAnalysis, parameter_count_table
+from fvcore.nn import FlopCountAnalysis
 
 DEVICE = torch.device("cpu")   # FLOPs measured on CPU
 
@@ -254,14 +254,34 @@ class CompetitiveBlock(nn.Module):
         return torch.cat([x1.flatten(1), x2.flatten(1)], dim=1)
 
 
+def _infer_competitive_fc_in(input_tensor):
+    """
+    Dynamically compute the flattened feature size produced by the three
+    CompetitiveBlocks (cb1/cb2/cb3) for an arbitrary spatial input size,
+    avoiding the hardcoded 13152 that was calibrated for 112×112 only.
+    """
+    cb1 = CompetitiveBlock(1, 9,  35, 0.8, 1.00)
+    cb2 = CompetitiveBlock(1, 36, 17, 0.8, 0.50)
+    cb3 = CompetitiveBlock(1, 9,   7, 0.8, 0.25)
+    with torch.no_grad():
+        f = torch.cat([cb1(input_tensor), cb2(input_tensor), cb3(input_tensor)], dim=1)
+    return f.shape[1]
+
+
 class CCNet(nn.Module):
-    """1-channel input, feature_dim=2048."""
-    def __init__(self, num_classes=190):
+    """1-channel input, feature_dim=2048. fc size inferred from input shape."""
+    def __init__(self, num_classes=190, sample_input=None):
         super().__init__()
         self.cb1 = CompetitiveBlock(1, 9, 35, 0.8, 1.00)
         self.cb2 = CompetitiveBlock(1, 36, 17, 0.8, 0.50)
         self.cb3 = CompetitiveBlock(1, 9,  7, 0.8, 0.25)
-        self.fc  = nn.Linear(13152, 2048)
+
+        # Infer fc input dimension from a sample forward pass
+        if sample_input is None:
+            sample_input = torch.zeros(1, 1, 224, 224)
+        fc_in = _infer_competitive_fc_in(sample_input)
+
+        self.fc  = nn.Linear(fc_in, 2048)
         self.bn  = nn.BatchNorm1d(2048)
 
     def forward(self, x):
@@ -270,13 +290,18 @@ class CCNet(nn.Module):
 
 
 class CO3Net(nn.Module):
-    """Same architecture as CCNet."""
-    def __init__(self, num_classes=190):
+    """Same architecture as CCNet. fc size inferred from input shape."""
+    def __init__(self, num_classes=190, sample_input=None):
         super().__init__()
         self.cb1 = CompetitiveBlock(1, 9, 35, 0.8, 1.00)
         self.cb2 = CompetitiveBlock(1, 36, 17, 0.8, 0.50)
         self.cb3 = CompetitiveBlock(1, 9,  7, 0.8, 0.25)
-        self.fc  = nn.Linear(13152, 2048)
+
+        if sample_input is None:
+            sample_input = torch.zeros(1, 1, 224, 224)
+        fc_in = _infer_competitive_fc_in(sample_input)
+
+        self.fc  = nn.Linear(fc_in, 2048)
         self.bn  = nn.BatchNorm1d(2048)
 
     def forward(self, x):
@@ -407,30 +432,30 @@ def fmt_params(n):
 
 
 def run():
-    # All models evaluated on 224×224 input
-    # Grayscale models: 1×224×224
-    # RGB models (ConvNeXt, DINOv2): 3×224×224
-    x1  = torch.zeros(1, 1, 224, 224)   # grayscale 224×224
-    x3  = torch.zeros(1, 3, 224, 224)   # RGB 224×224
+    x1 = torch.zeros(1, 1, 224, 224)   # grayscale 224×224
+    x3 = torch.zeros(1, 3, 224, 224)   # RGB 224×224
 
     MODELS = [
-        ("CompNet",              lambda: CompNet(),         x1),
-        ("PPNet",                lambda: PPNet(),           x1),
-        ("CCNet",                lambda: CCNet(),           x1),
-        ("CO3Net",               lambda: CO3Net(),          x1),
-        ("SF2Net",               lambda: SF2Net(),          x1),
-        ("PalmBridge",           lambda: PalmBridgeModel(), x1),
-        ("ConvNeXtV2-Tiny",      lambda: ConvNeXtModel(),  x3),
-        ("DINOv2 ViT-S/14",     lambda: DINOv2Model(),    x3),
+        ("CompNet",          lambda: CompNet(),                    x1),
+        ("PPNet",            lambda: PPNet(),                      x1),
+        ("CCNet",            lambda: CCNet(sample_input=x1),      x1),
+        ("CO3Net",           lambda: CO3Net(sample_input=x1),     x1),
+        ("SF2Net",           lambda: SF2Net(),                     x1),
+        ("PalmBridge",       lambda: PalmBridgeModel(),            x1),
+        ("ConvNeXtV2-Tiny",  lambda: ConvNeXtModel(),             x3),
+        ("DINOv2 ViT-S/14", lambda: DINOv2Model(),               x3),
     ]
 
-    col = {"model": 20, "total": 12, "trainable": 14, "flops": 10, "input": 16, "feat": 8}
-    header = (f"{'Model':<{col['model']}}"
-              f"{'Total Params':>{col['total']}}"
-              f"{'Trainable':>{col['trainable']}}"
-              f"{'GFLOPs':>{col['flops']}}"
-              f"{'Input size':>{col['input']}}"
-              f"{'Feat dim':>{col['feat']}}")
+    # Column widths
+    W_NAME  = 20
+    W_TOTAL = 16
+    W_TRAIN = 16
+    W_FLOPS = 12
+
+    header = (f"{'Model':<{W_NAME}}"
+              f"{'Total Params':>{W_TOTAL}}"
+              f"{'Trainable':>{W_TRAIN}}"
+              f"{'GFLOPs':>{W_FLOPS}}")
     sep = "─" * len(header)
 
     print("\n" + "=" * len(header))
@@ -447,32 +472,23 @@ def run():
             total, trainable = count_params(model)
             gflops           = count_flops(model, x)
 
-            with torch.no_grad():
-                out = model(x)
-            feat_dim = out.shape[-1]
-
-            c, h, w = x.shape[1], x.shape[2], x.shape[3]
-            input_str = f"{c}×{h}×{w}"
-
             results.append({
-                "name": name, "total": total, "trainable": trainable,
-                "gflops": gflops, "input": input_str, "feat": feat_dim,
+                "name": name, "total": total,
+                "trainable": trainable, "gflops": gflops,
             })
 
             gflops_str = f"{gflops:.3f}" if not math.isnan(gflops) else "N/A"
-            print(f"  {'':2}{name:<{col['model']-2}}"
-                  f"{fmt_params(total):>{col['total']}}"
-                  f"{fmt_params(trainable):>{col['trainable']}}"
-                  f"{gflops_str:>{col['flops']}}"
-                  f"{input_str:>{col['input']}}"
-                  f"{feat_dim:>{col['feat']}}")
+            print(f"    {name:<{W_NAME}}"
+                  f"{fmt_params(total):>{W_TOTAL}}"
+                  f"{fmt_params(trainable):>{W_TRAIN}}"
+                  f"{gflops_str:>{W_FLOPS}}")
 
         except Exception as e:
             print(f"  ERROR — {name}: {e}")
 
     print(sep)
 
-    # Save to txt
+    # ── Save to txt ────────────────────────────────────────────
     out_path = "model_comparison.txt"
     with open(out_path, "w") as f:
         f.write("Model Comparison — Parameters & FLOPs (input 224×224)\n")
@@ -481,19 +497,18 @@ def run():
         f.write(sep + "\n")
         for r in results:
             gflops_str = f"{r['gflops']:.3f}" if not math.isnan(r['gflops']) else "N/A"
-            f.write(f"{r['name']:<{col['model']}}"
-                    f"{fmt_params(r['total']):>{col['total']}}"
-                    f"{fmt_params(r['trainable']):>{col['trainable']}}"
-                    f"{gflops_str:>{col['flops']}}"
-                    f"{r['input']:>{col['input']}}"
-                    f"{r['feat']:>{col['feat']}}\n")
+            f.write(f"{r['name']:<{W_NAME}}"
+                    f"{fmt_params(r['total']):>{W_TOTAL}}"
+                    f"{fmt_params(r['trainable']):>{W_TRAIN}}"
+                    f"{gflops_str:>{W_FLOPS}}\n")
         f.write(sep + "\n")
         f.write("\nNotes:\n")
         f.write("  - GFLOPs measured for a single sample (batch=1)\n")
-        f.write("  - Grayscale models (CompNet/PPNet/CCNet/CO3Net/SF2Net/PalmBridge): input 1×112×112\n")
-        f.write("  - RGB models (ConvNeXt/DINOv2): input 3×112×112 / 3×224×224\n")
+        f.write("  - Grayscale models (CompNet/PPNet/CCNet/CO3Net/SF2Net/PalmBridge): input 1×224×224\n")
+        f.write("  - RGB models (ConvNeXt/DINOv2): input 3×224×224\n")
         f.write("  - DINOv2 requires input size multiple of patch_size=14 → 224×224\n")
         f.write("  - PalmBridge includes codebook P ∈ R^{512×512} in parameter count\n")
+        f.write("  - CCNet/CO3Net fc input size inferred dynamically (not hardcoded)\n")
     print(f"\nTable saved to: {out_path}")
 
 
