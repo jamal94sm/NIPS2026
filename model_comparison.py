@@ -8,7 +8,8 @@ Compares all biometric models on:
 
 Models: CompNet, PPNet, CCNet, CO3Net, SF2Net,
         PalmBridge (CompNet backbone), ConvNeXt, DINOv2,
-        GIFT (GIFTBackbone — inference model only, FSM inactive)
+        GIFT (GIFTBackbone — inference model only, FSM inactive),
+        TSCAN (PalmNet / FeatureEncoder — inference model only)
 
 Run on the server:
     python model_comparison.py
@@ -405,6 +406,48 @@ class DINOv2Model(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
+#  TSCAN  (inference model only — PalmNet / FeatureEncoder)
+#  Source: "Teacher-Student Co-learning with Adversarial
+#           Normalization" adapted for Palm-Auth
+#
+#  Inference path: PalmNet.get_features(x)
+#    → FeatureEncoder: frozen ResNet-18 stem+layer1-3
+#                    + trainable layer4
+#                    + Linear(512→feat_dim) + Tanh
+#  Excluded (training-only): DomainDiscriminator, AdaFaceLoss
+#  Input: 3×224×224
+# ══════════════════════════════════════════════════════════════
+
+class TSCANModel(nn.Module):
+    """
+    Inference-only wrapper for TSCAN's PalmNet.
+    Mirrors FeatureEncoder exactly — frozen_layers are included
+    because they run during inference (no_grad scope is a training
+    optimisation, not an architectural exclusion).
+    """
+    def __init__(self, feat_dim=256):
+        super().__init__()
+        backbone = tv_models.resnet18(weights=None)
+        children = list(backbone.children())
+        # stem + layer1 + layer2 + layer3  (frozen during training, but
+        # still execute at inference — must be included in the model)
+        self.frozen_layers = nn.Sequential(*children[:7])
+        self.layer4        = children[7]          # trainable
+        self.avgpool       = children[8]
+        self.flatten       = nn.Flatten()
+        self.linear        = nn.Linear(512, feat_dim, bias=True)
+        self.hash          = nn.Tanh()
+
+    def forward(self, x):
+        x    = self.frozen_layers(x)
+        x    = self.layer4(x)
+        x    = self.avgpool(x)
+        bb   = self.flatten(x)
+        feat = self.hash(self.linear(bb))
+        return F.normalize(feat, p=2, dim=1)
+
+
+# ══════════════════════════════════════════════════════════════
 #  GIFT  (GIFTBackbone — inference model only)
 #  Source: "Generating Stylized Features for Single-Source
 #           Cross-Dataset Palmprint Recognition", TIP 2024
@@ -506,6 +549,7 @@ def run():
         ("ConvNeXtV2-Tiny",  lambda: ConvNeXtModel(),             x3),
         ("DINOv2 ViT-S/14", lambda: DINOv2Model(),               x3),
         ("GIFT (ResNet-18)", lambda: GIFTModel(),                 x3s),
+        ("TSCAN (PalmNet)",  lambda: TSCANModel(),                x3s),
     ]
 
     # Column widths
@@ -570,6 +614,7 @@ def run():
         f.write("  - RGB models (ConvNeXt/DINOv2): input 3×224×224\n")
         f.write("  - GIFT: input 3×224×224 (standardised to match other models)\n")
         f.write("  - GIFT FSMs are inactive at inference → zero extra FLOPs, but counted in params\n")
+        f.write("  - TSCAN: inference model is PalmNet (FeatureEncoder); discriminator & AdaFace excluded\n")
         f.write("  - DINOv2 requires input size multiple of patch_size=14 → 224×224\n")
         f.write("  - PalmBridge includes codebook P ∈ R^{512×512} in parameter count\n")
         f.write("  - CCNet/CO3Net fc input size inferred dynamically (not hardcoded)\n")
