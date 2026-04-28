@@ -9,7 +9,8 @@ Compares all biometric models on:
 Models: CompNet, PPNet, CCNet, CO3Net, SF2Net,
         PalmBridge (CompNet backbone), ConvNeXt, DINOv2,
         GIFT (GIFTBackbone — inference model only, FSM inactive),
-        TSCAN (PalmNet / FeatureEncoder — inference model only)
+        TSCAN (PalmNet / FeatureEncoder — inference model only),
+        PDFG (MultiDatasetExtractors — inference model only, N=2 heads)
 
 Run on the server:
     python model_comparison.py
@@ -406,6 +407,76 @@ class DINOv2Model(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
+#  PDFG  (MultiDatasetExtractors — inference model only)
+#  Source: "Palm-print Domain Feature Generalization", adapted
+#           for Palm-Auth
+#
+#  Inference path: model.extract_avg(x)
+#    → SharedLayers (shared CNN stem)
+#    → N=2 independent Linear heads (each: flat→1024→512→feat_dim)
+#    → average all head outputs → L2-normalise
+#  Excluded (training-only): ArcFaceLoss heads
+#  Input: 3×224×224
+#  flat_dim is inferred dynamically from a dummy forward pass,
+#  so no hardcoded size is needed.
+# ══════════════════════════════════════════════════════════════
+
+class _PDFGSharedLayers(nn.Module):
+    """Shared CNN stem from PDFG (unchanged)."""
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 16,  3, stride=4, padding=1)
+        self.pool1 = nn.MaxPool2d(2, stride=1)
+        self.conv2 = nn.Conv2d(16, 32,  5, stride=2, padding=2)
+        self.pool2 = nn.MaxPool2d(2, stride=1)
+        self.conv3 = nn.Conv2d(32, 64,  3, stride=1, padding=1)
+        self.conv4 = nn.Conv2d(64, 128, 3, stride=1, padding=1)
+        self.pool3 = nn.MaxPool2d(2, stride=1)
+        self.act   = nn.LeakyReLU(0.2, inplace=True)
+
+    def forward(self, x):
+        x = self.pool1(self.act(self.conv1(x)))
+        x = self.pool2(self.act(self.conv2(x)))
+        x = self.act(self.conv3(x))
+        x = self.pool3(self.act(self.conv4(x)))
+        return x
+
+
+class PDFGModel(nn.Module):
+    """
+    Inference-only wrapper for PDFG's MultiDatasetExtractors.
+    N=2 heads, feature_dim=128.
+    flat_dim is inferred via a dummy 224×224 forward pass so no
+    hardcoded spatial size is needed.
+    """
+    def __init__(self, n_heads=2, feature_dim=128,
+                 sample_input=None):
+        super().__init__()
+        self.shared = _PDFGSharedLayers()
+
+        # Infer flattened size from sample input
+        if sample_input is None:
+            sample_input = torch.zeros(1, 3, 224, 224)
+        with torch.no_grad():
+            flat_dim = self.shared(sample_input).view(1, -1).shape[1]
+
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(flat_dim, 1024), nn.LeakyReLU(0.2, inplace=True),
+                nn.Linear(1024, 512),      nn.LeakyReLU(0.2, inplace=True),
+                nn.Linear(512, feature_dim),
+            ) for _ in range(n_heads)
+        ])
+
+    def forward(self, x):
+        """Mirrors MultiDatasetExtractors.extract_avg() used at eval."""
+        shared = self.shared(x).view(x.size(0), -1)
+        per_head = torch.stack(
+            [F.normalize(h(shared), p=2, dim=1) for h in self.heads], dim=0)
+        return F.normalize(per_head.mean(dim=0), p=2, dim=1)
+
+
+# ══════════════════════════════════════════════════════════════
 #  TSCAN  (inference model only — PalmNet / FeatureEncoder)
 #  Source: "Teacher-Student Co-learning with Adversarial
 #           Normalization" adapted for Palm-Auth
@@ -548,8 +619,9 @@ def run():
         ("PalmBridge",       lambda: PalmBridgeModel(),            x1),
         ("ConvNeXtV2-Tiny",  lambda: ConvNeXtModel(),             x3),
         ("DINOv2 ViT-S/14", lambda: DINOv2Model(),               x3),
-        ("GIFT (ResNet-18)", lambda: GIFTModel(),                 x3s),
-        ("TSCAN (PalmNet)",  lambda: TSCANModel(),                x3s),
+        ("GIFT (ResNet-18)", lambda: GIFTModel(),                           x3s),
+        ("TSCAN (PalmNet)",  lambda: TSCANModel(),                          x3s),
+        ("PDFG",             lambda: PDFGModel(sample_input=x3s),           x3s),
     ]
 
     # Column widths
@@ -615,6 +687,8 @@ def run():
         f.write("  - GIFT: input 3×224×224 (standardised to match other models)\n")
         f.write("  - GIFT FSMs are inactive at inference → zero extra FLOPs, but counted in params\n")
         f.write("  - TSCAN: inference model is PalmNet (FeatureEncoder); discriminator & AdaFace excluded\n")
+        f.write("  - PDFG: inference model is MultiDatasetExtractors (N=2 heads); ArcFace loss excluded\n")
+        f.write("  - PDFG flat_dim inferred dynamically from 224×224 input\n")
         f.write("  - DINOv2 requires input size multiple of patch_size=14 → 224×224\n")
         f.write("  - PalmBridge includes codebook P ∈ R^{512×512} in parameter count\n")
         f.write("  - CCNet/CO3Net fc input size inferred dynamically (not hardcoded)\n")
