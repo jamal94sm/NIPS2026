@@ -7,7 +7,8 @@ Compares all biometric models on:
   - GFLOPs for a single forward pass (batch=1, input 224×224)
 
 Models: CompNet, PPNet, CCNet, CO3Net, SF2Net,
-        PalmBridge (CompNet backbone), ConvNeXt, DINOv2
+        PalmBridge (CompNet backbone), ConvNeXt, DINOv2,
+        GIFT (GIFTBackbone — inference model only, FSM inactive)
 
 Run on the server:
     python model_comparison.py
@@ -18,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
+from torchvision import models as tv_models
 from fvcore.nn import FlopCountAnalysis
 
 DEVICE = torch.device("cpu")   # FLOPs measured on CPU
@@ -403,6 +405,64 @@ class DINOv2Model(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
+#  GIFT  (GIFTBackbone — inference model only)
+#  Source: "Generating Stylized Features for Single-Source
+#           Cross-Dataset Palmprint Recognition", TIP 2024
+#
+#  At inference the FSMs are inactive (pass-through), so they
+#  contribute parameters but add zero FLOPs.
+#  Input: 3×112×112 RGB  (eval_transform in the original code)
+# ══════════════════════════════════════════════════════════════
+
+class _FeatureStylizationModule(nn.Module):
+    """FSM — inactive at eval, so zero extra FLOPs during inference."""
+    def __init__(self, gamma=0.2):
+        super().__init__()
+        self.gamma  = gamma
+        self.active = False   # always False at eval
+
+    def forward(self, f):
+        # During eval (active=False) this is a pure pass-through.
+        return f, f
+
+
+class GIFTModel(nn.Module):
+    """
+    Inference-only wrapper around GIFTBackbone.
+    Matches the original architecture exactly:
+      ResNet-18 backbone + 5 FSM modules + linear projection to emb_dim.
+    FSMs are never activated here, so they cost zero FLOPs.
+    """
+    def __init__(self, emb_dim=128, gamma=0.2):
+        super().__init__()
+        resnet = tv_models.resnet18(weights=None)   # no pretrained weights needed for param/FLOP count
+
+        self.conv1   = resnet.conv1
+        self.bn1     = resnet.bn1
+        self.relu    = resnet.relu
+        self.maxpool = resnet.maxpool
+        self.fsm0    = _FeatureStylizationModule(gamma)
+
+        self.layer1  = resnet.layer1; self.fsm1 = _FeatureStylizationModule(gamma)
+        self.layer2  = resnet.layer2; self.fsm2 = _FeatureStylizationModule(gamma)
+        self.layer3  = resnet.layer3; self.fsm3 = _FeatureStylizationModule(gamma)
+        self.layer4  = resnet.layer4; self.fsm4 = _FeatureStylizationModule(gamma)
+
+        self.avgpool = resnet.avgpool
+        self.fc      = nn.Linear(resnet.fc.in_features, emb_dim)
+
+    def forward(self, x):
+        x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
+        x, _ = self.fsm0(x)
+        x = self.layer1(x); x, _ = self.fsm1(x)
+        x = self.layer2(x); x, _ = self.fsm2(x)
+        x = self.layer3(x); x, _ = self.fsm3(x)
+        x = self.layer4(x); x, _ = self.fsm4(x)
+        x   = self.avgpool(x).flatten(1)
+        return F.normalize(self.fc(x), p=2, dim=1)
+
+
+# ══════════════════════════════════════════════════════════════
 #  ANALYSIS
 # ══════════════════════════════════════════════════════════════
 
@@ -432,8 +492,9 @@ def fmt_params(n):
 
 
 def run():
-    x1 = torch.zeros(1, 1, 224, 224)   # grayscale 224×224
-    x3 = torch.zeros(1, 3, 224, 224)   # RGB 224×224
+    x1  = torch.zeros(1, 1, 224, 224)   # grayscale 224×224
+    x3  = torch.zeros(1, 3, 224, 224)   # RGB 224×224
+    x3s = torch.zeros(1, 3, 224, 224)   # RGB 224×224  (standardised input)
 
     MODELS = [
         ("CompNet",          lambda: CompNet(),                    x1),
@@ -444,6 +505,7 @@ def run():
         ("PalmBridge",       lambda: PalmBridgeModel(),            x1),
         ("ConvNeXtV2-Tiny",  lambda: ConvNeXtModel(),             x3),
         ("DINOv2 ViT-S/14", lambda: DINOv2Model(),               x3),
+        ("GIFT (ResNet-18)", lambda: GIFTModel(),                 x3s),
     ]
 
     # Column widths
@@ -506,6 +568,8 @@ def run():
         f.write("  - GFLOPs measured for a single sample (batch=1)\n")
         f.write("  - Grayscale models (CompNet/PPNet/CCNet/CO3Net/SF2Net/PalmBridge): input 1×224×224\n")
         f.write("  - RGB models (ConvNeXt/DINOv2): input 3×224×224\n")
+        f.write("  - GIFT: input 3×224×224 (standardised to match other models)\n")
+        f.write("  - GIFT FSMs are inactive at inference → zero extra FLOPs, but counted in params\n")
         f.write("  - DINOv2 requires input size multiple of patch_size=14 → 224×224\n")
         f.write("  - PalmBridge includes codebook P ∈ R^{512×512} in parameter count\n")
         f.write("  - CCNet/CO3Net fc input size inferred dynamically (not hardcoded)\n")
