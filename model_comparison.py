@@ -4,7 +4,7 @@ model_comparison.py
 Compares all biometric models on:
   - Total parameters
   - Trainable parameters
-  - GFLOPs for a single forward pass (batch=1, input 224×224)
+  - GFLOPs for a single forward pass (batch=1, input 112×112)
 
 Models: CompNet, PPNet, CCNet, CO3Net, SF2Net,
         PalmBridge (CompNet backbone), ConvNeXt, DINOv2,
@@ -276,7 +276,7 @@ class CCNet(nn.Module):
         self.cb2 = CompetitiveBlock(1, 36, 17, 0.8, 0.50)
         self.cb3 = CompetitiveBlock(1, 9,  7, 0.8, 0.25)
         if sample_input is None:
-            sample_input = torch.zeros(1, 1, 224, 224)
+            sample_input = torch.zeros(1, 1, 112, 112)
         fc_in = _infer_competitive_fc_in(sample_input)
         self.fc  = nn.Linear(fc_in, 2048)
         self.bn  = nn.BatchNorm1d(2048)
@@ -293,7 +293,7 @@ class CO3Net(nn.Module):
         self.cb2 = CompetitiveBlock(1, 36, 17, 0.8, 0.50)
         self.cb3 = CompetitiveBlock(1, 9,  7, 0.8, 0.25)
         if sample_input is None:
-            sample_input = torch.zeros(1, 1, 224, 224)
+            sample_input = torch.zeros(1, 1, 112, 112)
         fc_in = _infer_competitive_fc_in(sample_input)
         self.fc  = nn.Linear(fc_in, 2048)
         self.bn  = nn.BatchNorm1d(2048)
@@ -422,7 +422,7 @@ class PDFGModel(nn.Module):
         super().__init__()
         self.shared = _PDFGSharedLayers()
         if sample_input is None:
-            sample_input = torch.zeros(1, 3, 224, 224)
+            sample_input = torch.zeros(1, 3, 112, 112)
         with torch.no_grad():
             flat_dim = self.shared(sample_input).view(1, -1).shape[1]
         self.heads = nn.ModuleList([
@@ -606,8 +606,6 @@ class ArcFaceModel(nn.Module):
             p.requires_grad = (i >= n_freeze)
 
     def forward(self, x):
-        if x.shape[-1] != 112:
-            x = F.interpolate(x, size=(112, 112), mode='bilinear', align_corners=False)
         out = self.net(x)
         if isinstance(out, (list, tuple)):
             out = out[0]
@@ -625,6 +623,8 @@ class MagFaceModel(nn.Module):
     MagFace iResNet100 from official MagFace checkpoint (MS1MV2).
     Checkpoint key format: "features.module.*" → stripped to match IResNet.
     Freeze ratio: first 75% of parameter tensors frozen.
+    Input resized to 112×112 before network (matches InsightFace convention
+    and makes FLOPs comparable with ArcFace).
     """
     def __init__(self, ckpt_path, freeze_ratio=0.75):
         super().__init__()
@@ -677,9 +677,9 @@ def fmt_params(n):
 
 
 def run():
-    x1   = torch.zeros(1, 1, 224, 224)   # grayscale 224×224
-    x3   = torch.zeros(1, 3, 224, 224)   # RGB 224×224
-    x3s  = torch.zeros(1, 3, 224, 224)   # RGB 224×224
+    x1   = torch.zeros(1, 1, 112, 112)   # grayscale 112×112
+    x3   = torch.zeros(1, 3, 112, 112)   # RGB 112×112
+    x3s  = torch.zeros(1, 3, 112, 112)   # RGB 112×112
 
     MODELS = [
         ("CompNet",             lambda: CompNet(),                     x1),
@@ -709,7 +709,7 @@ def run():
     sep = "─" * len(header)
 
     print("\n" + "=" * len(header))
-    print("Model Comparison — Parameters & FLOPs")
+    print("Model Comparison — Parameters & FLOPs (input 112×112)")
     print("=" * len(header))
     print(header)
     print(sep)
@@ -735,7 +735,7 @@ def run():
 
     out_path = "model_comparison.txt"
     with open(out_path, "w") as f:
-        f.write("Model Comparison — Parameters & FLOPs\n")
+        f.write("Model Comparison — Parameters & FLOPs (input 112×112 for all models)\n")
         f.write(sep + "\n")
         f.write(header + "\n")
         f.write(sep + "\n")
@@ -748,9 +748,9 @@ def run():
         f.write(sep + "\n")
         f.write("\nNotes:\n")
         f.write("  - GFLOPs measured for a single sample (batch=1)\n")
-        f.write("  - Grayscale models (CompNet/PPNet/CCNet/CO3Net/SF2Net/PalmBridge): input 1×224×224\n")
-        f.write("  - RGB models (ConvNeXt/DINOv2/GIFT/TSCAN/PDFG): input 3×224×224\n")
-        f.write("  - ArcFace & MagFace: input 3×224×224 (ArcFace downscales to 112×112 internally; MagFace uses adaptive pool)\n")
+        f.write("  - Grayscale models (CompNet/PPNet/CCNet/CO3Net/SF2Net/PalmBridge): input 1×112×112\n")
+        f.write("  - RGB models (ConvNeXt/DINOv2/GIFT/TSCAN/PDFG/ArcFace/MagFace): input 3×112×112\n")
+        f.write("  - All models evaluated at 112×112 input for fair comparison\n")
         f.write("  - ArcFace loaded from ONNX via onnx2torch (R100, Glint360K)\n")
         f.write("  - MagFace loaded from .pth checkpoint (R100, MS1MV2, epoch 25)\n")
         f.write("  - Both face models: first 75% of parameter tensors frozen\n")
