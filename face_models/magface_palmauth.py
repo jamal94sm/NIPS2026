@@ -44,8 +44,8 @@ CONFIG = {
     "test_gallery_ratio"   : 0.50,
 
     # MagFace loss parameters
-    "arcface_s"            : 64.0,   # scale
-    "m_l"                  : 0.45,   # lower margin bound
+    "arcface_s"            : 32.0,   # scale, orig = 64
+    "m_l"                  : 0.35,   # lower margin bound, orig = 0.45
     "m_u"                  : 0.80,   # upper margin bound
     "l_a"                  : 10.0,   # lower magnitude bound
     "u_a"                  : 110.0,  # upper magnitude bound
@@ -53,7 +53,7 @@ CONFIG = {
 
     # Training
     "img_side"             : 112,
-    "batch_size"           : 64,
+    "batch_size"           : 64, 
     "num_epochs"           : 100,
     "lr"                   : 1e-4,
     "weight_decay"         : 5e-4,
@@ -619,7 +619,7 @@ def main():
                 print(f"  *** New best Rank-1: {best_rank1:.2f}% ***")
 
     # ── Final evaluation ──────────────────────────────────────
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     final_eer, final_rank1 = evaluate(
         model, gallery_loader, probe_loader, device, eval_dir, "FINAL")
