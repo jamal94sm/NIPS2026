@@ -44,16 +44,16 @@ CONFIG = {
     "test_gallery_ratio"   : 0.50,
 
     # MagFace loss parameters
-    "arcface_s"            : 32.0,   # scale, orig = 64
-    "m_l"                  : 0.35,   # lower margin bound, orig = 0.45
+    "arcface_s"            : 64.0,   # scale
+    "m_l"                  : 0.45,   # lower margin bound
     "m_u"                  : 0.80,   # upper margin bound
     "l_a"                  : 10.0,   # lower magnitude bound
     "u_a"                  : 110.0,  # upper magnitude bound
-    "lambda_g"             : 20.0,   # magnitude regularization weight
+    "lambda_g"             : 20.0,   # magnitude regularization weight (increased: avg_norm was ~28, target u_a=110)
 
     # Training
     "img_side"             : 112,
-    "batch_size"           : 64, 
+    "batch_size"           : 64,
     "num_epochs"           : 100,
     "lr"                   : 1e-4,
     "weight_decay"         : 5e-4,
@@ -390,7 +390,6 @@ def split_ids(id2paths, train_ratio, gallery_ratio, seed):
 def _base_tf(img_side):
     return transforms.Compose([
         transforms.Resize((img_side, img_side)),
-        transforms.Grayscale(num_output_channels=3),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
@@ -398,7 +397,6 @@ def _base_tf(img_side):
 def _aug_tf(img_side):
     return transforms.Compose([
         transforms.Resize((img_side, img_side)),
-        transforms.Grayscale(num_output_channels=3),
         transforms.RandomChoice([
             transforms.ColorJitter(brightness=0, contrast=0.05, saturation=0, hue=0),
             transforms.RandomResizedCrop(img_side, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
@@ -416,13 +414,25 @@ def _aug_tf(img_side):
 
 
 class TrainDataset(Dataset):
+    """
+    Returns (img_orig, aug1, aug2, aug3, label) — 4× views per image per epoch.
+    img_orig : base transform only (stable anchor, no augmentation)
+    aug1-3   : three independently sampled augmentations
+    Matches the augmentation strategy used in ConvNeXt and DINOv2 scripts.
+    """
     def __init__(self, samples, img_side):
-        self.samples   = samples
-        self.transform = _aug_tf(img_side)
+        self.samples  = samples
+        self.img_side = img_side
+        self.base     = _base_tf(img_side)
     def __len__(self): return len(self.samples)
     def __getitem__(self, idx):
         path, label = self.samples[idx]
-        return self.transform(Image.open(path).convert("L")), label
+        img = Image.open(path).convert("RGB")
+        return (self.base(img),
+                _aug_tf(self.img_side)(img),
+                _aug_tf(self.img_side)(img),
+                _aug_tf(self.img_side)(img),
+                label)
 
 
 class EvalDataset(Dataset):
@@ -432,7 +442,7 @@ class EvalDataset(Dataset):
     def __len__(self): return len(self.samples)
     def __getitem__(self, idx):
         path, label = self.samples[idx]
-        return self.transform(Image.open(path).convert("L")), label
+        return self.transform(Image.open(path).convert("RGB")), label
 
 
 def make_loader(samples, train, cfg):
@@ -575,13 +585,14 @@ def main():
         ep_corr = 0;   ep_tot = 0
         ep_norm_sum = 0.0
 
-        for imgs, labels in train_loader:
-            imgs   = imgs.to(device)
-            labels = labels.to(device)
+        for img_orig, aug1, aug2, aug3, labels in train_loader:
+            # Stack original + 3 augmented views → 4× batch
+            imgs_all   = torch.cat([img_orig, aug1, aug2, aug3], dim=0).to(device)
+            labels_all = torch.cat([labels, labels, labels, labels], dim=0).to(device)
             optimizer.zero_grad()
 
-            embeddings        = model(imgs)          # raw, not normalised
-            loss, l_arc, l_g  = criterion(embeddings, labels)
+            embeddings        = model(imgs_all)          # raw, not normalised
+            loss, l_arc, l_g  = criterion(embeddings, labels_all)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, 5.0)
             optimizer.step()
@@ -593,8 +604,8 @@ def main():
 
             with torch.no_grad():
                 preds    = criterion.get_logits(embeddings).argmax(dim=1)
-                ep_corr += (preds == labels).sum().item()
-                ep_tot  += labels.size(0)
+                ep_corr += (preds == labels_all).sum().item()
+                ep_tot  += labels_all.size(0)
 
         scheduler.step()
         n   = len(train_loader)
