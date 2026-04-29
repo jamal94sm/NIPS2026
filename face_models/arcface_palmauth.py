@@ -471,7 +471,7 @@ def main():
     print(f"  Device : {device}")
     print(f"  Epochs : {cfg['num_epochs']}")
     print(f"  s={cfg['arcface_s']}  m={cfg['arcface_m']}")
-      print(f"{'='*60}\n")
+    print(f"{'='*60}\n")
 
     # ── Data ──────────────────────────────────────────────────
     print("  Collecting Palm-Auth data ...")
