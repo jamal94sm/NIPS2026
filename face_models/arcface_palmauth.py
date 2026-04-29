@@ -30,8 +30,7 @@ Results saved to:
 CONFIG = {
     "palm_auth_data_root"  : "/home/pai-ng/Jamal/smartphone_data",
     "scanner_spectra"      : {"green", "ir", "yellow", "pink", "white"},
-    "pretrained_weights"   : "/home/pai-ng/Jamal/NIPS2026/Face/arcface_r100_ms1mv2.pth",
-
+    "pretrained_weights"   : "/home/pai-ng/Jamal/NIPS2026/Face/r100_glint360k.onnx",  # ONNX from InsightFace model zoo
 
     "train_id_ratio"       : 0.80,
     "test_gallery_ratio"   : 0.50,
@@ -176,48 +175,42 @@ def iresnet100(num_features=512, **kwargs):
 
 class ArcFaceBackbone(nn.Module):
     """
-    iResNet100 with selective layer freezing.
-    Frozen  : conv1, bn1, prelu, layer1, layer2, layer3
-    Trainable: layer4, bn2, fc, features (BN)
+    ArcFace iResNet100 loaded from ONNX via onnx2torch.
+    Freezes the first 75% of parameters (early layers).
+    Finetunes the last 25% (deep layers + output head).
     Returns L2-normalised 512-dim embeddings.
     """
-    def __init__(self, pretrained_path, num_features=512):
+    def __init__(self, pretrained_path, freeze_ratio=0.75):
         super().__init__()
-        self.net = iresnet100(num_features=num_features)
+        import onnx
+        from onnx2torch import convert
 
-        if pretrained_path and os.path.exists(pretrained_path):
-            ckpt  = torch.load(pretrained_path, map_location="cpu",
-                               weights_only=False)
-            # Handle both raw state_dict and wrapped checkpoints
-            state = ckpt.get("state_dict", ckpt)
-            # Strip "module." prefix if saved with DataParallel
-            state = {k.replace("module.", ""): v for k, v in state.items()}
-            missing, unexpected = self.net.load_state_dict(state, strict=False)
-            print(f"  Loaded pretrained weights: {pretrained_path}")
-            if missing:    print(f"    Missing keys    : {len(missing)}")
-            if unexpected: print(f"    Unexpected keys : {len(unexpected)}")
-        else:
-            print(f"  [WARN] Pretrained weights not found at: {pretrained_path}")
-            print(f"         Training from scratch.")
+        if not os.path.exists(pretrained_path):
+            raise FileNotFoundError(
+                f"ONNX model not found at: {pretrained_path}\n"
+                f"Download R100 Glint360K from InsightFace model zoo.")
 
-        # Freeze stem + layers 1-3
-        for module in [self.net.conv1, self.net.bn1, self.net.prelu,
-                        self.net.layer1, self.net.layer2, self.net.layer3]:
-            for p in module.parameters():
-                p.requires_grad = False
+        print(f"  Loading ONNX model from: {pretrained_path}")
+        self.net = convert(onnx.load(pretrained_path))
+        print(f"  Converted ONNX → PyTorch")
 
-        # Unfreeze layer4, bn2, fc, features
-        for module in [self.net.layer4, self.net.bn2,
-                        self.net.fc, self.net.features]:
-            for p in module.parameters():
-                p.requires_grad = True
+        # Freeze first freeze_ratio of all parameters (early layers)
+        all_params = list(self.net.parameters())
+        n_freeze   = int(len(all_params) * freeze_ratio)
+        for i, p in enumerate(all_params):
+            p.requires_grad = (i >= n_freeze)
 
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         total     = sum(p.numel() for p in self.parameters())
+        print(f"  Frozen params   : {n_freeze}/{len(all_params)} tensors")
         print(f"  Trainable params: {trainable/1e6:.2f}M / {total/1e6:.2f}M total")
 
     def forward(self, x):
-        return F.normalize(self.net(x), p=2, dim=1)
+        # InsightFace ONNX outputs L2-normalised 512-dim embeddings directly
+        out = self.net(x)
+        if isinstance(out, (list, tuple)):
+            out = out[0]
+        return F.normalize(out, p=2, dim=1)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -489,7 +482,7 @@ def main():
     probe_loader   = make_loader(probe_samples,   train=False, cfg=cfg)
 
     # ── Model ─────────────────────────────────────────────────
-    model = ArcFaceBackbone(cfg["pretrained_weights"]).to(device)
+    model = ArcFaceBackbone(cfg["pretrained_weights"]).to(device)  # loads ONNX directly
     criterion = ArcFaceLoss(num_classes,
                             embedding_size=512,
                             s=cfg["arcface_s"],
