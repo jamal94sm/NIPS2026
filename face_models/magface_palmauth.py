@@ -38,7 +38,7 @@ Results saved to:
 CONFIG = {
     "palm_auth_data_root"  : "/home/pai-ng/Jamal/smartphone_data",
     "scanner_spectra"      : {"green", "ir", "yellow", "pink", "white"},
-    "pretrained_weights"   : "./pretrained/magface_iresnet100.pth",
+    "pretrained_weights"   : "Face/magface_iresnet100.pth",
 
     "train_id_ratio"       : 0.80,
     "test_gallery_ratio"   : 0.50,
