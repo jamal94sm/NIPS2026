@@ -38,7 +38,7 @@ Results saved to:
 CONFIG = {
     "palm_auth_data_root"  : "/home/pai-ng/Jamal/smartphone_data",
     "scanner_spectra"      : {"green", "ir", "yellow", "pink", "white"},
-    "pretrained_weights"   : "/home/pai-ng/Jamal/NIPS2026/Face/magface_iresnet100.pth",
+    "pretrained_weights" : "/home/pai-ng/Jamal/NIPS2026/Face/magface_iresnet100.pth",
 
     "train_id_ratio"       : 0.80,
     "test_gallery_ratio"   : 0.50,
@@ -200,10 +200,12 @@ class MagFaceBackbone(nn.Module):
         if pretrained_path and os.path.exists(pretrained_path):
             ckpt  = torch.load(pretrained_path, map_location="cpu")
             state = ckpt.get("state_dict", ckpt)
-            # MagFace checkpoint keys: "features.module.conv1.weight" etc.
-            # Strip "features.module." prefix → "conv1.weight" to match self.net
+            # Checkpoint stores backbone under "features.module.*"
+            # and the MagFace classifier head under "fc.*" at top level.
+            # Only keep backbone keys - discard classifier head entirely.
             state = {k.replace("features.module.", ""): v
-                     for k, v in state.items()}
+                     for k, v in state.items()
+                     if k.startswith("features.module.")}
             missing, unexpected = self.net.load_state_dict(state, strict=False)
             print(f"  Loaded pretrained weights: {pretrained_path}")
             print(f"  Checkpoint epoch: {ckpt.get('epoch', 'N/A')}  "
@@ -455,18 +457,28 @@ def extract_embeddings(model, loader, device):
     model.eval(); feats, labels = [], []
     for imgs, lbl in loader:
         raw  = model(imgs.to(device))
-        norm = F.normalize(raw, p=2, dim=1)   # normalise for cosine similarity
+        # Replace any NaN/Inf (can occur before BN warms up) with zeros
+        raw  = torch.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
+        norm = F.normalize(raw, p=2, dim=1)
         feats.append(norm.cpu().numpy())
         labels.append(lbl.numpy())
-    return np.concatenate(feats), np.concatenate(labels)
+    feats = np.concatenate(feats)
+    # Final safety check
+    if not np.isfinite(feats).all():
+        feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
+    return feats, np.concatenate(labels)
 
 
 def compute_eer(scores_array):
     ins  = scores_array[scores_array[:, 1] ==  1, 0]
     outs = scores_array[scores_array[:, 1] == -1, 0]
     if len(ins) == 0 or len(outs) == 0: return 1.0, 0.0
-    y   = np.concatenate([np.ones(len(ins)), np.zeros(len(outs))])
-    s   = np.concatenate([ins, outs])
+    y = np.concatenate([np.ones(len(ins)), np.zeros(len(outs))])
+    s = np.concatenate([ins, outs])
+    # Guard: if all scores are identical or contain NaN, EER is undefined
+    if not np.isfinite(s).all() or np.unique(s).size < 2:
+        print("  [WARN] Scores contain NaN/Inf or are constant — EER set to 1.0")
+        return 1.0, 0.0
     fpr, tpr, thresholds = roc_curve(y, s, pos_label=1)
     eer    = brentq(lambda x: 1.0 - x - interp1d(fpr, tpr)(x), 0.0, 1.0)
     thresh = float(interp1d(fpr, thresholds)(eer))
