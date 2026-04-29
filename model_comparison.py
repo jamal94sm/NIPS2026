@@ -10,7 +10,9 @@ Models: CompNet, PPNet, CCNet, CO3Net, SF2Net,
         PalmBridge (CompNet backbone), ConvNeXt, DINOv2,
         GIFT (GIFTBackbone — inference model only, FSM inactive),
         TSCAN (PalmNet / FeatureEncoder — inference model only),
-        PDFG (MultiDatasetExtractors — inference model only, N=2 heads)
+        PDFG (MultiDatasetExtractors — inference model only, N=2 heads),
+        ArcFace iResNet100 (loaded from ONNX via onnx2torch, 112×112 RGB),
+        MagFace iResNet100 (loaded from .pth checkpoint,    112×112 RGB)
 
 Run on the server:
     python model_comparison.py
@@ -26,12 +28,14 @@ from fvcore.nn import FlopCountAnalysis
 
 DEVICE = torch.device("cpu")   # FLOPs measured on CPU
 
+# ── Checkpoint paths ──────────────────────────────────────────
+ARCFACE_ONNX_PATH  = "/home/pai-ng/Jamal/NIPS2026/face_models/checkpoints/r100_glint360k.onnx"
+MAGFACE_CKPT_PATH  = "/home/pai-ng/Jamal/NIPS2026/face_models/checkpoints/magface_iresnet100.pth"
+
 
 # ══════════════════════════════════════════════════════════════
 #  SHARED COMPONENTS
 # ══════════════════════════════════════════════════════════════
-
-# ── CompNet / PalmBridge Gabor backbone ───────────────────────
 
 class LearnableGaborLayer(nn.Module):
     def __init__(self, num_filters=32, kernel_size=15):
@@ -79,7 +83,6 @@ class CompetitivePool(nn.Module):
 
 
 class CompNetBackbone(nn.Module):
-    """Shared backbone for CompNet and PalmBridge."""
     def __init__(self, feature_dim=512):
         super().__init__()
         self.gabor   = LearnableGaborLayer()
@@ -128,7 +131,7 @@ class CompNet(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
-#  PPNET  (CE + Contrastive, L2 distance matching)
+#  PPNET
 # ══════════════════════════════════════════════════════════════
 
 class PPNet(nn.Module):
@@ -164,12 +167,11 @@ class PPNet(nn.Module):
         f = self.pool2(self.block2(f))
         f = self.pool3(self.block3(f))
         f = self.gap(self.block4(f))
-        z = self.embed(f)
-        return z   # L2 distance used at eval
+        return self.embed(f)
 
 
 # ══════════════════════════════════════════════════════════════
-#  CCNET / CO3NET  (Gabor Competitive Block)
+#  CCNET / CO3NET
 # ══════════════════════════════════════════════════════════════
 
 class GaborConv2d(nn.Module):
@@ -259,11 +261,6 @@ class CompetitiveBlock(nn.Module):
 
 
 def _infer_competitive_fc_in(input_tensor):
-    """
-    Dynamically compute the flattened feature size produced by the three
-    CompetitiveBlocks (cb1/cb2/cb3) for an arbitrary spatial input size,
-    avoiding the hardcoded 13152 that was calibrated for 112×112 only.
-    """
     cb1 = CompetitiveBlock(1, 9,  35, 0.8, 1.00)
     cb2 = CompetitiveBlock(1, 36, 17, 0.8, 0.50)
     cb3 = CompetitiveBlock(1, 9,   7, 0.8, 0.25)
@@ -273,18 +270,14 @@ def _infer_competitive_fc_in(input_tensor):
 
 
 class CCNet(nn.Module):
-    """1-channel input, feature_dim=2048. fc size inferred from input shape."""
     def __init__(self, num_classes=190, sample_input=None):
         super().__init__()
         self.cb1 = CompetitiveBlock(1, 9, 35, 0.8, 1.00)
         self.cb2 = CompetitiveBlock(1, 36, 17, 0.8, 0.50)
         self.cb3 = CompetitiveBlock(1, 9,  7, 0.8, 0.25)
-
-        # Infer fc input dimension from a sample forward pass
         if sample_input is None:
             sample_input = torch.zeros(1, 1, 224, 224)
         fc_in = _infer_competitive_fc_in(sample_input)
-
         self.fc  = nn.Linear(fc_in, 2048)
         self.bn  = nn.BatchNorm1d(2048)
 
@@ -294,17 +287,14 @@ class CCNet(nn.Module):
 
 
 class CO3Net(nn.Module):
-    """Same architecture as CCNet. fc size inferred from input shape."""
     def __init__(self, num_classes=190, sample_input=None):
         super().__init__()
         self.cb1 = CompetitiveBlock(1, 9, 35, 0.8, 1.00)
         self.cb2 = CompetitiveBlock(1, 36, 17, 0.8, 0.50)
         self.cb3 = CompetitiveBlock(1, 9,  7, 0.8, 0.25)
-
         if sample_input is None:
             sample_input = torch.zeros(1, 1, 224, 224)
         fc_in = _infer_competitive_fc_in(sample_input)
-
         self.fc  = nn.Linear(fc_in, 2048)
         self.bn  = nn.BatchNorm1d(2048)
 
@@ -314,7 +304,7 @@ class CO3Net(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
-#  SF2NET  (Gabor + Triplet, 1024-d)
+#  SF2NET
 # ══════════════════════════════════════════════════════════════
 
 class SF2Net(nn.Module):
@@ -353,22 +343,19 @@ class SF2Net(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
-#  PALMBRIDGE  (CompNet backbone + codebook)
+#  PALMBRIDGE
 # ══════════════════════════════════════════════════════════════
 
 class PalmBridgeModel(nn.Module):
-    """CompNet backbone only — codebook is separate (not counted in inference)."""
     def __init__(self, feature_dim=512, num_pb_vectors=512):
         super().__init__()
         self.backbone = CompNetBackbone(feature_dim)
-        # PalmBridge codebook P ∈ R^{K×D}
         self.P = nn.Parameter(
             F.normalize(torch.randn(num_pb_vectors, feature_dim), p=2, dim=1))
         self.W_ORI = 0.7; self.W_MAP = 0.3
 
     def forward(self, x):
         z = self.backbone(x)
-        # Nearest-vector lookup (argmin L2)
         dists   = (z.pow(2).sum(1, keepdim=True)
                    + self.P.pow(2).sum(1).unsqueeze(0)
                    - 2.0 * (z @ self.P.t()))
@@ -407,22 +394,10 @@ class DINOv2Model(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
-#  PDFG  (MultiDatasetExtractors — inference model only)
-#  Source: "Palm-print Domain Feature Generalization", adapted
-#           for Palm-Auth
-#
-#  Inference path: model.extract_avg(x)
-#    → SharedLayers (shared CNN stem)
-#    → N=2 independent Linear heads (each: flat→1024→512→feat_dim)
-#    → average all head outputs → L2-normalise
-#  Excluded (training-only): ArcFaceLoss heads
-#  Input: 3×224×224
-#  flat_dim is inferred dynamically from a dummy forward pass,
-#  so no hardcoded size is needed.
+#  PDFG
 # ══════════════════════════════════════════════════════════════
 
 class _PDFGSharedLayers(nn.Module):
-    """Shared CNN stem from PDFG (unchanged)."""
     def __init__(self):
         super().__init__()
         self.conv1 = nn.Conv2d(3, 16,  3, stride=4, padding=1)
@@ -443,23 +418,13 @@ class _PDFGSharedLayers(nn.Module):
 
 
 class PDFGModel(nn.Module):
-    """
-    Inference-only wrapper for PDFG's MultiDatasetExtractors.
-    N=2 heads, feature_dim=128.
-    flat_dim is inferred via a dummy 224×224 forward pass so no
-    hardcoded spatial size is needed.
-    """
-    def __init__(self, n_heads=2, feature_dim=128,
-                 sample_input=None):
+    def __init__(self, n_heads=2, feature_dim=128, sample_input=None):
         super().__init__()
         self.shared = _PDFGSharedLayers()
-
-        # Infer flattened size from sample input
         if sample_input is None:
             sample_input = torch.zeros(1, 3, 224, 224)
         with torch.no_grad():
             flat_dim = self.shared(sample_input).view(1, -1).shape[1]
-
         self.heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(flat_dim, 1024), nn.LeakyReLU(0.2, inplace=True),
@@ -469,7 +434,6 @@ class PDFGModel(nn.Module):
         ])
 
     def forward(self, x):
-        """Mirrors MultiDatasetExtractors.extract_avg() used at eval."""
         shared = self.shared(x).view(x.size(0), -1)
         per_head = torch.stack(
             [F.normalize(h(shared), p=2, dim=1) for h in self.heads], dim=0)
@@ -477,33 +441,16 @@ class PDFGModel(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
-#  TSCAN  (inference model only — PalmNet / FeatureEncoder)
-#  Source: "Teacher-Student Co-learning with Adversarial
-#           Normalization" adapted for Palm-Auth
-#
-#  Inference path: PalmNet.get_features(x)
-#    → FeatureEncoder: frozen ResNet-18 stem+layer1-3
-#                    + trainable layer4
-#                    + Linear(512→feat_dim) + Tanh
-#  Excluded (training-only): DomainDiscriminator, AdaFaceLoss
-#  Input: 3×224×224
+#  TSCAN
 # ══════════════════════════════════════════════════════════════
 
 class TSCANModel(nn.Module):
-    """
-    Inference-only wrapper for TSCAN's PalmNet.
-    Mirrors FeatureEncoder exactly — frozen_layers are included
-    because they run during inference (no_grad scope is a training
-    optimisation, not an architectural exclusion).
-    """
     def __init__(self, feat_dim=256):
         super().__init__()
         backbone = tv_models.resnet18(weights=None)
         children = list(backbone.children())
-        # stem + layer1 + layer2 + layer3  (frozen during training, but
-        # still execute at inference — must be included in the model)
         self.frozen_layers = nn.Sequential(*children[:7])
-        self.layer4        = children[7]          # trainable
+        self.layer4        = children[7]
         self.avgpool       = children[8]
         self.flatten       = nn.Flatten()
         self.linear        = nn.Linear(512, feat_dim, bias=True)
@@ -519,49 +466,32 @@ class TSCANModel(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
-#  GIFT  (GIFTBackbone — inference model only)
-#  Source: "Generating Stylized Features for Single-Source
-#           Cross-Dataset Palmprint Recognition", TIP 2024
-#
-#  At inference the FSMs are inactive (pass-through), so they
-#  contribute parameters but add zero FLOPs.
-#  Input: 3×112×112 RGB  (eval_transform in the original code)
+#  GIFT
 # ══════════════════════════════════════════════════════════════
 
 class _FeatureStylizationModule(nn.Module):
-    """FSM — inactive at eval, so zero extra FLOPs during inference."""
     def __init__(self, gamma=0.2):
         super().__init__()
         self.gamma  = gamma
-        self.active = False   # always False at eval
+        self.active = False
 
     def forward(self, f):
-        # During eval (active=False) this is a pure pass-through.
         return f, f
 
 
 class GIFTModel(nn.Module):
-    """
-    Inference-only wrapper around GIFTBackbone.
-    Matches the original architecture exactly:
-      ResNet-18 backbone + 5 FSM modules + linear projection to emb_dim.
-    FSMs are never activated here, so they cost zero FLOPs.
-    """
     def __init__(self, emb_dim=128, gamma=0.2):
         super().__init__()
-        resnet = tv_models.resnet18(weights=None)   # no pretrained weights needed for param/FLOP count
-
+        resnet = tv_models.resnet18(weights=None)
         self.conv1   = resnet.conv1
         self.bn1     = resnet.bn1
         self.relu    = resnet.relu
         self.maxpool = resnet.maxpool
         self.fsm0    = _FeatureStylizationModule(gamma)
-
         self.layer1  = resnet.layer1; self.fsm1 = _FeatureStylizationModule(gamma)
         self.layer2  = resnet.layer2; self.fsm2 = _FeatureStylizationModule(gamma)
         self.layer3  = resnet.layer3; self.fsm3 = _FeatureStylizationModule(gamma)
         self.layer4  = resnet.layer4; self.fsm4 = _FeatureStylizationModule(gamma)
-
         self.avgpool = resnet.avgpool
         self.fc      = nn.Linear(resnet.fc.in_features, emb_dim)
 
@@ -572,8 +502,150 @@ class GIFTModel(nn.Module):
         x = self.layer2(x); x, _ = self.fsm2(x)
         x = self.layer3(x); x, _ = self.fsm3(x)
         x = self.layer4(x); x, _ = self.fsm4(x)
-        x   = self.avgpool(x).flatten(1)
+        x = self.avgpool(x).flatten(1)
         return F.normalize(self.fc(x), p=2, dim=1)
+
+
+# ══════════════════════════════════════════════════════════════
+#  iResNet100  (shared architecture for ArcFace and MagFace)
+# ══════════════════════════════════════════════════════════════
+
+def conv3x3(in_planes, out_planes, stride=1, groups=1):
+    return nn.Conv2d(in_planes, out_planes, 3, stride=stride,
+                     padding=1, groups=groups, bias=False)
+
+def conv1x1(in_planes, out_planes, stride=1):
+    return nn.Conv2d(in_planes, out_planes, 1, stride=stride, bias=False)
+
+
+class IBasicBlock(nn.Module):
+    expansion = 1
+    def __init__(self, inplanes, planes, stride=1, downsample=None,
+                 groups=1, base_width=64, dilation=1):
+        super().__init__()
+        self.bn1   = nn.BatchNorm2d(inplanes, eps=1e-05)
+        self.conv1 = conv3x3(inplanes, planes)
+        self.bn2   = nn.BatchNorm2d(planes, eps=1e-05)
+        self.prelu = nn.PReLU(planes)
+        self.conv2 = conv3x3(planes, planes, stride)
+        self.bn3   = nn.BatchNorm2d(planes, eps=1e-05)
+        self.downsample = downsample; self.stride = stride
+
+    def forward(self, x):
+        identity = x
+        out = self.bn1(x);    out = self.conv1(out)
+        out = self.bn2(out);  out = self.prelu(out)
+        out = self.conv2(out); out = self.bn3(out)
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        return out + identity
+
+
+class IResNet(nn.Module):
+    def __init__(self, block, layers, num_features=512):
+        super().__init__()
+        self.inplanes = 64
+        self.conv1  = nn.Conv2d(3, 64, 3, stride=1, padding=1, bias=False)
+        self.bn1    = nn.BatchNorm2d(64, eps=1e-05)
+        self.prelu  = nn.PReLU(64)
+        self.layer1 = self._make_layer(block, 64,  layers[0], stride=2)
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+        self.bn2    = nn.BatchNorm2d(512, eps=1e-05)
+        self.fc     = nn.Linear(512 * 7 * 7, num_features)
+        self.features = nn.BatchNorm1d(num_features, eps=1e-05)
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes:
+            downsample = nn.Sequential(
+                conv1x1(self.inplanes, planes, stride),
+                nn.BatchNorm2d(planes, eps=1e-05))
+        layers = [block(self.inplanes, planes, stride, downsample)]
+        self.inplanes = planes
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.prelu(self.bn1(self.conv1(x)))
+        x = self.layer4(self.layer3(self.layer2(self.layer1(x))))
+        x = self.bn2(x)
+        x = F.adaptive_avg_pool2d(x, (7, 7))   # handles any input spatial size
+        x = x.flatten(1)
+        x = self.fc(x);  x = self.features(x)
+        return x
+
+
+def iresnet100(num_features=512):
+    return IResNet(IBasicBlock, [3, 13, 30, 3], num_features=num_features)
+
+
+# ══════════════════════════════════════════════════════════════
+#  ARCFACE iResNet100  (loaded from ONNX via onnx2torch)
+#  Input: 3×112×112 RGB, mean=0.5, std=0.5
+#  Freeze: first 75% of parameter tensors
+# ══════════════════════════════════════════════════════════════
+
+class ArcFaceModel(nn.Module):
+    """
+    ArcFace iResNet100 from InsightFace ONNX (R100, Glint360K).
+    Loaded via onnx2torch — no custom architecture mapping needed.
+    Freeze ratio: first 75% of parameter tensors frozen.
+    """
+    def __init__(self, onnx_path, freeze_ratio=0.75):
+        super().__init__()
+        import onnx
+        from onnx2torch import convert
+        self.net = convert(onnx.load(onnx_path))
+
+        all_params = list(self.net.parameters())
+        n_freeze   = int(len(all_params) * freeze_ratio)
+        for i, p in enumerate(all_params):
+            p.requires_grad = (i >= n_freeze)
+
+    def forward(self, x):
+        if x.shape[-1] != 112:
+            x = F.interpolate(x, size=(112, 112), mode='bilinear', align_corners=False)
+        out = self.net(x)
+        if isinstance(out, (list, tuple)):
+            out = out[0]
+        return F.normalize(out, p=2, dim=1)
+
+
+# ══════════════════════════════════════════════════════════════
+#  MAGFACE iResNet100  (loaded from .pth checkpoint)
+#  Input: 3×112×112 RGB, mean=0.5, std=0.5
+#  Freeze: first 75% of parameter tensors
+# ══════════════════════════════════════════════════════════════
+
+class MagFaceModel(nn.Module):
+    """
+    MagFace iResNet100 from official MagFace checkpoint (MS1MV2).
+    Checkpoint key format: "features.module.*" → stripped to match IResNet.
+    Freeze ratio: first 75% of parameter tensors frozen.
+    """
+    def __init__(self, ckpt_path, freeze_ratio=0.75):
+        super().__init__()
+        self.net = iresnet100()
+
+        ckpt  = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        state = ckpt.get("state_dict", ckpt)
+        state = {k.replace("features.module.", ""): v
+                 for k, v in state.items()
+                 if k.startswith("features.module.")}
+        missing, unexpected = self.net.load_state_dict(state, strict=False)
+        if missing:    print(f"  [MagFace] Missing keys    : {len(missing)}")
+        if unexpected: print(f"  [MagFace] Unexpected keys : {len(unexpected)}")
+
+        all_params = list(self.net.parameters())
+        n_freeze   = int(len(all_params) * freeze_ratio)
+        for i, p in enumerate(all_params):
+            p.requires_grad = (i >= n_freeze)
+
+    def forward(self, x):
+        return F.normalize(self.net(x), p=2, dim=1)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -587,13 +659,12 @@ def count_params(model):
 
 
 def count_flops(model, input_tensor):
-    """Return GFLOPs for a single forward pass."""
     try:
         model.eval()
         flops = FlopCountAnalysis(model, input_tensor)
         flops.unsupported_ops_warnings(False)
         flops.uncalled_modules_warnings(False)
-        return flops.total() / 1e9   # GFLOPs
+        return flops.total() / 1e9
     except Exception as e:
         print(f"    [FLOP count failed: {e}]")
         return float("nan")
@@ -606,26 +677,27 @@ def fmt_params(n):
 
 
 def run():
-    x1  = torch.zeros(1, 1, 224, 224)   # grayscale 224×224
-    x3  = torch.zeros(1, 3, 224, 224)   # RGB 224×224
-    x3s = torch.zeros(1, 3, 224, 224)   # RGB 224×224  (standardised input)
+    x1   = torch.zeros(1, 1, 224, 224)   # grayscale 224×224
+    x3   = torch.zeros(1, 3, 224, 224)   # RGB 224×224
+    x3s  = torch.zeros(1, 3, 224, 224)   # RGB 224×224
 
     MODELS = [
-        ("CompNet",          lambda: CompNet(),                    x1),
-        ("PPNet",            lambda: PPNet(),                      x1),
-        ("CCNet",            lambda: CCNet(sample_input=x1),      x1),
-        ("CO3Net",           lambda: CO3Net(sample_input=x1),     x1),
-        ("SF2Net",           lambda: SF2Net(),                     x1),
-        ("PalmBridge",       lambda: PalmBridgeModel(),            x1),
-        ("ConvNeXtV2-Tiny",  lambda: ConvNeXtModel(),             x3),
-        ("DINOv2 ViT-S/14", lambda: DINOv2Model(),               x3),
-        ("GIFT (ResNet-18)", lambda: GIFTModel(),                           x3s),
-        ("TSCAN (PalmNet)",  lambda: TSCANModel(),                          x3s),
-        ("PDFG",             lambda: PDFGModel(sample_input=x3s),           x3s),
+        ("CompNet",             lambda: CompNet(),                     x1),
+        ("PPNet",               lambda: PPNet(),                       x1),
+        ("CCNet",               lambda: CCNet(sample_input=x1),        x1),
+        ("CO3Net",              lambda: CO3Net(sample_input=x1),       x1),
+        ("SF2Net",              lambda: SF2Net(),                      x1),
+        ("PalmBridge",          lambda: PalmBridgeModel(),             x1),
+        ("ConvNeXtV2-Tiny",     lambda: ConvNeXtModel(),              x3),
+        ("DINOv2 ViT-S/14",    lambda: DINOv2Model(),                x3),
+        ("GIFT (ResNet-18)",    lambda: GIFTModel(),                  x3s),
+        ("TSCAN (PalmNet)",     lambda: TSCANModel(),                  x3s),
+        ("PDFG",                lambda: PDFGModel(sample_input=x3s),  x3s),
+        ("ArcFace iResNet100",  lambda: ArcFaceModel(ARCFACE_ONNX_PATH), x3),
+        ("MagFace iResNet100",  lambda: MagFaceModel(MAGFACE_CKPT_PATH), x3),
     ]
 
-    # Column widths
-    W_NAME  = 20
+    W_NAME  = 22
     W_TOTAL = 16
     W_TRAIN = 16
     W_FLOPS = 12
@@ -637,7 +709,7 @@ def run():
     sep = "─" * len(header)
 
     print("\n" + "=" * len(header))
-    print("Model Comparison — Parameters & FLOPs (single sample, input 224×224)")
+    print("Model Comparison — Parameters & FLOPs")
     print("=" * len(header))
     print(header)
     print(sep)
@@ -649,27 +721,21 @@ def run():
             model = build_fn().to(DEVICE).eval()
             total, trainable = count_params(model)
             gflops           = count_flops(model, x)
-
-            results.append({
-                "name": name, "total": total,
-                "trainable": trainable, "gflops": gflops,
-            })
-
+            results.append({"name": name, "total": total,
+                            "trainable": trainable, "gflops": gflops})
             gflops_str = f"{gflops:.3f}" if not math.isnan(gflops) else "N/A"
             print(f"    {name:<{W_NAME}}"
                   f"{fmt_params(total):>{W_TOTAL}}"
                   f"{fmt_params(trainable):>{W_TRAIN}}"
                   f"{gflops_str:>{W_FLOPS}}")
-
         except Exception as e:
             print(f"  ERROR — {name}: {e}")
 
     print(sep)
 
-    # ── Save to txt ────────────────────────────────────────────
     out_path = "model_comparison.txt"
     with open(out_path, "w") as f:
-        f.write("Model Comparison — Parameters & FLOPs (input 224×224)\n")
+        f.write("Model Comparison — Parameters & FLOPs\n")
         f.write(sep + "\n")
         f.write(header + "\n")
         f.write(sep + "\n")
@@ -683,15 +749,15 @@ def run():
         f.write("\nNotes:\n")
         f.write("  - GFLOPs measured for a single sample (batch=1)\n")
         f.write("  - Grayscale models (CompNet/PPNet/CCNet/CO3Net/SF2Net/PalmBridge): input 1×224×224\n")
-        f.write("  - RGB models (ConvNeXt/DINOv2): input 3×224×224\n")
-        f.write("  - GIFT: input 3×224×224 (standardised to match other models)\n")
-        f.write("  - GIFT FSMs are inactive at inference → zero extra FLOPs, but counted in params\n")
-        f.write("  - TSCAN: inference model is PalmNet (FeatureEncoder); discriminator & AdaFace excluded\n")
-        f.write("  - PDFG: inference model is MultiDatasetExtractors (N=2 heads); ArcFace loss excluded\n")
-        f.write("  - PDFG flat_dim inferred dynamically from 224×224 input\n")
-        f.write("  - DINOv2 requires input size multiple of patch_size=14 → 224×224\n")
-        f.write("  - PalmBridge includes codebook P ∈ R^{512×512} in parameter count\n")
-        f.write("  - CCNet/CO3Net fc input size inferred dynamically (not hardcoded)\n")
+        f.write("  - RGB models (ConvNeXt/DINOv2/GIFT/TSCAN/PDFG): input 3×224×224\n")
+        f.write("  - ArcFace & MagFace: input 3×224×224 (ArcFace downscales to 112×112 internally; MagFace uses adaptive pool)\n")
+        f.write("  - ArcFace loaded from ONNX via onnx2torch (R100, Glint360K)\n")
+        f.write("  - MagFace loaded from .pth checkpoint (R100, MS1MV2, epoch 25)\n")
+        f.write("  - Both face models: first 75% of parameter tensors frozen\n")
+        f.write("  - GIFT FSMs inactive at inference → zero extra FLOPs\n")
+        f.write("  - TSCAN: FeatureEncoder only; discriminator & AdaFace excluded\n")
+        f.write("  - PDFG: MultiDatasetExtractors (N=2 heads); ArcFace loss excluded\n")
+        f.write("  - PalmBridge includes codebook P in R^{512x512}\n")
     print(f"\nTable saved to: {out_path}")
 
 
