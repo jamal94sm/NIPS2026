@@ -30,7 +30,7 @@ Results saved to:
 CONFIG = {
     "palm_auth_data_root"  : "/home/pai-ng/Jamal/smartphone_data",
     "scanner_spectra"      : {"green", "ir", "yellow", "pink", "white"},
-    "pretrained_weights"   : "/home/pai-ng/Jamal/NIPS2026/Face/r100_glint360k.onnx",  # ONNX from InsightFace model zoo
+    "pretrained_weights"   : "/home/pai-ng/Jamal/NIPS2026/face_models/checkpoints/r100_glint360k.onnx",  # ONNX from InsightFace model zoo
 
     "train_id_ratio"       : 0.80,
     "test_gallery_ratio"   : 0.50,
