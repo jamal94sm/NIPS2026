@@ -216,17 +216,12 @@ class MagFaceBackbone(nn.Module):
             print(f"  [WARN] Pretrained weights not found at: {pretrained_path}")
             print(f"         Training from scratch.")
 
-        # Freeze stem + layers 1-3
-        for module in [self.net.conv1, self.net.bn1, self.net.prelu,
-                        self.net.layer1, self.net.layer2, self.net.layer3]:
-            for p in module.parameters():
-                p.requires_grad = False
 
-        # Unfreeze layer4, bn2, fc, features
-        for module in [self.net.layer4, self.net.bn2,
-                        self.net.fc, self.net.features]:
-            for p in module.parameters():
-                p.requires_grad = True
+        # Freeze first 75% of parameters by index (matches ArcFace strategy)
+        all_params = list(self.net.parameters())
+        n_freeze   = int(len(all_params) * 0.75)
+        for i, p in enumerate(all_params):
+            p.requires_grad = (i >= n_freeze)
 
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         total     = sum(p.numel() for p in self.parameters())
