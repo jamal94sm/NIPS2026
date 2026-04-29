@@ -49,7 +49,7 @@ CONFIG = {
     "m_u"                  : 0.80,   # upper margin bound
     "l_a"                  : 10.0,   # lower magnitude bound
     "u_a"                  : 110.0,  # upper magnitude bound
-    "lambda_g"             : 20.0,   # magnitude regularization weight (increased: avg_norm was ~28, target u_a=110)
+    "lambda_g"             : 35.0,   # magnitude regularization weight (increased: avg_norm was ~28, target u_a=110)
 
     # Training
     "img_side"             : 112,
@@ -414,25 +414,15 @@ def _aug_tf(img_side):
 
 
 class TrainDataset(Dataset):
-    """
-    Returns (img_orig, aug1, aug2, aug3, label) — 4× views per image per epoch.
-    img_orig : base transform only (stable anchor, no augmentation)
-    aug1-3   : three independently sampled augmentations
-    Matches the augmentation strategy used in ConvNeXt and DINOv2 scripts.
-    """
+    """Single augmented view per image per epoch.
+    One transform picked randomly from 4 options."""
     def __init__(self, samples, img_side):
-        self.samples  = samples
-        self.img_side = img_side
-        self.base     = _base_tf(img_side)
+        self.samples   = samples
+        self.transform = _aug_tf(img_side)
     def __len__(self): return len(self.samples)
     def __getitem__(self, idx):
         path, label = self.samples[idx]
-        img = Image.open(path).convert("RGB")
-        return (self.base(img),
-                _aug_tf(self.img_side)(img),
-                _aug_tf(self.img_side)(img),
-                _aug_tf(self.img_side)(img),
-                label)
+        return self.transform(Image.open(path).convert("RGB")), label
 
 
 class EvalDataset(Dataset):
@@ -585,14 +575,13 @@ def main():
         ep_corr = 0;   ep_tot = 0
         ep_norm_sum = 0.0
 
-        for img_orig, aug1, aug2, aug3, labels in train_loader:
-            # Stack original + 3 augmented views → 4× batch
-            imgs_all   = torch.cat([img_orig, aug1, aug2, aug3], dim=0).to(device)
-            labels_all = torch.cat([labels, labels, labels, labels], dim=0).to(device)
+        for imgs, labels in train_loader:
+            imgs   = imgs.to(device)
+            labels = labels.to(device)
             optimizer.zero_grad()
 
-            embeddings        = model(imgs_all)          # raw, not normalised
-            loss, l_arc, l_g  = criterion(embeddings, labels_all)
+            embeddings        = model(imgs)          # raw, not normalised
+            loss, l_arc, l_g  = criterion(embeddings, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, 5.0)
             optimizer.step()
@@ -604,8 +593,8 @@ def main():
 
             with torch.no_grad():
                 preds    = criterion.get_logits(embeddings).argmax(dim=1)
-                ep_corr += (preds == labels_all).sum().item()
-                ep_tot  += labels_all.size(0)
+                ep_corr += (preds == labels).sum().item()
+                ep_tot  += labels.size(0)
 
         scheduler.step()
         n   = len(train_loader)
