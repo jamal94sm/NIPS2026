@@ -30,7 +30,8 @@ Results saved to:
 CONFIG = {
     "palm_auth_data_root"  : "/home/pai-ng/Jamal/smartphone_data",
     "scanner_spectra"      : {"green", "ir", "yellow", "pink", "white"},
-    "pretrained_weights"   : "./pretrained/arcface_r100_ms1mv2.pth",
+    "pretrained_weights"   : "/home/pai-ng/Jamal/NIPS2026/Face/arcface_r100_ms1mv2.pth",
+
 
     "train_id_ratio"       : 0.80,
     "test_gallery_ratio"   : 0.50,
