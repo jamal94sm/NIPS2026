@@ -85,7 +85,7 @@ SCALE        = 16       # ArcFace scale
 EVAL_EVERY   = 5
 NUM_WORKERS  = 4
 IMG_SIZE     = 224
-SEED         = 42
+SEED         = 123
 
 DEVICE   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IMG_EXTS = {".jpg", ".jpeg", ".bmp", ".png"}
