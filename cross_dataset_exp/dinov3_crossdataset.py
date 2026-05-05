@@ -1,19 +1,17 @@
 """
 DINOv3 ViT-S — Full Cross-Dataset Experiment Runner
 =====================================================
-Backbone : ViT-Small/16 pretrained with custom DINOv3 self-supervised training
-           (vit_small_patch16_224 via timm)
-           Loaded from checkpoint via load_dino_encoder_weights()
+Backbone : DINOv2 ViT-S/14 (facebookresearch/dinov2, pretrained on LVD-142M)
+           used as the base pretrained model — identical to the DINOv2 baseline.
+           When a custom DINOv3 checkpoint is available (trained with the DINOv3
+           self-supervised framework on palmprint data), it is loaded instead.
            Finetuned: last N transformer blocks + norm layer
 Loss     : ArcFace (additive angular margin) + SupCon
 Input    : 112×112 RGB, ImageNet normalization (mean=0.485, std=0.229)
 
-Model files required (place in same directory or update DINO_MODEL_DIR):
-  Model.py
-  DBLoaders.py
-
-Checkpoint:
-  Place pretrained DINOv3 checkpoint at DINO_CKPT_PATH
+Checkpoint (optional):
+  If you have trained a DINOv3 palmprint checkpoint, set dino_ckpt_path.
+  Otherwise, the official DINOv2 ViT-S/14 weights are used as initialization.
 
 Train datasets : CASIA-MS | Palm-Auth | MPDv2 | XJTU
 Test  datasets : CASIA-MS | Palm-Auth | MPDv2 | XJTU
@@ -40,11 +38,11 @@ BASE_CONFIG = {
     "xjtu_data_root"       : "/home/pai-ng/Jamal/XJTU-UP",
 
     # DINOv3 checkpoint path
-    "dino_ckpt_path"       : None,  # Set to path of custom DINOv3 checkpoint, or None to use ImageNet pretrained ViT-S
+    "dino_ckpt_path"       : None,  # Set to path of custom DINOv3 palmprint checkpoint, or None to use DINOv2 ViT-S/14 weights
 
     # Model
-    "model_name"           : "vit_small_patch16_224",
-    "embed_dim"            : 384,
+    "model_name"           : "dinov2_vits14",  # same as DINOv2 baseline
+    "embed_dim"            : 384,   # ViT-S/14 embedding dim
     "layers_to_tune"       : 2,      # finetune last N transformer blocks
 
     "train_subject_ratio"  : 0.80,
@@ -68,7 +66,7 @@ BASE_CONFIG = {
     "eval_every"           : 5,
     "num_workers"          : 4,
 
-    "base_results_dir"     : "./rst_vits16_crossdataset",
+    "base_results_dir"     : "./rst_dinov3_crossdataset",
     "random_seed"          : 42,
 }
 # ==============================================================
@@ -84,7 +82,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-import timm
 
 from sklearn.metrics import roc_curve
 from scipy.optimize import brentq
@@ -204,31 +201,35 @@ class DinoV3Transform:
 # ──────────────────────────────────────────────────────────────
 
 def _load_dinov3_encoder(ckpt_path, model_name, embed_dim,
-                          layers_to_tune, device, model_dir="."):
+                          layers_to_tune, device):
     """
-    Load ViT-S encoder for palmprint finetuning.
+    Load DINOv3 encoder for palmprint finetuning.
 
     Priority:
-      1. If ckpt_path is set and file exists → load custom DINOv3 checkpoint
+      1. If ckpt_path is set and file exists → load custom DINOv3 palmprint
+         checkpoint (trained with DINOv3 self-supervised framework on palmprints)
          via inlined load_dino_encoder_weights()
-      2. Otherwise → initialize from public ImageNet pretrained weights
-         (timm downloads automatically on first run)
+      2. Otherwise → load official DINOv2 ViT-S/14 pretrained weights
+         (facebookresearch/dinov2, pretrained on LVD-142M)
+         This is identical to the DINOv2 baseline initialization, ensuring
+         a fair comparison — the only difference is the finetuning framework.
     """
     if ckpt_path and os.path.exists(ckpt_path):
-        encoder = timm.create_model(
-            model_name, pretrained=False,
-            img_size=112, num_classes=0, dynamic_img_size=True,
-        )
+        # Load custom DINOv3 palmprint checkpoint
+        # The underlying architecture is still ViT-S/14 (dinov2_vits14)
+        _base = torch.hub.load(
+            "facebookresearch/dinov2", "dinov2_vits14", verbose=False)
+        _base.head = torch.nn.Identity()
+        encoder = _base
         encoder = load_dino_encoder_weights(encoder, ckpt_path, device)
-        print(f"  Loaded custom DINOv3 checkpoint: {ckpt_path}")
+        print(f"  Loaded custom DINOv3 palmprint checkpoint: {ckpt_path}")
     else:
-        print(f"  No custom checkpoint — loading ImageNet pretrained "
-              f"{model_name} from timm …")
-        encoder = timm.create_model(
-            model_name, pretrained=True,
-            img_size=112, num_classes=0, dynamic_img_size=True,
-        )
-        print(f"  Loaded ImageNet pretrained weights (timm)")
+        # Use official DINOv2 ViT-S/14 weights — same as DINOv2 baseline
+        print(f"  No custom DINOv3 checkpoint found.")
+        print(f"  Loading official DINOv2 ViT-S/14 (LVD-142M) as initialization …")
+        encoder = torch.hub.load(
+            "facebookresearch/dinov2", "dinov2_vits14", verbose=False)
+        print(f"  Loaded DINOv2 ViT-S/14 pretrained weights (Meta, LVD-142M)")
 
     # Freeze all parameters
     for p in encoder.parameters():
@@ -342,7 +343,7 @@ class SupConLoss(nn.Module):
 
 # ══════════════════════════════════════════════════════════════
 #  TRANSFORMS & DATASETS
-#  ImageNet normalization — matches DINOv3 pretraining convention
+#  ImageNet normalization — matches DINOv2/DINOv3 pretraining convention
 # ══════════════════════════════════════════════════════════════
 
 def _base_tf(img_side):
