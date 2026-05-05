@@ -101,7 +101,7 @@ EVAL_EVERY    = 5
 NUM_WORKERS   = 4
 GRAD_CLIP     = 1.0
 
-SEED          = 42
+SEED          = 123
 SAVE_DIR      = "./rst_gift_crossdomain"
 DEVICE        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
