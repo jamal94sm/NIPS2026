@@ -53,7 +53,7 @@ BASE_CONFIG = {
 
     # ── Misc ───────────────────────────────────────────────────
     "base_results_dir"     : "./rst_compnet_all",
-    "random_seed"          : 42,
+    "random_seed"          : 123,
     "save_every"           : 50,
     "eval_every"           : 50,
     "num_workers"          : 4,
