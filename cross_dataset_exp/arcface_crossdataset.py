@@ -48,7 +48,7 @@ BASE_CONFIG = {
     "num_workers"          : 4,
 
     "base_results_dir"     : "./rst_arcface_crossdataset",
-    "random_seed"          : 42,
+    "random_seed"          : 123,
 }
 # ==============================================================
 
