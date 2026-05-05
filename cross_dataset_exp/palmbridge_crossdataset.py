@@ -42,7 +42,7 @@ BASE_CONFIG = {
     "weight_decay"         : 5e-4,
 
     "base_results_dir"     : "./rst_palmbridge_all",
-    "random_seed"          : 42,
+    "random_seed"          : 123,
     "eval_every"           : 5,
     "num_workers"          : 4,
 }
