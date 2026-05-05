@@ -109,7 +109,7 @@ WARMUP_EPOCHS = 5
 
 # ── Misc ──────────────────────────────────────────────────────────────────────
 N_EER_THRESHOLDS = 2000
-SEED             = 42
+SEED             = 123
 SAVE_DIR         = "./rst_palmbridge_crossdomain"
 PLOT_DIR         = "./rst_palmbridge_crossdomain/plots"
 LOG_EPOCHS       = 5
