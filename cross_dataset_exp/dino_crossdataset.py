@@ -44,7 +44,7 @@ BASE_CONFIG = {
     "num_workers"          : 4,
 
     "base_results_dir"     : "./rst_dino_all",
-    "random_seed"          : 42,
+    "random_seed"          : 123,
 }
 # ==============================================================
 
