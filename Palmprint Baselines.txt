@@ -1,0 +1,133 @@
+
+################################### Cross-domain Authentication 
+### Domain Generalization 
+Learning to Generalize Unseen Dataset for Cross-Dataset Palmprint Recognition (PDFG)
+
+Unified Adversarial Augmentation for Improving Palmprint Recognition 
+
+Single Source Domain Generalization for Palm Biometrics (PalmRSS) 
+
+Generating Stylized Features for Single-Source Cross-Dataset Palmprint Recognition with Unseen Target Dataset (GIFT) 
+
+
+ArcPalm: Distribution Alignment for Cross-Device Palmprint Recognition, PR 2022
+
+DDH – Deep Distilled Hashing for Unconstrained Palmprints, arXive 2020
+
+Cross‑dataset Image Matching Network for Heterogeneous Palmprint Recognition, CCBR 2022
+
+
+
+### Domain Adaptation
+
+TSCAN: Teacher-Student Co-Learning Adaptive Network for Cross-Device Palmprint Recognition, Springer CCBR 2025 
+
+Multi-Target Cross-Dataset Palmprint Recognition via Distilling From Multi-Teacher (DFMT) 2023 
+
+Towards Cross-Dataset Palmprint Recognition Via Joint Pixel and Feature Alignment (JPFA) TIP 2021 
+
+Lsfm: Light style and feature matching for efficient cross-domain palmprint recognition (LSFM) 2024
+
+Distribution alignment for cross‑device palmprint recognition (Pattern Recognition 2022) TIM 2021
+
+Learning With Partners to Improve the Multi-Source Cross-Dataset Palmprint Recognition (LWP) TIFS 2021
+
+Cross-domain palmprint recognition via regularized adversarial domain adaptive hashing (R-ADAH) TCSVT 2020
+
+
+
+################################### Cross-subject (open-set evaluation) Authentication 
+
+PalmBridge: A Plug-and-Play Feature Alignment Framework for Open-Set Palmprint Verification, arXive 2026 
+
+Towards Open-Set Touchless Palmprint Recognition via Weight-Based Meta Metric Learning (W2ML) PR 2022 
+
+Centralized Large Margin Cosine Loss for Open-Set Deep Palmprint Recognition (C-LMCL) TCSVT 2020 
+
+Mobile Contactless Palmprint Recognition: Use of Multiscale, Multimodel Embeddings (Palm-ID) TIFS 2024
+
+
+
+
+
+####################### Models
+
+
+X. Liang, J. Yang, G. Lu and D. Zhang, "CompNet: Competitive Neural Network for Palmprint Recognition Using Learnable Gabor Kernels," in IEEE Signal Processing Letters, vol. 28, pp. 1739-1743, 2021, doi: 10.1109/LSP.2021.3103475.
+
+https://github.com/xuliangcs/compnet
+
+ 
+
+X. Liang, Z. Li, D. Fan, B. Zhang, G. Lu and D. Zhang, "Innovative Contactless Palmprint Recognition System Based on Dual-Camera Alignment," in IEEE Transactions on Systems, Man, and Cybernetics: Systems, vol. 52, no. 10, pp. 6464-6476, Oct. 2022, doi: 10.1109/TSMC.2022.3146777.
+
+https://github.com/xuliangcs/ppnet
+
+ 
+
+Z. Yang, H. Huangfu, L. Leng, B. Zhang, A. B. J. Teoh and Y. Zhang, "Comprehensive Competition Mechanism in Palmprint Recognition," in IEEE Transactions on Information Forensics and Security, vol. 18, pp. 5160-5170, 2023, doi: 10.1109/TIFS.2023.3306104.
+
+https://github.com/Zi-YuanYang/CCNet
+
+ 
+
+Z. Yang et al., "CO3Net: Coordinate-Aware Contrastive Competitive Neural Network for Palmprint Recognition," in IEEE Transactions on Instrumentation and Measurement, vol. 72, pp. 1-14, 2023, Art no. 2514114, doi: 10.1109/TIM.2023.3276506.
+
+https://github.com/Zi-YuanYang/CO3Net
+
+
+Y. Liu, L. Leng, Z. Yang, A. Beng Jin Teoh and B. Zhang, "SF2Net: Sequence Feature Fusion Network for Palmprint Verification," in IEEE Transactions on Information Forensics and Security, vol. 20, pp. 9936-9949, 2025, doi: 10.1109/TIFS.2025.3611692.
+
+https://github.com/20201422/SF2Net
+
+
+
+
+
+############################################  ROI Extraction 
+
+[MPD 2019] PAY BY SHOWING YOUR PALM:ASTUDY OF PALMPRINT VERIFICATIONON MOBILE PLATFORMS
+Towards Palmprint Verification On Smartphones
+[MPDv2 dataset] https://pan.baidu.com/login?redirecturl=https%3A%2F%2Fpan.baidu.com%2Fdisk%2Fmain%23%2Findex
+https://cslinzhang.github.io/deepmpv/
+https://cslinzhang.github.io/MobilePalmPrint/
+
+
+PalmNet: Gabor-PCA Convolutional Networks for Touchless Palmprint Recognition
+https://github.com/AngeloUNIMI/PalmNet
+https://github.com/AngeloUNIMI/PalmSeg
+
+
+Joint Finger Valley Points-Free ROI Detection and Recurrent Layer Aggregation for Palmprint Recognition in Open Environment
+https://github.com/godfatherwang2/RDRLA 
+
+
+Smart touchless palm sensing via palm adjustment and dynamic registration
+https://github.com/zoe-abu/ERAlign
+
+
+
+Palmprint Recognition in Uncontrolled and Uncooperative Environment
+https://github.com/matkowski-voy/Palmprint-Recognition-in-the-Wild
+
+
+An effectual method for extraction of ROI of palmprints
+https://github.com/yyaddaden/PROIE
+https://github.com/safwankdb/Effectual-Palm-RoI-Extraction
+
+
+
+Real-Time Contactless Palm Print Identification System for Uncontrolled and Uncooperative Environment
+https://github.com/VKev/Real-Time-Contactless-Palm-Print-Identification-System
+
+BPFNet: A Unified Framework for Bimodal Palmprint Alignment and Fusion
+https://github.com/dxbdxx/BPFNet
+annotations for CUHKSZ dataset only 
+
+
+PKLNet: Keypoint Localization Neural Network for Touchless Palmprint Recognition Based on Edge-Aware Regression
+
+
+
+
+
