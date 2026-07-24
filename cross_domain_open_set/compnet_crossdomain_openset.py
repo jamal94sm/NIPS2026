@@ -337,13 +337,24 @@ def generate_all_splits(cond_paths, scanner_paths, train_id_ratio, seed):
     train_ids = sorted(set(all_persp_ids) - set(test_ids))
     splits["S_scanner"] = {"train_ids": train_ids, "test_ids": test_ids}
 
+    '''
     # S_scanner_to_persp: train = all scanner IDs, test = no-scanner perspective IDs
     no_scanner_ids = sorted(set(all_persp_ids) - set(scanner_ids))
     splits["S_scanner_to_persp"] = {
         "train_ids": scanner_ids,
         "test_ids" : no_scanner_ids,
     }
-
+    '''
+    # S_scanner_to_persp: apply same ratio to scanner IDs
+    n_test_scan   = len(scanner_ids) - int(len(scanner_ids) * train_id_ratio)
+    n_test_scan   = max(1, n_test_scan)
+    test_scan_ids = sorted(_random.Random(seed).sample(scanner_ids, n_test_scan))
+    train_scan_ids= sorted(set(scanner_ids) - set(test_scan_ids))
+    splits["S_scanner_to_persp"] = {
+        "train_ids": train_scan_ids,
+        "test_ids" : test_scan_ids,
+    }
+  
     # Paired-condition settings
     for cond_a, cond_b in PAIRED_CONDITIONS:
         paths_a = cond_paths.get(cond_a, {})
