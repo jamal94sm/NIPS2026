@@ -39,7 +39,7 @@ CONFIG = {
     "scanner_spectra"      : {"green", "ir", "yellow", "pink", "white"},
 
     # Open-set split
-    "train_id_ratio"       : 0.80,   # fraction of IDs used for training
+    "train_id_ratio"       : 0.50,   # fraction of IDs used for training
     "test_gallery_ratio"   : 0.50,   # sample-level gallery/probe split
 
     # Model
