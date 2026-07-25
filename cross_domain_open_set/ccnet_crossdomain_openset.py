@@ -60,7 +60,7 @@ CONFIG = {
     "lr"                   : 0.001,
     "lr_step"              : 17,
     "lr_gamma"             : 0.8,
-    "augment_factor"       : 2,
+    "augment_factor"       : 1,
 
     # Misc
     "base_results_dir"     : "./rst_ccnet_crossdomain_openset",
