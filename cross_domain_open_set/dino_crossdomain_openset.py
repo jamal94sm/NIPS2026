@@ -148,22 +148,15 @@ def _make_aug():
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TrainDataset(Dataset):
-    """
-    Returns (img_orig, aug1, aug2, aug3, label) — 4× augmentation per image.
-    img_orig : base transform only (no augmentation)
-    aug1-3   : three independently sampled CompNet-style augmentations
-    """
     def __init__(self, samples):
         self.samples = samples
     def __len__(self): return len(self.samples)
     def __getitem__(self, idx):
         path, label = self.samples[idx]
         img = Image.open(path).convert("RGB")
-        return (base_transform(img),
+        return (_make_aug()(img),
                 _make_aug()(img),
-                _make_aug()(img),
-                _make_aug()(img),
-                label)
+                label
 
 
 class EvalDataset(Dataset):
@@ -602,15 +595,13 @@ def run_experiment(train_samples, gallery_samples, probe_samples,
         ep_loss = 0.0; ep_arc = 0.0; ep_con = 0.0
         ep_corr = 0;   ep_tot = 0
 
-        for img_orig, aug1, aug2, aug3, y_i in train_loader:
-            img_orig = img_orig.to(DEVICE)
+        for aug1, aug2, y_i in train_loader:
             aug1     = aug1.to(DEVICE)
             aug2     = aug2.to(DEVICE)
-            aug3     = aug3.to(DEVICE)
             y_i      = y_i.to(DEVICE)
-
-            imgs_all = torch.cat([img_orig, aug1, aug2, aug3], dim=0)
-            y_all    = torch.cat([y_i, y_i, y_i, y_i], dim=0)
+        
+            imgs_all = torch.cat([aug1, aug2], dim=0)
+            y_all    = torch.cat([y_i, y_i], dim=0)
 
             optimizer.zero_grad()
             emb_all  = model(imgs_all)
