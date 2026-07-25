@@ -45,6 +45,7 @@ CONFIG = {
     "weight_decay"         : 5e-4,
     "eval_every"           : 5,
     "num_workers"          : 4,
+    "augment_factor" : 2,
 
     "base_results_dir"     : "./rst_magface_crossdomain_openset",
     "random_seed"          : 42,
@@ -272,11 +273,13 @@ def _aug_tf(img_side):
         transforms.Normalize(mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5])])
 
 class TrainDataset(Dataset):
-    def __init__(self, samples, img_side):
+    def __init__(self, samples, img_side, augment_factor=2):
         self.samples=samples; self.transform=_aug_tf(img_side)
-    def __len__(self): return len(self.samples)
+        self.augment_factor=augment_factor
+    def __len__(self): return len(self.samples)*self.augment_factor
     def __getitem__(self, idx):
-        path, label = self.samples[idx]
+        real_idx = idx % len(self.samples)
+        path, label = self.samples[real_idx]
         return self.transform(Image.open(path).convert("RGB")), label
 
 class EvalDataset(Dataset):
@@ -288,7 +291,7 @@ class EvalDataset(Dataset):
         return self.transform(Image.open(path).convert("RGB")), label
 
 def make_loader(samples, train, cfg):
-    ds = TrainDataset(samples, cfg["img_side"]) if train \
+    ds = TrainDataset(samples, cfg["img_side"], cfg.get("augment_factor",2)) if train \
          else EvalDataset(samples, cfg["img_side"])
     return DataLoader(ds, batch_size=min(cfg["batch_size"], len(samples)),
                       shuffle=train, num_workers=cfg["num_workers"],
