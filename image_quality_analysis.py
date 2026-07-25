@@ -5,6 +5,7 @@ import pandas as pd
 from collections import defaultdict
 import torch
 import pyiqa
+from tqdm import tqdm  # <-- Added for progress bar
 
 # ==========================================
 # Configuration & Paths
@@ -101,7 +102,6 @@ def parse_xjtu_domains(data_root):
     if not os.path.exists(data_root): return records
     IMG_EXTS = {".jpg", ".jpeg", ".bmp", ".png"}
     
-    # Traverse Phone/Condition/Identity structure
     for device in os.listdir(data_root):
         dev_dir = os.path.join(data_root, device)
         if not os.path.isdir(dev_dir): continue
@@ -140,7 +140,6 @@ def parse_xpalm(data_root):
                 parts = os.path.splitext(fname)[0].split("_")
                 if len(parts) < 4: continue
                 
-                # Use raw subject ID (e.g., '001') for cross-domain matching table
                 subj_id = subj_folder 
                 path = os.path.join(subj_dir, fname)
                 records.append({"Dataset": "X-Palm (scanner)", "Subset": "scanner", "ID": subj_id, "Path": path})
@@ -177,13 +176,12 @@ def main():
         print("No images found. Please check dataset root paths.")
         return
 
-    # 2. Compute metrics
-    print(f"Computing metrics for {len(all_records)} images. This will take time...")
+    # 2. Compute metrics with tqdm progress bar
+    print(f"Total images to process: {len(all_records)}")
     results = []
-    for i, record in enumerate(all_records):
-        if i > 0 and i % 1000 == 0:
-            print(f"  Processed {i}/{len(all_records)} images...")
-            
+    
+    # Wrapping all_records in tqdm creates the progress bar
+    for record in tqdm(all_records, desc="Extracting Quality Metrics", unit="img"):
         metrics = compute_metrics(record["Path"])
         if metrics:
             record.update(metrics)
@@ -202,7 +200,6 @@ def main():
     # ---------------------------------------------------------
     table1 = df.groupby('Dataset')[metrics_cols].agg(format_mean_std).T
     
-    # Enforce requested column order
     cols_order = ["XJTU-UP", "MPDv2", "CASIA-MS", "X-Palm (scanner)", "X-Palm (smartphone)"]
     valid_cols = [c for c in cols_order if c in table1.columns]
     table1 = table1[valid_cols]
@@ -220,10 +217,8 @@ def main():
     if not xpalm_df.empty:
         table2 = xpalm_df.groupby(['ID', 'Subset'])[metrics_cols].agg(format_mean_std).unstack(level='Subset')
         
-        # Flatten multi-index columns: e.g., ('NIQE', 'scanner') -> 'NIQE_scanner'
         table2.columns = [f"{metric}_{subset}" for metric, subset in table2.columns]
         
-        # Reorder columns to pair metrics (e.g., NIQE_scanner, NIQE_smartphone, ...)
         paired_cols = []
         for m in metrics_cols:
             if f"{m}_scanner" in table2.columns:
