@@ -109,6 +109,7 @@ WEIGHT_DECAY = 5e-4
 EPOCHS       = 100
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 NUM_WORKERS  = 4
+augment_factor = 2
 
 # ── PalmBridge warm-up ────────────────────────────────────────────────────────
 WARMUP_EPOCHS = 5
