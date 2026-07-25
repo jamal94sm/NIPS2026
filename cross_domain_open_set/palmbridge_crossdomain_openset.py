@@ -375,20 +375,22 @@ def get_eval_transform():
 
 
 class PalmAuthDataset(Dataset):
-    def __init__(self, samples: List[Tuple[str, int]], train: bool = False):
+    def __init__(self, samples: List[Tuple[str, int]], train: bool = False, augment_factor: int = 2):
         self.samples   = samples
         self.transform = get_train_transform() if train else get_eval_transform()
+        self.augment_factor = augment_factor if train else 1
 
-    def __len__(self): return len(self.samples)
+    def __len__(self): return len(self.samples) * self.augment_factor
 
     def __getitem__(self, idx):
-        path, label = self.samples[idx]
+        real_idx = idx % len(self.samples)
+        path, label = self.samples[real_idx]
         img = Image.open(path).convert("L")
         return self.transform(img), label
 
 
-def make_loader(samples, train=False, shuffle=False):
-    ds = PalmAuthDataset(samples, train=train)
+def make_loader(samples, train=False, shuffle=False, augment_factor=2):
+    ds = PalmAuthDataset(samples, train=train, augment_factor=augment_factor)
     return DataLoader(ds, batch_size=min(BATCH_SIZE, len(samples)),
                       shuffle=shuffle, num_workers=NUM_WORKERS,
                       pin_memory=(DEVICE == "cuda"),
