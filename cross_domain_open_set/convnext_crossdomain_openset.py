@@ -597,9 +597,6 @@ def run_experiment(train_samples, gallery_samples, probe_samples,
             imgs_all = torch.cat([aug1, aug2], dim=0)
             y_all    = torch.cat([y_i, y_i], dim=0)
 
-            imgs_all = torch.cat([img_orig, aug1, aug2, aug3], dim=0)
-            y_all    = torch.cat([y_i, y_i, y_i, y_i], dim=0)
-
             optimizer.zero_grad()
             emb_all  = model(imgs_all)
             proj_all = proj(emb_all)
