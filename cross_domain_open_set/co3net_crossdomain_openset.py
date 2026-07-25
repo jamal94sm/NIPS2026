@@ -59,7 +59,7 @@ CONFIG = {
     "lr"                   : 0.001,
     "lr_step"              : 30,
     "lr_gamma"             : 0.6,
-    "augment_factor"       : 2,
+    "augment_factor"       : 1,
 
     # Misc
     "base_results_dir"     : "./rst_co3net_crossdomain_openset",
