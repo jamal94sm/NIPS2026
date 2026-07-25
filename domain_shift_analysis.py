@@ -106,32 +106,38 @@ def parse_xpalm(data_root):
     if not os.path.exists(data_root): return records
     IMG_EXTS = {".jpg", ".png", ".bmp"}
     
-    # Helper to extract the variation condition from filename
-    # NOTE: Adjust `parts[1]` to whichever index holds your variation (e.g., pink, wet, roll)
-    def extract_condition(fname, prefix):
-        parts = os.path.splitext(fname)[0].split("_")
-        condition = parts[1] if len(parts) > 1 else "default"
-        return f"{prefix}_{condition}"
+    # Explicit domain targets
+    scanner_targets = ["pink", "green", "white", "ir", "blue", "yellow"]
+    smartphone_targets = ["wet", "text", "jf", "sf", "bf", "close", "far", "pitch", "roll", "fl", "rnd"]
     
+    # Process Scanner
     scanner_dir = os.path.join(data_root, "scanner_roi")
     if os.path.isdir(scanner_dir):
         for subj in sorted(os.listdir(scanner_dir)):
             subj_dir = os.path.join(scanner_dir, subj)
             if not os.path.isdir(subj_dir): continue
             for fname in sorted(os.listdir(subj_dir)):
-                if os.path.splitext(fname)[1].lower() in IMG_EXTS:
-                    subdomain = extract_condition(fname, "Scanner")
-                    records.append({"Dataset": "X-Palm", "SubDomain": subdomain, "Path": os.path.join(subj_dir, fname)})
+                if os.path.splitext(fname)[1].lower() not in IMG_EXTS: continue
+                # Identify which scanner target matches the filename
+                fname_lower = fname.lower()
+                matched_target = next((t for t in scanner_targets if t in fname_lower), None)
+                if matched_target:
+                    records.append({"Dataset": "X-Palm", "SubDomain": f"Scanner_{matched_target}", "Path": os.path.join(subj_dir, fname)})
 
+    # Process Smartphone
     phone_dir = os.path.join(data_root, "smartphone_roi")
     if os.path.isdir(phone_dir):
         for subj in sorted(os.listdir(phone_dir)):
             subj_dir = os.path.join(phone_dir, subj)
             if not os.path.isdir(subj_dir): continue
             for fname in sorted(os.listdir(subj_dir)):
-                if os.path.splitext(fname)[1].lower() in IMG_EXTS:
-                    subdomain = extract_condition(fname, "Smartphone")
-                    records.append({"Dataset": "X-Palm", "SubDomain": subdomain, "Path": os.path.join(subj_dir, fname)})
+                if os.path.splitext(fname)[1].lower() not in IMG_EXTS: continue
+                # Identify which smartphone target matches the filename
+                fname_lower = fname.lower()
+                matched_target = next((t for t in smartphone_targets if t in fname_lower), None)
+                if matched_target:
+                    records.append({"Dataset": "X-Palm", "SubDomain": f"Smartphone_{matched_target}", "Path": os.path.join(subj_dir, fname)})
+                    
     return records
 
 # ==========================================
@@ -295,9 +301,9 @@ def main():
     # Output Final Table
     df = pd.DataFrame(results)
     
-    print("\n" + "="*110)
+    print("\n" + "="*120)
     print("TABLE: Inter-Domain Distribution Shift by Dataset")
-    print("="*110)
+    print("="*120)
     print(df.to_markdown(index=False))
 
 if __name__ == "__main__":
