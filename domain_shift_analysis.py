@@ -126,8 +126,9 @@ from sklearn.svm import LinearSVC
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics.pairwise import rbf_kernel, euclidean_distances
+from sklearn.metrics.pairwise import rbf_kernel, polynomial_kernel, euclidean_distances
 from sklearn.metrics import calinski_harabasz_score, silhouette_score
+from sklearn.neighbors import NearestNeighbors
 from scipy.linalg import sqrtm
 from tqdm import tqdm
 
@@ -145,7 +146,7 @@ DATA_ROOTS = {
 
 OUTPUT_DIR = "domain_shift_outputs"
 
-EMBEDDING_SOURCE = "dinov2"   # "imagenet_resnet50" | "dinov2" | "task_model"
+EMBEDDING_SOURCE = "imagenet_resnet50"   # "imagenet_resnet50" | "dinov2" | "task_model"
 DINOV2_MODEL_NAME = "dinov2_vits14"   # or dinov2_vitb14 / dinov2_vitl14 / dinov2_vitg14
                                         # (larger = slower + higher-dim; vits14=384-D,
                                         # vitb14=768-D, vitl14=1024-D, vitg14=1536-D)
@@ -157,6 +158,8 @@ MIN_SAMPLES_SHIFT = 10                    # general floor for MMD/FFD to even at
 N_PERMUTATIONS = 100                      # MMD permutation-test resamples (0 disables)
 MAX_PERM_SAMPLES = 200                    # cap per-group size used inside the permutation test only
 FFD_RESAMPLES = 10                        # size-balanced FFD resampling repeats
+KID_DEGREE = 3                            # polynomial kernel degree for KID (Binkowski et al., 2018)
+SWD_N_PROJECTIONS = 100                   # random projections for Sliced Wasserstein Distance
 TOP_K_HARDEST = 5
 RANDOM_STATE = 42
 
@@ -586,53 +589,161 @@ def compute_mmd(X_A, X_B, n_permutations=N_PERMUTATIONS, random_state=RANDOM_STA
 
 
 def compute_proxy_a_distance(X_A, X_B, min_samples=MIN_SAMPLES_PAD, random_state=RANDOM_STATE):
+    """Returns (PAD, raw_error). PAD = 2(1-2*error) saturates near its
+    ceiling of 2 once error gets close to 0, which compresses real
+    differences between highly-separable sub-domain pairs into a narrow
+    band (see Table B discussion). The raw cross-validated error doesn't
+    have that compression -- report it alongside PAD, not as a replacement
+    for it."""
     if len(X_A) < min_samples or len(X_B) < min_samples:
-        return np.nan
+        return np.nan, np.nan
     X = np.vstack([X_A, X_B])
     y = np.hstack([np.zeros(len(X_A)), np.ones(len(X_B))])
     n_splits = min(5, len(X_A), len(X_B))
     if n_splits < 2:
-        return np.nan
+        return np.nan, np.nan
     cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     clf = LinearSVC(random_state=random_state, max_iter=5000, dual=False, C=0.1)
     try:
         scores = cross_val_score(clf, X, y, cv=cv, scoring="accuracy")
     except ValueError:
-        return np.nan
+        return np.nan, np.nan
     error = 1.0 - scores.mean()
-    return max(0.0, 2 * (1 - 2 * error))
+    pad = max(0.0, 2 * (1 - 2 * error))
+    return pad, float(error)
 
 
-def _ffd_raw(X_A, X_B, eps=1e-6):
+def _ffd_components(X_A, X_B, eps=1e-6):
+    """Splits FFD into its two additive terms, plus CORAL, so a large FFD
+    can be attributed to a genuine cause rather than left ambiguous:
+      - mean_term: ||mu_A - mu_B||^2 -- do the sub-domains differ in
+        average appearance?
+      - cov_term: Tr(Sigma_A + Sigma_B - 2*sqrtm(Sigma_A @ Sigma_B)) -- the
+        Frechet covariance-mismatch term (FFD = mean_term + cov_term).
+      - coral: ||Sigma_A - Sigma_B||_F^2 (Sun, Feng & Saenko, 2016) -- a
+        simpler, non-Frechet covariance-mismatch score, useful as a
+        cross-check on cov_term since it needs no matrix square root.
+    """
     mu_A, mu_B = np.mean(X_A, axis=0), np.mean(X_B, axis=0)
     sigma_A = np.cov(X_A, rowvar=False) + np.eye(X_A.shape[1]) * eps
     sigma_B = np.cov(X_B, rowvar=False) + np.eye(X_B.shape[1]) * eps
-    diff = mu_A - mu_B
+    mean_term = float(np.sum((mu_A - mu_B) ** 2))
     covmean, _ = sqrtm(sigma_A.dot(sigma_B), disp=False)
     if np.iscomplexobj(covmean):
         covmean = covmean.real
-    return max(0.0, float(diff.dot(diff) + np.trace(sigma_A + sigma_B - 2 * covmean)))
+    cov_term = max(0.0, float(np.trace(sigma_A + sigma_B - 2 * covmean)))
+    coral = float(np.sum((sigma_A - sigma_B) ** 2))
+    return mean_term, cov_term, coral
+
+
+def _ffd_raw(X_A, X_B, eps=1e-6):
+    mean_term, cov_term, _ = _ffd_components(X_A, X_B, eps)
+    return max(0.0, mean_term + cov_term)
 
 
 def compute_ffd(X_A, X_B, n_resamples=FFD_RESAMPLES, random_state=RANDOM_STATE):
+    """Returns (FFD, n, mean_term, cov_term, CORAL), all averaged over the
+    same size-balanced resamples used for FFD itself, so the decomposition
+    is directly comparable to the headline FFD number."""
     if len(X_A) < MIN_SAMPLES_SHIFT or len(X_B) < MIN_SAMPLES_SHIFT:
-        return np.nan, 0
+        return np.nan, 0, np.nan, np.nan, np.nan
     n = min(len(X_A), len(X_B))
     rng = np.random.default_rng(random_state)
-    vals = []
+    ffd_vals, mean_vals, cov_vals, coral_vals = [], [], [], []
     for _ in range(n_resamples):
         idx_a = rng.choice(len(X_A), n, replace=False)
         idx_b = rng.choice(len(X_B), n, replace=False)
-        vals.append(_ffd_raw(X_A[idx_a], X_B[idx_b]))
-    return float(np.mean(vals)), n
+        mean_term, cov_term, coral = _ffd_components(X_A[idx_a], X_B[idx_b])
+        ffd_vals.append(max(0.0, mean_term + cov_term))
+        mean_vals.append(mean_term)
+        cov_vals.append(cov_term)
+        coral_vals.append(coral)
+    return (float(np.mean(ffd_vals)), n, float(np.mean(mean_vals)),
+            float(np.mean(cov_vals)), float(np.mean(coral_vals)))
+
+
+def compute_kid(X_A, X_B, degree=KID_DEGREE, coef0=1.0):
+    """Kernel Inception Distance (Binkowski et al., 2018): MMD^2 with a
+    polynomial kernel instead of an RBF kernel. Purpose-built as a
+    lower-bias, lower-variance alternative to Frechet-style distances in
+    the small-sample regime (FID/FFD assume tens of thousands of samples;
+    our sub-domains have tens to a few hundred) -- a cross-check on FFD
+    that doesn't share its Gaussian-covariance assumption or its small-N
+    bias."""
+    if len(X_A) < MIN_SAMPLES_SHIFT or len(X_B) < MIN_SAMPLES_SHIFT:
+        return np.nan
+    gamma = 1.0 / X_A.shape[1]
+    Kaa = polynomial_kernel(X_A, X_A, degree=degree, gamma=gamma, coef0=coef0)
+    Kbb = polynomial_kernel(X_B, X_B, degree=degree, gamma=gamma, coef0=coef0)
+    Kab = polynomial_kernel(X_A, X_B, degree=degree, gamma=gamma, coef0=coef0)
+    na, nb = len(X_A), len(X_B)
+    sum_aa = (Kaa.sum() - np.trace(Kaa)) / (na * (na - 1))
+    sum_bb = (Kbb.sum() - np.trace(Kbb)) / (nb * (nb - 1))
+    return max(0.0, float(sum_aa + sum_bb - 2 * Kab.mean()))
+
+
+def compute_swd(X_A, X_B, n_projections=SWD_N_PROJECTIONS, random_state=RANDOM_STATE):
+    """Sliced Wasserstein Distance: approximates the (generally intractable
+    in >1D) Wasserstein-1 distance by averaging the exact closed-form 1-D
+    Wasserstein distance over many random projections. Makes NO Gaussian
+    assumption about either sub-domain, unlike FFD -- if SWD and FFD agree
+    in ranking, that corroborates FFD's Gaussian assumption; if they
+    diverge, FFD's magnitude may partly reflect non-Gaussian sub-domain
+    shape rather than genuine separation."""
+    if len(X_A) < MIN_SAMPLES_SHIFT or len(X_B) < MIN_SAMPLES_SHIFT:
+        return np.nan
+    rng = np.random.default_rng(random_state)
+    d = X_A.shape[1]
+    dists = []
+    for _ in range(n_projections):
+        direction = rng.normal(size=d)
+        direction /= np.linalg.norm(direction) + 1e-12
+        proj_a = np.sort(X_A @ direction)
+        proj_b = np.sort(X_B @ direction)
+        n = min(len(proj_a), len(proj_b))
+        qa = np.interp(np.linspace(0, 1, n), np.linspace(0, 1, len(proj_a)), proj_a)
+        qb = np.interp(np.linspace(0, 1, n), np.linspace(0, 1, len(proj_b)), proj_b)
+        dists.append(np.mean(np.abs(qa - qb)))
+    return float(np.mean(dists))
+
+
+def compute_nn_same_domain_fraction(X_A, X_B, max_samples=MAX_PERM_SAMPLES, random_state=RANDOM_STATE):
+    """Friedman-Rafsky (1979) 1-nearest-neighbor two-sample statistic: pool
+    both sub-domains, and for every point check whether its nearest OTHER
+    point came from the same sub-domain. The fraction that do is a
+    distribution-free separability score -- no kernel bandwidth, no
+    Gaussian assumption, no classifier training -- a third, methodologically
+    independent check alongside MMD and PAD. Near 0.5 under the null
+    (identical distributions); near 1.0 means the sub-domains barely
+    overlap in feature space."""
+    if len(X_A) < MIN_SAMPLES_SHIFT or len(X_B) < MIN_SAMPLES_SHIFT:
+        return np.nan
+    rng = np.random.default_rng(random_state)
+    a = X_A if len(X_A) <= max_samples else X_A[rng.choice(len(X_A), max_samples, replace=False)]
+    b = X_B if len(X_B) <= max_samples else X_B[rng.choice(len(X_B), max_samples, replace=False)]
+    X = np.vstack([a, b])
+    labels = np.array([0] * len(a) + [1] * len(b))
+    nn = NearestNeighbors(n_neighbors=2).fit(X)
+    _, indices = nn.kneighbors(X)
+    nearest_other = indices[:, 1]
+    return float((labels[nearest_other] == labels).mean())
 
 
 def compute_all_metrics(X_A, X_B):
     mmd, mmd_p = compute_mmd(X_A, X_B)
-    pad = compute_proxy_a_distance(X_A, X_B)
-    ffd, ffd_n = compute_ffd(X_A, X_B)
-    return {"MMD": mmd, "MMD_p": mmd_p, "PAD": pad, "FFD": ffd, "FFD_n": ffd_n,
-            "N_A": len(X_A), "N_B": len(X_B)}
+    pad, pad_error = compute_proxy_a_distance(X_A, X_B)
+    ffd, ffd_n, ffd_mean_term, ffd_cov_term, coral = compute_ffd(X_A, X_B)
+    kid = compute_kid(X_A, X_B)
+    swd = compute_swd(X_A, X_B)
+    nn_frac = compute_nn_same_domain_fraction(X_A, X_B)
+    return {
+        "MMD": mmd, "MMD_p": mmd_p,
+        "PAD": pad, "PAD_Error": pad_error,
+        "FFD": ffd, "FFD_n": ffd_n,
+        "FFD_MeanTerm": ffd_mean_term, "FFD_CovTerm": ffd_cov_term, "CORAL": coral,
+        "KID": kid, "SWD": swd, "NN_SameDomainFrac": nn_frac,
+        "N_A": len(X_A), "N_B": len(X_B),
+    }
 
 
 def format_metric(x, digits=3):
@@ -875,28 +986,49 @@ def main():
             continue
         sub_feats = {sd: feats_for((df_meta["Dataset"] == ds) & (df_meta["SubDomain"] == sd))
                      for sd in subdomains}
-        mmd_list, pad_list, ffd_list = [], [], []
+        metric_lists = {k: [] for k in (
+            "MMD", "PAD", "PAD_Error", "FFD", "FFD_MeanTerm", "FFD_CovTerm",
+            "CORAL", "KID", "SWD", "NN_SameDomainFrac")}
         for sd_a, sd_b in combinations(subdomains, 2):
             m = compute_all_metrics(sub_feats[sd_a], sub_feats[sd_b])
             all_pair_records.append({"Dataset": ds, "SubDomain_A": sd_a, "SubDomain_B": sd_b, **m})
-            if np.isfinite(m["MMD"]):
-                mmd_list.append(m["MMD"])
-            if np.isfinite(m["PAD"]):
-                pad_list.append(m["PAD"])
-            if np.isfinite(m["FFD"]):
-                ffd_list.append(m["FFD"])
+            for key in metric_lists:
+                if np.isfinite(m[key]):
+                    metric_lists[key].append(m[key])
 
         ch_index, sil_score = safe_cluster_scores(feats_for(df_meta["Dataset"] == ds),
                                                     sub["SubDomain"].values)
 
+        def _mean_std(key, digits=3):
+            vals = metric_lists[key]
+            if not vals:
+                return "N/A", "N/A"
+            return format_metric(np.mean(vals), digits), format_metric(np.std(vals), digits)
+
+        mean_mmd, std_mmd = _mean_std("MMD")
+        mean_pad, std_pad = _mean_std("PAD")
+        mean_pad_err, std_pad_err = _mean_std("PAD_Error")
+        mean_ffd, std_ffd = _mean_std("FFD", 1)
+        mean_ffd_mean, std_ffd_mean = _mean_std("FFD_MeanTerm", 1)
+        mean_ffd_cov, std_ffd_cov = _mean_std("FFD_CovTerm", 1)
+        mean_coral, std_coral = _mean_std("CORAL", 1)
+        mean_kid, std_kid = _mean_std("KID")
+        mean_swd, std_swd = _mean_std("SWD")
+        mean_nn, std_nn = _mean_std("NN_SameDomainFrac")
+
         rows_b.append({
-            "Dataset": ds, "N_SubDomains": len(subdomains), "Pairs_Evaluated": len(mmd_list),
-            "Mean_MMD": format_metric(np.mean(mmd_list)) if mmd_list else "N/A",
-            "Std_MMD": format_metric(np.std(mmd_list)) if mmd_list else "N/A",
-            "Mean_PAD": format_metric(np.mean(pad_list)) if pad_list else "N/A",
-            "Std_PAD": format_metric(np.std(pad_list)) if pad_list else "N/A",
-            "Mean_FFD": format_metric(np.mean(ffd_list), 1) if ffd_list else "N/A",
-            "Std_FFD": format_metric(np.std(ffd_list), 1) if ffd_list else "N/A",
+            "Dataset": ds, "N_SubDomains": len(subdomains),
+            "Pairs_Evaluated": len(metric_lists["MMD"]),
+            "Mean_MMD": mean_mmd, "Std_MMD": std_mmd,
+            "Mean_PAD": mean_pad, "Std_PAD": std_pad,
+            "Mean_PAD_Error": mean_pad_err, "Std_PAD_Error": std_pad_err,
+            "Mean_FFD": mean_ffd, "Std_FFD": std_ffd,
+            "Mean_FFD_MeanTerm": mean_ffd_mean, "Std_FFD_MeanTerm": std_ffd_mean,
+            "Mean_FFD_CovTerm": mean_ffd_cov, "Std_FFD_CovTerm": std_ffd_cov,
+            "Mean_CORAL": mean_coral, "Std_CORAL": std_coral,
+            "Mean_KID": mean_kid, "Std_KID": std_kid,
+            "Mean_SWD": mean_swd, "Std_SWD": std_swd,
+            "Mean_NN_SameDomainFrac": mean_nn, "Std_NN_SameDomainFrac": std_nn,
             "Calinski_Harabasz": format_metric(ch_index, 1),
             "Silhouette": format_metric(sil_score),
         })
@@ -909,7 +1041,15 @@ def main():
     table_b.to_csv(os.path.join(OUTPUT_DIR, "tableB_within_dataset.csv"), index=False)
     print("Note: Calinski-Harabasz is unbounded (higher = more separated); Silhouette is "
           "bounded in [-1, 1] and is the more directly cross-dataset-comparable of the two "
-          "since it does not scale with sub-domain count the way the pairwise means can.")
+          "since it does not scale with sub-domain count the way the pairwise means can.\n"
+          "New metrics: KID (Binkowski et al. 2018) is a lower-bias small-sample alternative "
+          "to FFD; SWD makes no Gaussian assumption, unlike FFD, and is a check on that "
+          "assumption; NN_SameDomainFrac (Friedman & Rafsky 1979) is a kernel-free, "
+          "classifier-free separability check (~0.5 = fully overlapping, ~1.0 = non-overlapping); "
+          "FFD_MeanTerm/FFD_CovTerm/CORAL decompose FFD into 'different average appearance' vs. "
+          "'different spread/noisiness' so a large FFD can be attributed to a specific cause; "
+          "PAD_Error is the raw cross-validated classifier error PAD is computed from, without "
+          "PAD's ceiling-saturating 2(1-2*error) transform.")
 
     pair_df = pd.DataFrame(all_pair_records)
     pair_df.to_csv(os.path.join(OUTPUT_DIR, "all_subdomain_pairs.csv"), index=False)
@@ -1009,7 +1149,8 @@ def main():
             continue
         loo_table = leave_one_condition_out(df_meta, feats_for, group_ds, sensor_tag, other_ds)
         display = loo_table.copy()
-        for col in ("MMD", "MMD_p", "PAD", "FFD", "Delta_MMD_vs_Baseline"):
+        for col in ("MMD", "MMD_p", "PAD", "PAD_Error", "FFD", "FFD_MeanTerm", "FFD_CovTerm",
+                    "CORAL", "KID", "SWD", "NN_SameDomainFrac", "Delta_MMD_vs_Baseline"):
             display[col] = display[col].map(lambda x: format_metric(x, 3))
         print("\n" + "=" * 100)
         print(title)
