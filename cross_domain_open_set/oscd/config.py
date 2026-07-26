@@ -63,7 +63,7 @@ METHODS = {
     "compnet": {
         "img_side": 128, "channels": 1, "normalize": "roi",
         "view_mode": "single", "augment_factor": 2,
-        "batch_size": 128, "num_epochs": 300, "lr": 1e-3,
+        "batch_size": 128, "num_epochs": 100, "lr": 1e-3,
         "lr_step": 30, "lr_gamma": 0.8,
         "embedding_dim": 512, "arcface_s": 30.0, "arcface_m": 0.50, "dropout": 0.25,
     },
@@ -90,7 +90,7 @@ METHODS = {
     "ppnet": {
         "img_side": 128, "channels": 1, "normalize": "roi",
         "view_mode": "single", "augment_factor": 2,
-        "batch_size": 64, "num_epochs": 200, "lr": 1e-4,
+        "batch_size": 64, "num_epochs": 100, "lr": 1e-4,
         "lr_step": 17, "lr_gamma": 0.8,
         "contrastive_margin": 5.0, "w_l2": 1e-4, "w_contra": 2e-4, "w_dis": 1e-4,
     },
@@ -108,7 +108,7 @@ METHODS = {
     "ccnet": {
         "img_side": 128, "channels": 1, "normalize": "roi",
         "view_mode": "paired", "augment_factor": 1,
-        "batch_size": 256, "num_epochs": 200, "lr": 1e-3,
+        "batch_size": 256, "num_epochs": 100, "lr": 1e-3,
         "lr_step": 17, "lr_gamma": 0.8,
         "comp_weight": 0.8, "dropout": 0.5, "arcface_s": 20.0, "arcface_m": 0.30,
         "ce_weight": 0.8, "con_weight": 0.2, "temperature": 0.07,
@@ -117,7 +117,7 @@ METHODS = {
     "co3net": {
         "img_side": 128, "channels": 1, "normalize": "roi",
         "view_mode": "paired", "augment_factor": 1,
-        "batch_size": 256, "num_epochs": 200, "lr": 1e-3,
+        "batch_size": 256, "num_epochs": 100, "lr": 1e-3,
         "lr_step": 30, "lr_gamma": 0.6,
         "dropout": 0.5, "arcface_s": 20.0, "arcface_m": 0.30,
         "ce_weight": 0.8, "con_weight": 0.2, "temperature": 0.07,
@@ -140,7 +140,7 @@ METHODS = {
     "sf2net": {
         "img_side": 128, "channels": 1, "normalize": "roi",
         "view_mode": "triplet", "augment_factor": 1,
-        "batch_size": 256, "num_epochs": 200, "lr": 1e-3,
+        "batch_size": 256, "num_epochs": 100, "lr": 1e-3,
         "lr_step": 17, "lr_gamma": 0.8,
         "dropout": 0.5, "arcface_s": 30.0, "arcface_m": 0.50,
         "ce_weight": 0.7, "tl_weight": 0.3, "triplet_margin": 2.0,
