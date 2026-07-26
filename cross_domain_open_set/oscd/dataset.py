@@ -197,7 +197,8 @@ def generate_all_splits(cond_paths, scanner_paths, train_id_ratio, seed):
     n_test = len(all_persp_ids) - int(len(all_persp_ids) * train_id_ratio)
 
     splits = {}
-    test_ids = sorted(random.Random(seed).sample(scanner_ids, n_test))
+    n_test_scanner = min(n_test, len(scanner_ids))
+    test_ids = sorted(random.Random(seed).sample(scanner_ids, n_test_scanner))
     train_ids = sorted(set(all_persp_ids) - set(test_ids))
     splits["S_scanner"] = {"train_ids": train_ids, "test_ids": test_ids}
 
