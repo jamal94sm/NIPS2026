@@ -65,7 +65,7 @@ METHODS = {
         "view_mode": "single", "augment_factor": 2,
         "batch_size": 32, "num_epochs": 100, "lr": 1e-4, "weight_decay": 5e-4,
         "arcface_s": 64.0, "arcface_m": 0.50,
-        "pretrained_weights": "/path/to/r100_glint360k.onnx",  # <-- set this
+        "pretrained_weights": "/home/pai-ng/Jamal/NIPS2026/face_models/checkpoints/r100_glint360k.onnx",  # <-- set this
         "freeze_ratio": 0.75,
     },
 
