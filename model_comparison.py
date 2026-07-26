@@ -51,7 +51,7 @@ from fvcore.nn import FlopCountAnalysis
 DEVICE = torch.device("cpu")   # FLOPs + timing measured on CPU
 
 # ── Timing configuration ──────────────────────────────────────
-BATCH_SIZE_TRAIN = 8     # equalized across ALL models for a fair per-batch comparison
+BATCH_SIZE_TRAIN = 32     # equalized across ALL models for a fair per-batch comparison
 N_TRAIN_WARMUP   = 3
 N_TRAIN_ITERS    = 10
 N_INFER_WARMUP   = 5
