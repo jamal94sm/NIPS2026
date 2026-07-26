@@ -7,15 +7,16 @@ replacing each method's slightly-different bespoke eval code), checkpoint
 helpers, and the final results-table builder.
 """
 import os
+import time
 import random
 import numpy as np
+import pandas as pd
 import torch
 
 from sklearn.metrics import roc_curve
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
-# utils.py, in the imports block at the top — add:
-import time
+
 
 def seed_everything(seed):
     random.seed(seed)
@@ -23,42 +24,6 @@ def seed_everything(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
-# utils.py, append after build_tables()
-
-def build_timing_table(timing_results, method_order, out_dir):
-    """`timing_results[method]` = list of per-run dicts (one per setting
-    that method completed), each with keys:
-        train_time_per_epoch_s, train_time_per_batch_ms,
-        infer_time_per_100_samples_ms
-    Averages across all completed runs for each method and writes
-    timing_table.csv + appends to summary.md."""
-    rows = []
-    for m in method_order:
-        runs = timing_results.get(m, [])
-        if not runs:
-            rows.append({"method": m, "avg_train_time_per_epoch_s": None,
-                         "avg_train_time_per_batch_ms": None,
-                         "avg_infer_time_per_100_samples_ms": None})
-            continue
-        rows.append({
-            "method": m,
-            "avg_train_time_per_epoch_s": round(
-                np.mean([r["train_time_per_epoch_s"] for r in runs]), 3),
-            "avg_train_time_per_batch_ms": round(
-                np.mean([r["train_time_per_batch_ms"] for r in runs]), 2),
-            "avg_infer_time_per_100_samples_ms": round(
-                np.mean([r["infer_time_per_100_samples_ms"] for r in runs]), 2),
-        })
-    df = pd.DataFrame(rows).set_index("method")
-
-    os.makedirs(out_dir, exist_ok=True)
-    df.to_csv(os.path.join(out_dir, "timing_table.csv"))
-    with open(os.path.join(out_dir, "summary.md"), "a") as f:
-        f.write("\n\n# Timing -- averaged over all completed runs per method\n\n")
-        f.write(df.to_markdown())
-        f.write("\n")
-    return df
 
 # ══════════════════════════════════════════════════════════════
 #  EMBEDDING EXTRACTION / EER / RANK-1  (one canonical implementation)
@@ -148,8 +113,6 @@ def build_tables(results, settings_labels, method_order, out_dir):
     seen during training, per benchmarking.py). Writes eer_table.csv,
     rank1_table.csv and a combined markdown summary; returns both
     pandas DataFrames."""
-    import pandas as pd
-
     eer_rows, r1_rows = [], []
     for s in settings_labels:
         eer_row = {"setting": s}
@@ -176,3 +139,38 @@ def build_tables(results, settings_labels, method_order, out_dir):
         f.write("\n")
 
     return eer_df, r1_df
+
+
+def build_timing_table(timing_results, method_order, out_dir):
+    """`timing_results[method]` = list of per-run dicts (one per setting
+    that method completed), each with keys:
+        train_time_per_epoch_s, train_time_per_batch_ms,
+        infer_time_per_100_samples_ms
+    Averages across all completed runs for each method and writes
+    timing_table.csv + appends to summary.md."""
+    rows = []
+    for m in method_order:
+        runs = timing_results.get(m, [])
+        if not runs:
+            rows.append({"method": m, "avg_train_time_per_epoch_s": None,
+                         "avg_train_time_per_batch_ms": None,
+                         "avg_infer_time_per_100_samples_ms": None})
+            continue
+        rows.append({
+            "method": m,
+            "avg_train_time_per_epoch_s": round(
+                np.mean([r["train_time_per_epoch_s"] for r in runs]), 3),
+            "avg_train_time_per_batch_ms": round(
+                np.mean([r["train_time_per_batch_ms"] for r in runs]), 2),
+            "avg_infer_time_per_100_samples_ms": round(
+                np.mean([r["infer_time_per_100_samples_ms"] for r in runs]), 2),
+        })
+    df = pd.DataFrame(rows).set_index("method")
+
+    os.makedirs(out_dir, exist_ok=True)
+    df.to_csv(os.path.join(out_dir, "timing_table.csv"))
+    with open(os.path.join(out_dir, "summary.md"), "a") as f:
+        f.write("\n\n# Timing -- averaged over all completed runs per method\n\n")
+        f.write(df.to_markdown())
+        f.write("\n")
+    return df
