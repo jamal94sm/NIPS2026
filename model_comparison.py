@@ -53,9 +53,9 @@ DEVICE = torch.device("cpu")   # FLOPs + timing measured on CPU
 # ── Timing configuration ──────────────────────────────────────
 BATCH_SIZE_TRAIN = 32     # equalized across ALL models for a fair per-batch comparison
 N_TRAIN_WARMUP   = 3
-N_TRAIN_ITERS    = 10
+N_TRAIN_ITERS    = 20
 N_INFER_WARMUP   = 5
-N_INFER_SAMPLES  = 50
+N_INFER_SAMPLES  = 100
 
 # ── Checkpoint paths ──────────────────────────────────────────
 ARCFACE_ONNX_PATH  = "/home/pai-ng/Jamal/NIPS2026/face_models/checkpoints/r100_glint360k.onnx"
