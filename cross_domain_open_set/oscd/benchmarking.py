@@ -16,6 +16,7 @@ Usage:
     python benchmarking.py --quick                # smoke-test: 1 epoch, eval every epoch
 """
 import os
+import gc
 import json
 import time
 import argparse
@@ -128,6 +129,20 @@ def run_one(method_name, setting, train_samples, gallery_samples, probe_samples,
         json.dump({"setting": setting["label"], "method": method_name,
                     "num_train_classes": num_classes,
                     "EER_pct": final_eer, "Rank1_pct": final_rank1, **timing}, f, indent=2)
+
+    # Free this method's GPU memory before returning. PyTorch's caching
+    # allocator holds onto freed blocks for reuse within a process; that's
+    # fine when consecutive methods have similarly-shaped tensors, but here
+    # methods range from tiny from-scratch CNNs (compnet, ppnet, ...) to full
+    # pretrained backbones (convnext, dino) -- freed blocks sized for one
+    # rarely satisfy the other, so cached-but-unused memory can starve the
+    # next method even when it would otherwise fit. empty_cache() forces the
+    # allocator to release it back to the driver.
+    del baseline, optimizer, scheduler, train_loader, gallery_loader, probe_loader, infer_loader
+    gc.collect()
+    if C.DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
+
     return final_eer, final_rank1, timing
 
 
@@ -179,6 +194,14 @@ def main():
                 print(f"  [FAILED] {method_name} on {setting['label']}: {e}")
                 traceback.print_exc()
                 results[(setting["label"], method_name)] = {"eer": None, "rank1": None}
+            finally:
+                # Primary cleanup safety net: if run_one() raised mid-training
+                # (e.g. CUDA OOM), it never reaches its own end-of-function
+                # cleanup, so this is what actually releases that method's GPU
+                # memory before the next method starts.
+                gc.collect()
+                if C.DEVICE.type == "cuda":
+                    torch.cuda.empty_cache()
 
     print(f"\n{'='*70}\nALL RUNS COMPLETE -- building tables\n{'='*70}")
     setting_labels = [s["label"] for s in settings]
