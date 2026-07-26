@@ -150,5 +150,6 @@ METHODS = {
 
 # Order in which benchmarking.py iterates methods (also the column order
 # in the final EER / Rank-1 tables)
-METHOD_ORDER = ["arcface", "magface", "compnet", "ppnet", "palmbridge",
-                 "ccnet", "co3net", "convnext", "dino", "sf2net"]
+METHOD_ORDER = ["compnet", "ppnet", "ccnet", "co3net", "sf2net", "palmbridge", "convnext", "dino", "arcface", "magface"]
+
+
