@@ -25,11 +25,19 @@ import torch
 DATA_ROOT            = "/path/to/your/smartphone_data"   # <-- set to your data path
 SCANNER_SPECTRA    = {"green", "ir", "yellow", "pink", "white"}
 
-SPLITS_FILE        = "./palm_auth_openset_splits.json"       # shared, cached, seeded
+
 BASE_RESULTS_DIR    = "./benchmark_results"
 
+
+
+
 SEED                = 42
-TRAIN_ID_RATIO       = 0.80
+SPLITS_FILE        = "./palm_auth_openset_splits_50-50.json"       # shared, cached, seeded
+TRAIN_ID_RATIO       = 0.50
+
+
+
+
 TEST_GALLERY_RATIO   = 0.50
 
 DEVICE              = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
