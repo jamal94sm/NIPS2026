@@ -5,6 +5,10 @@ Compares all biometric models on:
   - Total parameters
   - Trainable parameters
   - GFLOPs for a single forward pass (batch=1, input 112×112)
+  - Training time (ms per batch: forward + backward + optimizer.step(),
+    batch size equalized across all models -- see BATCH_SIZE_TRAIN below)
+  - Inference time (ms per 100 samples: forward only, no_grad, batch=1
+    latency scaled up -- see N_INFER_SAMPLES below)
 
 Models: CompNet, PPNet, CCNet, CO3Net, SF2Net,
         PalmBridge (CompNet backbone), ConvNeXt, DINOv2,
@@ -16,8 +20,26 @@ Models: CompNet, PPNet, CCNet, CO3Net, SF2Net,
 
 Run on the server:
     python model_comparison.py
+
+Notes on the timing methodology:
+  - All timing is measured on DEVICE (CPU by default, same device as the
+    GFLOPs count, for consistency within this table -- these are relative
+    compute-cost comparisons between architectures, not absolute
+    production-hardware benchmarks).
+  - Training time uses the SAME batch size (BATCH_SIZE_TRAIN) for every
+    model, not each model's real training hyperparameters -- this is
+    deliberate: the goal here is to compare architectural compute cost,
+    not to reproduce each method's actual training config (that lives in
+    the full benchmark's config.py, not here).
+  - Training time only updates parameters with requires_grad=True, so
+    ArcFace/MagFace's 75%-frozen backbones correctly show a cheaper
+    per-batch update than their FLOPs count alone would suggest.
+  - Both timings include a short warmup (untimed) before the measured
+    iterations, to avoid first-call overhead (lazy kernel init, etc.)
+    skewing the result.
 """
 
+import time
 import math
 import torch
 import torch.nn as nn
@@ -26,7 +48,14 @@ import timm
 from torchvision import models as tv_models
 from fvcore.nn import FlopCountAnalysis
 
-DEVICE = torch.device("cpu")   # FLOPs measured on CPU
+DEVICE = torch.device("cpu")   # FLOPs + timing measured on CPU
+
+# ── Timing configuration ──────────────────────────────────────
+BATCH_SIZE_TRAIN = 8     # equalized across ALL models for a fair per-batch comparison
+N_TRAIN_WARMUP   = 3
+N_TRAIN_ITERS    = 10
+N_INFER_WARMUP   = 5
+N_INFER_SAMPLES  = 50
 
 # ── Checkpoint paths ──────────────────────────────────────────
 ARCFACE_ONNX_PATH  = "/home/pai-ng/Jamal/NIPS2026/face_models/checkpoints/r100_glint360k.onnx"
@@ -670,10 +699,77 @@ def count_flops(model, input_tensor):
         return float("nan")
 
 
+def measure_train_time_per_batch(model, x, device=DEVICE,
+                                  batch_size=BATCH_SIZE_TRAIN,
+                                  n_iters=N_TRAIN_ITERS, n_warmup=N_TRAIN_WARMUP):
+    """Average wall-clock time (ms) for one forward + backward +
+    optimizer.step(), on a batch of `batch_size` samples (same batch size
+    for every model, for a fair architectural comparison). Only updates
+    parameters with requires_grad=True, so partially-frozen backbones
+    (ArcFace/MagFace) correctly show a cheaper update than a fully-trainable
+    model with the same FLOPs."""
+    try:
+        model.train()
+        reps = [batch_size] + [1] * (x.dim() - 1)
+        x_batch = x.repeat(*reps).to(device)
+
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        if not trainable:
+            return float("nan")
+        optimizer = torch.optim.SGD(trainable, lr=1e-3)
+
+        def _step():
+            optimizer.zero_grad()
+            out = model(x_batch)
+            loss = out.pow(2).sum()     # dummy loss: just needs to backprop through out
+            loss.backward()
+            optimizer.step()
+
+        for _ in range(n_warmup):
+            _step()
+
+        t0 = time.perf_counter()
+        for _ in range(n_iters):
+            _step()
+        elapsed = time.perf_counter() - t0
+        return (elapsed / n_iters) * 1000.0    # ms / batch
+    except Exception as e:
+        print(f"    [train-time measurement failed: {e}]")
+        return float("nan")
+
+
+def measure_infer_time_per_100(model, x, device=DEVICE,
+                                n_samples=N_INFER_SAMPLES, n_warmup=N_INFER_WARMUP):
+    """Average pure-inference wall-clock time, scaled to ms per 100 samples.
+    Runs one sample (batch=1) at a time through model.eval() + no_grad(),
+    matching real single-query verification latency rather than a
+    best-case large-batch throughput number."""
+    try:
+        model.eval()
+        x_single = x.to(device)   # x is already batch=1
+
+        with torch.no_grad():
+            for _ in range(n_warmup):
+                model(x_single)
+
+            t0 = time.perf_counter()
+            for _ in range(n_samples):
+                model(x_single)
+            elapsed = time.perf_counter() - t0
+        return (elapsed / n_samples) * 100 * 1000.0   # ms per 100 samples
+    except Exception as e:
+        print(f"    [infer-time measurement failed: {e}]")
+        return float("nan")
+
+
 def fmt_params(n):
     if n >= 1e6: return f"{n/1e6:.2f} M"
     if n >= 1e3: return f"{n/1e3:.1f} K"
     return str(n)
+
+
+def fmt_ms(v):
+    return f"{v:.2f}" if not math.isnan(v) else "N/A"
 
 
 def run():
@@ -698,18 +794,22 @@ def run():
     ]
 
     W_NAME  = 22
-    W_TOTAL = 16
-    W_TRAIN = 16
-    W_FLOPS = 12
+    W_TOTAL = 14
+    W_TRAIN = 14
+    W_FLOPS = 10
+    W_TRAINMS = 16
+    W_INFERMS = 14
 
     header = (f"{'Model':<{W_NAME}}"
               f"{'Total Params':>{W_TOTAL}}"
               f"{'Trainable':>{W_TRAIN}}"
-              f"{'GFLOPs':>{W_FLOPS}}")
+              f"{'GFLOPs':>{W_FLOPS}}"
+              f"{'Train ms/batch':>{W_TRAINMS}}"
+              f"{'Infer ms/100':>{W_INFERMS}}")
     sep = "─" * len(header)
 
     print("\n" + "=" * len(header))
-    print("Model Comparison — Parameters & FLOPs (input 112×112)")
+    print("Model Comparison — Parameters, FLOPs & Timing (input 112×112)")
     print("=" * len(header))
     print(header)
     print(sep)
@@ -720,14 +820,18 @@ def run():
         try:
             model = build_fn().to(DEVICE).eval()
             total, trainable = count_params(model)
-            gflops           = count_flops(model, x)
-            results.append({"name": name, "total": total,
-                            "trainable": trainable, "gflops": gflops})
+            gflops    = count_flops(model, x)
+            train_ms  = measure_train_time_per_batch(model, x)
+            infer_ms  = measure_infer_time_per_100(model, x)
+            results.append({"name": name, "total": total, "trainable": trainable,
+                            "gflops": gflops, "train_ms": train_ms, "infer_ms": infer_ms})
             gflops_str = f"{gflops:.3f}" if not math.isnan(gflops) else "N/A"
             print(f"    {name:<{W_NAME}}"
                   f"{fmt_params(total):>{W_TOTAL}}"
                   f"{fmt_params(trainable):>{W_TRAIN}}"
-                  f"{gflops_str:>{W_FLOPS}}")
+                  f"{gflops_str:>{W_FLOPS}}"
+                  f"{fmt_ms(train_ms):>{W_TRAINMS}}"
+                  f"{fmt_ms(infer_ms):>{W_INFERMS}}")
         except Exception as e:
             print(f"  ERROR — {name}: {e}")
 
@@ -735,7 +839,7 @@ def run():
 
     out_path = "model_comparison.txt"
     with open(out_path, "w") as f:
-        f.write("Model Comparison — Parameters & FLOPs (input 112×112 for all models)\n")
+        f.write("Model Comparison — Parameters, FLOPs & Timing (input 112×112 for all models)\n")
         f.write(sep + "\n")
         f.write(header + "\n")
         f.write(sep + "\n")
@@ -744,7 +848,9 @@ def run():
             f.write(f"{r['name']:<{W_NAME}}"
                     f"{fmt_params(r['total']):>{W_TOTAL}}"
                     f"{fmt_params(r['trainable']):>{W_TRAIN}}"
-                    f"{gflops_str:>{W_FLOPS}}\n")
+                    f"{gflops_str:>{W_FLOPS}}"
+                    f"{fmt_ms(r['train_ms']):>{W_TRAINMS}}"
+                    f"{fmt_ms(r['infer_ms']):>{W_INFERMS}}\n")
         f.write(sep + "\n")
         f.write("\nNotes:\n")
         f.write("  - GFLOPs measured for a single sample (batch=1)\n")
@@ -758,6 +864,18 @@ def run():
         f.write("  - TSCAN: FeatureEncoder only; discriminator & AdaFace excluded\n")
         f.write("  - PDFG: MultiDatasetExtractors (N=2 heads); ArcFace loss excluded\n")
         f.write("  - PalmBridge includes codebook P in R^{512x512}\n")
+        f.write(f"  - Train ms/batch: forward+backward+optimizer.step(), batch_size="
+                f"{BATCH_SIZE_TRAIN} (SAME for every model, for a fair architectural\n"
+                f"    comparison -- not each method's real training hyperparameters), "
+                f"only requires_grad=True params updated,\n"
+                f"    {N_TRAIN_WARMUP} warmup + {N_TRAIN_ITERS} measured iterations, on {DEVICE}.\n")
+        f.write(f"  - Infer ms/100: forward-only (no_grad), batch=1 latency scaled to "
+                f"100 samples, {N_INFER_WARMUP} warmup +\n"
+                f"    {N_INFER_SAMPLES} measured samples, on {DEVICE}.\n")
+        f.write("  - All timing measured on the same device as GFLOPs (see DEVICE at top of "
+                "this file) -- these are\n"
+                "    relative architectural compute-cost comparisons, not absolute "
+                "production-hardware benchmarks.\n")
     print(f"\nTable saved to: {out_path}")
 
 
