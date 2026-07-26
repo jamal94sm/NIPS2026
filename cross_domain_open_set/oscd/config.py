@@ -60,6 +60,14 @@ os.makedirs(BASE_RESULTS_DIR, exist_ok=True)
 
 METHODS = {
 
+    "compnet": {
+        "img_side": 128, "channels": 1, "normalize": "roi",
+        "view_mode": "single", "augment_factor": 2,
+        "batch_size": 128, "num_epochs": 300, "lr": 1e-3,
+        "lr_step": 30, "lr_gamma": 0.8,
+        "embedding_dim": 512, "arcface_s": 30.0, "arcface_m": 0.50, "dropout": 0.25,
+    },
+  
     "arcface": {
         "img_side": 112, "channels": 3, "normalize": "unit",
         "view_mode": "single", "augment_factor": 2,
@@ -77,14 +85,6 @@ METHODS = {
         "lambda_g": 20.0,
         "pretrained_weights": "/home/pai-ng/Jamal/NIPS2026/face_models/checkpoints/magface_iresnet100.pth",  # <-- set this
         "freeze_ratio": 0.75,
-    },
-
-    "compnet": {
-        "img_side": 128, "channels": 1, "normalize": "roi",
-        "view_mode": "single", "augment_factor": 2,
-        "batch_size": 128, "num_epochs": 300, "lr": 1e-3,
-        "lr_step": 30, "lr_gamma": 0.8,
-        "embedding_dim": 512, "arcface_s": 30.0, "arcface_m": 0.50, "dropout": 0.25,
     },
 
     "ppnet": {
