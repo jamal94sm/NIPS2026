@@ -101,12 +101,14 @@ designed for:
     lot between datasets -- don't masquerade as differences in shift.
 
 A caveat worth stating explicitly in a rebuttal: these metrics are computed
-on generic ImageNet-pretrained features, which is standard practice but is a
-domain-mismatched proxy for what your actual recognizer responds to. See
-`EMBEDDING_SOURCE` below -- swapping in your trained recognition backbone's
-own embeddings ties the shift measurement directly to the feature space that
-determines matching performance, which is the more causally convincing
-version of this analysis for a reviewer asking "why does performance drop".
+on generic, task-agnostic features (ResNet-50 by default; DINOv2 is also
+available as a toggle -- see `EMBEDDING_SOURCE` below), which is standard
+practice but is a domain-mismatched proxy for what your actual recognizer
+responds to. Swapping in your trained recognition backbone's own embeddings
+(`EMBEDDING_SOURCE = "task_model"`) ties the shift measurement directly to
+the feature space that determines matching performance, which is the more
+causally convincing version of this analysis for a reviewer asking "why
+does performance drop".
 """
 
 import os
@@ -142,9 +144,13 @@ DATA_ROOTS = {
 }
 
 OUTPUT_DIR = "domain_shift_outputs"
-FEATURE_CACHE = os.path.join(OUTPUT_DIR, "raw_features_cache.pkl")
 
-EMBEDDING_SOURCE = "imagenet_resnet50"   # or "task_model" -- see extract_task_specific_feature()
+EMBEDDING_SOURCE = "imagenet_resnet50"   # "imagenet_resnet50" | "dinov2" | "task_model"
+DINOV2_MODEL_NAME = "dinov2_vits14"   # or dinov2_vitb14 / dinov2_vitl14 / dinov2_vitg14
+                                        # (larger = slower + higher-dim; vits14=384-D,
+                                        # vitb14=768-D, vitl14=1024-D, vitg14=1536-D)
+                                        # only used when EMBEDDING_SOURCE == "dinov2"
+
 PCA_DIM = 64                              # shared, globally-fit reduced dimensionality
 MIN_SAMPLES_PAD = 20                      # PAD reliability floor (see module docstring)
 MIN_SAMPLES_SHIFT = 10                    # general floor for MMD/FFD to even attempt a pair
@@ -156,6 +162,23 @@ RANDOM_STATE = 42
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def get_cache_path():
+    """Feature cache is keyed by which embedding model produced it, not just
+    by image path -- otherwise switching EMBEDDING_SOURCE (e.g. ResNet-50 ->
+    DINOv2) and rerunning would silently reuse stale cached vectors from the
+    OLD model for every path already in the cache, quietly mixing two
+    incompatible embedding spaces into one "reduced" feature matrix with no
+    error or warning. Every table downstream would still run; the numbers
+    would just be wrong."""
+    if EMBEDDING_SOURCE == "dinov2":
+        tag = f"dinov2_{DINOV2_MODEL_NAME}"
+    elif EMBEDDING_SOURCE == "task_model":
+        tag = "task_model"
+    else:
+        tag = "imagenet_resnet50"
+    return os.path.join(OUTPUT_DIR, f"raw_features_cache_{tag}.pkl")
 
 
 # ==========================================
@@ -188,6 +211,55 @@ def load_imagenet_extractor():
     return extractor
 
 
+def load_dinov2_extractor(model_name=DINOV2_MODEL_NAME):
+    """
+    DINOv2 (Oquab et al., 2023) self-supervised ViT features, loaded via
+    torch.hub. Unlike the ImageNet-supervised ResNet-50 below, DINOv2 is
+    trained with a self-supervised objective over a much larger and more
+    visually diverse corpus and is widely reported to transfer better to
+    content unlike typical ImageNet photos (close-up textures, documents,
+    biometric imagery) -- plausibly a better-behaved embedding space for
+    measuring domain shift on palmprint ROIs than a supervised natural-photo
+    classifier. It is still a generic, task-agnostic embedding, not a
+    substitute for the task-specific hook in extract_task_specific_feature().
+
+    Requires internet access on first call (weights are fetched via
+    torch.hub and cached under ~/.cache/torch/hub, or $TORCH_HOME if set).
+    Input must be resized to a multiple of the model's 14x14 patch size;
+    224 (=16x14) is the standard choice used here. Calling the loaded model
+    directly (backbone(tensor)) returns the pooled per-image embedding,
+    matching the flat feature-vector-per-image contract the rest of this
+    script expects -- no extra pooling/indexing needed.
+    """
+    print(f"Loading DINOv2 ({model_name}) feature extractor on {device}...")
+    try:
+        backbone = torch.hub.load("facebookresearch/dinov2", model_name, trust_repo=True)
+    except TypeError:
+        # older torch versions don't accept trust_repo
+        backbone = torch.hub.load("facebookresearch/dinov2", model_name)
+    backbone = backbone.to(device)
+    backbone.eval()
+
+    transform = T.Compose([
+        T.ToPILImage(),
+        T.Resize(224, interpolation=T.InterpolationMode.BICUBIC),
+        T.CenterCrop(224),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    def extractor(path):
+        img = cv2.imread(path)
+        if img is None:
+            return None
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        tensor = transform(img_rgb).unsqueeze(0).to(device)
+        with torch.no_grad():
+            return backbone(tensor).cpu().numpy().flatten()
+
+    return extractor
+
+
 def extract_task_specific_feature():
     """
     Hook for the more causally convincing version of this analysis: swap in
@@ -212,6 +284,8 @@ def extract_task_specific_feature():
 def get_extractor():
     if EMBEDDING_SOURCE == "task_model":
         return extract_task_specific_feature()
+    if EMBEDDING_SOURCE == "dinov2":
+        return load_dinov2_extractor()
     return load_imagenet_extractor()
 
 
@@ -368,9 +442,10 @@ def gather_all_records():
 # after adding a few files don't recompute everything)
 # ==========================================
 def extract_all_features(records, extractor):
+    cache_path = get_cache_path()
     cache = {}
-    if os.path.exists(FEATURE_CACHE):
-        with open(FEATURE_CACHE, "rb") as f:
+    if os.path.exists(cache_path):
+        with open(cache_path, "rb") as f:
             cache = pickle.load(f)
 
     updated = False
@@ -383,7 +458,7 @@ def extract_all_features(records, extractor):
         updated = True
 
     if updated:
-        with open(FEATURE_CACHE, "wb") as f:
+        with open(cache_path, "wb") as f:
             pickle.dump(cache, f)
 
     paths, feats, kept_records = [], [], []
