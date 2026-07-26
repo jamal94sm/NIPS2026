@@ -64,15 +64,24 @@ def run_one(method_name, setting, train_samples, gallery_samples, probe_samples,
     best_rank1, best_eer = -1.0, None
     ckpt_path = os.path.join(results_dir, "best_model.pth")
 
+    batch_times, epoch_times = [], []
     for epoch in range(1, num_epochs + 1):
         if hasattr(baseline, "epoch"):
             baseline.epoch = epoch          # drives PalmBridge's warmup schedule
         baseline.train_mode()
         ep_loss, n_batches = 0.0, 0
+        epoch_t0 = time.time()
         for batch in train_loader:
+            if C.DEVICE.type == "cuda":
+                torch.cuda.synchronize()
+            batch_t0 = time.time()
             loss = baseline.train_step(batch, optimizer)
+            if C.DEVICE.type == "cuda":
+                torch.cuda.synchronize()
+            batch_times.append(time.time() - batch_t0)
             ep_loss += loss
             n_batches += 1
+        epoch_times.append(time.time() - epoch_t0)
         scheduler.step()
 
         if epoch % eval_every == 0 or epoch == num_epochs:
@@ -89,14 +98,37 @@ def run_one(method_name, setting, train_samples, gallery_samples, probe_samples,
     if os.path.exists(ckpt_path):
         baseline.load_state_dict(torch.load(ckpt_path, map_location=C.DEVICE, weights_only=False))
     baseline.eval_mode()
+
+    # Dedicated inference-timing pass (kept separate from the EER/Rank-1 eval
+    # calls above, which run periodically during training and would skew the
+    # average if included).
+    infer_samples = gallery_samples + probe_samples
+    infer_loader = D.make_loader(infer_samples, method_name, False, cfg["batch_size"], C.NUM_WORKERS)
+    if C.DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+    t0 = time.time()
+    with torch.no_grad():
+        for imgs, _ in infer_loader:
+            baseline.embed(imgs.to(C.DEVICE))
+    if C.DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+    infer_total_s = time.time() - t0
+    infer_time_per_100 = (infer_total_s / max(len(infer_samples), 1)) * 100 * 1000  # ms / 100 samples
+
     final_eer, final_rank1 = U.evaluate(baseline.embed, gallery_loader, probe_loader, C.DEVICE,
                                          eval_dir, tag="FINAL")
+
+    timing = {
+        "train_time_per_epoch_s": sum(epoch_times) / max(len(epoch_times), 1),
+        "train_time_per_batch_ms": (sum(batch_times) / max(len(batch_times), 1)) * 1000,
+        "infer_time_per_100_samples_ms": infer_time_per_100,
+    }
 
     with open(os.path.join(results_dir, "results.json"), "w") as f:
         json.dump({"setting": setting["label"], "method": method_name,
                     "num_train_classes": num_classes,
-                    "EER_pct": final_eer, "Rank1_pct": final_rank1}, f, indent=2)
-    return final_eer, final_rank1
+                    "EER_pct": final_eer, "Rank1_pct": final_rank1, **timing}, f, indent=2)
+    return final_eer, final_rank1, timing
 
 
 def main():
@@ -123,6 +155,7 @@ def main():
           f"= {len(methods) * len(settings)} experiments\n")
 
     results = {}
+    timing_results = {m: [] for m in methods}
     for s_idx, setting in enumerate(settings, 1):
         print(f"{'='*70}\n[{s_idx}/{len(settings)}] SETTING {setting['label']}\n"
               f"  Train: {setting['train_desc']}   Test: {setting['test_desc']}\n{'='*70}")
@@ -134,10 +167,13 @@ def main():
             print(f"  --- {method_name} ---")
             t0 = time.time()
             try:
-                eer, rank1 = run_one(method_name, setting, train_samples, gallery_samples,
-                                      probe_samples, num_classes, quick=args.quick)
+                eer, rank1, timing = run_one(method_name, setting, train_samples, gallery_samples,
+                                              probe_samples, num_classes, quick=args.quick)
                 results[(setting["label"], method_name)] = {"eer": eer, "rank1": rank1}
+                timing_results[method_name].append(timing)
                 print(f"  {method_name}: EER={eer:.4f}%  Rank-1={rank1:.2f}%  "
+                      f"train={timing['train_time_per_epoch_s']:.2f}s/epoch  "
+                      f"infer={timing['infer_time_per_100_samples_ms']:.1f}ms/100  "
                       f"({(time.time()-t0)/60:.1f} min)\n")
             except Exception as e:
                 print(f"  [FAILED] {method_name} on {setting['label']}: {e}")
@@ -153,6 +189,11 @@ def main():
     print("\nRank-1 (%) table (rows=settings, cols=methods), best-Rank-1 checkpoint per run:")
     print(rank1_df.to_string())
     print(f"\nSaved: {C.BASE_RESULTS_DIR}/eer_table.csv, rank1_table.csv, summary.md")
+
+    timing_df = U.build_timing_table(timing_results, methods, C.BASE_RESULTS_DIR)
+    print("\nTiming table (avg per method across all completed settings):")
+    print(timing_df.to_string())
+    print(f"Saved: {C.BASE_RESULTS_DIR}/timing_table.csv")
 
 
 if __name__ == "__main__":
