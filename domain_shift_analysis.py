@@ -145,7 +145,7 @@ DATA_ROOTS = {
 
 OUTPUT_DIR = "domain_shift_outputs"
 
-EMBEDDING_SOURCE = "dinov2"   # "imagenet_resnet50" | "dinov2" | "task_model"
+EMBEDDING_SOURCE = "imagenet_resnet50"   # "imagenet_resnet50" | "dinov2" | "task_model"
 DINOV2_MODEL_NAME = "dinov2_vits14"   # or dinov2_vitb14 / dinov2_vitl14 / dinov2_vitg14
                                         # (larger = slower + higher-dim; vits14=384-D,
                                         # vitb14=768-D, vitl14=1024-D, vitg14=1536-D)
@@ -369,11 +369,44 @@ def parse_xjtu_domains(data_root):
     return records
 
 
+import re
+
+_HAND_TOKEN_PATTERN = re.compile(r"(?:^|_)(l|r|left|right|lh|rh)(?:_|$)", re.IGNORECASE)
+
+
+def extract_hand(fname_no_ext):
+    """Best-effort extraction of hand laterality from an X-Palm filename.
+    X-Palm's true identity unit is subject+hand (a person's two palms are
+    different biometric patterns), but scanner_roi/smartphone_roi only
+    separate by SUBJECT folder -- both hands' images live in the same
+    folder, so laterality must be recovered from the filename itself.
+
+    *** ADAPT THE TOKEN LIST ABOVE (_HAND_TOKEN_PATTERN) to your actual
+    naming convention before trusting this. *** Verify first, e.g.:
+        ls scanner_roi/<some_subject_folder>/ | head -20
+        ls smartphone_roi/<some_subject_folder>/ | head -20
+    and check that "l"/"r" (or whatever token you actually use) appears as
+    its own underscore-delimited token in those filenames.
+
+    Returns 'L', 'R', or None if no recognized token was found. A None
+    result falls back to subject-only identity for that one file (the old
+    behavior) and is counted by the caller, so a systematic mismatch
+    between this pattern and your real filenames shows up as a loud
+    fallback-rate warning instead of silently mis-grouping identities.
+    """
+    m = _HAND_TOKEN_PATTERN.search(fname_no_ext.lower())
+    if not m:
+        return None
+    token = m.group(1)
+    return "R" if token in ("r", "right", "rh") else "L"
+
+
 def parse_xpalm(data_root):
     records = []
     unmatched = 0
+    no_hand_detected = 0
     if not os.path.exists(data_root):
-        return records, unmatched
+        return records, unmatched, no_hand_detected
     IMG_EXTS = {".jpg", ".png", ".bmp"}
     scanner_targets = ["pink", "green", "white", "ir", "blue", "yellow"]
     smartphone_targets = ["wet", "text", "jf", "sf", "bf", "close", "far", "pitch", "roll", "fl", "rnd"]
@@ -390,10 +423,14 @@ def parse_xpalm(data_root):
                 fname_lower = fname.lower()
                 matched = next((t for t in scanner_targets if t in fname_lower), None)
                 if matched:
+                    hand = extract_hand(os.path.splitext(fname)[0])
+                    if hand is None:
+                        no_hand_detected += 1
+                    subject_id = f"{subj}_{hand}" if hand else subj
                     records.append({
                         "Dataset": "X-Palm", "SubDomain": f"Scanner_{matched}",
                         "SensorTag": "Scanner", "ConditionTag": matched,
-                        "ID": subj,
+                        "ID": subject_id,
                         "Path": os.path.join(subj_dir, fname),
                     })
                 else:
@@ -411,16 +448,20 @@ def parse_xpalm(data_root):
                 fname_lower = fname.lower()
                 matched = next((t for t in smartphone_targets if t in fname_lower), None)
                 if matched:
+                    hand = extract_hand(os.path.splitext(fname)[0])
+                    if hand is None:
+                        no_hand_detected += 1
+                    subject_id = f"{subj}_{hand}" if hand else subj
                     records.append({
                         "Dataset": "X-Palm", "SubDomain": f"Smartphone_{matched}",
                         "SensorTag": "Smartphone", "ConditionTag": matched,
-                        "ID": subj,
+                        "ID": subject_id,
                         "Path": os.path.join(subj_dir, fname),
                     })
                 else:
                     unmatched += 1
 
-    return records, unmatched
+    return records, unmatched, no_hand_detected
 
 
 def gather_all_records():
@@ -430,9 +471,20 @@ def gather_all_records():
         recs = fn(DATA_ROOTS[name])
         print(f"  {name:10s}: {len(recs)} images parsed")
         all_records.extend(recs)
-    xpalm_recs, xpalm_unmatched = parse_xpalm(DATA_ROOTS["X-Palm"])
+    xpalm_recs, xpalm_unmatched, xpalm_no_hand = parse_xpalm(DATA_ROOTS["X-Palm"])
     print(f"  {'X-Palm':10s}: {len(xpalm_recs)} images parsed "
           f"({xpalm_unmatched} file(s) matched no known target keyword and were skipped)")
+    if xpalm_recs:
+        no_hand_rate = xpalm_no_hand / len(xpalm_recs)
+        if no_hand_rate > 0.02:
+            print(f"  WARNING: hand laterality could not be detected for "
+                  f"{xpalm_no_hand}/{len(xpalm_recs)} X-Palm files ({no_hand_rate:.1%}) -- "
+                  f"these fell back to subject-only ID. _HAND_TOKEN_PATTERN in parse_xpalm() "
+                  f"almost certainly does not match your actual filename convention; inspect a "
+                  f"few real filenames and adjust it before trusting Table B2's X-Palm rows.")
+        else:
+            print(f"  X-Palm hand detection: {xpalm_no_hand}/{len(xpalm_recs)} files fell back "
+                  f"to subject-only ID.")
     all_records.extend(xpalm_recs)
     return all_records
 
