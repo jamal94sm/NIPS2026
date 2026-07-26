@@ -1,0 +1,17 @@
+torch>=2.0
+torchvision>=0.15
+numpy
+pillow
+scikit-learn
+scipy
+pandas
+tabulate
+einops
+
+# Only needed for specific baselines:
+onnx                      # arcface (ONNX backbone loading)
+onnx2torch                # arcface
+timm                      # convnext (pretrained ConvNeXtV2-Tiny)
+pytorch-metric-learning   # convnext, dino (ArcFaceLoss, SupConLoss)
+# dino also needs internet access at first run to torch.hub.load(
+#   "facebookresearch/dinov2", "dinov2_vits14")
