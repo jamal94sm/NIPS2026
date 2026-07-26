@@ -32,8 +32,8 @@ BASE_RESULTS_DIR    = "./benchmark_results"
 
 
 SEED                = 42
-SPLITS_FILE        = "./palm_auth_openset_splits_50-50.json"       # shared, cached, seeded
-TRAIN_ID_RATIO       = 0.50
+SPLITS_FILE        = "./palm_auth_openset_splits_80-20.json"       # shared, cached, seeded
+TRAIN_ID_RATIO       = 0.80
 
 
 
