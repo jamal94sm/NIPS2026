@@ -146,7 +146,7 @@ DATA_ROOTS = {
 
 OUTPUT_DIR = "domain_shift_outputs"
 
-EMBEDDING_SOURCE = "imagenet_resnet50"   # "imagenet_resnet50" | "dinov2" | "task_model"
+EMBEDDING_SOURCE = "dinov2"   # "imagenet_resnet50" | "dinov2" | "task_model"
 DINOV2_MODEL_NAME = "dinov2_vits14"   # or dinov2_vitb14 / dinov2_vitl14 / dinov2_vitg14
                                         # (larger = slower + higher-dim; vits14=384-D,
                                         # vitb14=768-D, vitl14=1024-D, vitg14=1536-D)
