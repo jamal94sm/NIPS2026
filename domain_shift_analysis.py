@@ -12,27 +12,66 @@ question, using feature-space distance metrics (MMD, Proxy A-Distance,
 Frechet Feature Distance) computed on CNN embeddings -- the standard toolkit
 from the domain-adaptation / OOD-detection literature.
 
-Four tables, in order of how directly they answer the reviewer:
+Tables, in order of how directly they answer the reviewer:
 
-  Table A - Between-Dataset Shift: treats each whole dataset as one
-            distribution and computes pairwise shift across all 4 datasets.
-            This is the headline comparison: are the X-Palm-involving pairs
-            systematically larger than the other pairs?
-  Table B - Within-Dataset Heterogeneity: how spread out a dataset's own
-            captured sub-domains are from each other (pooled, all pairs).
-            Supports "X-Palm is intrinsically a harder/more heterogeneous
-            benchmark", independent of any other dataset.
-  Table C - Cross-Sensor Shift: a like-for-like comparison, since X-Palm
-            (scanner vs. smartphone) and MPDv2 (device h vs. device m) both
-            have a genuine sensor-change axis, while XJTU-UP's devices give
-            a second one -- lets you say "X-Palm's sensor-change shift is
-            X times larger than MPDv2's", not just "shift exists".
-  Table D - Hardest Sub-Domain Pairs: the single worst-case pairs pooled
-            across every dataset, ranked once by MMD and then reported
-            consistently across all three metrics (the original script's
-            "Top 5" logic ranked each metric independently, which could
-            silently report three different sets of pairs under one label
-            -- fixed here).
+  Table A  - Between-Dataset Shift: treats each whole dataset as one
+             distribution and computes pairwise shift across all 4 datasets.
+             This is the headline comparison: are the X-Palm-involving pairs
+             systematically larger than the other pairs? (Cross-dataset.)
+  Table B  - Within-Dataset Heterogeneity: how spread out a dataset's own
+             captured sub-domains are from each other, now reported with
+             dispersion (not just the mean pairwise MMD/PAD/FFD) plus two
+             cluster-separation indices -- Calinski-Harabasz and Silhouette
+             -- computed once per dataset over ALL its sub-domains jointly,
+             rather than by averaging pairwise comparisons (which favors
+             datasets with more sub-domains simply because they contribute
+             more pairs). We intentionally do NOT pair-count-match across
+             datasets here: a dataset covering more distinct capture
+             conditions is, by design, a more useful benchmark, and the raw
+             pairwise mean is left as-is so that richer condition coverage
+             is visible rather than normalized away. (Intra-dataset only.)
+  Table B2 - Per-Identity Cross-Domain Variability: Table B answers "how
+             different are this dataset's conditions from each other",
+             which says nothing about whether a *given subject* stays
+             recognizable across them. For every identity with samples in
+             >=2 sub-domains, we compute a within-identity, one-way-ANOVA-
+             style F-ratio: (between-domain scatter of that identity's own
+             per-domain centroids) / (within-domain scatter of that
+             identity's own samples around each centroid) -- an
+             identity-level analog of the Calinski-Harabasz idea in Table B,
+             but with "domain" as the grouping factor *within* one person's
+             data instead of across the whole dataset. A high ratio means a
+             typical subject's embedding moves a lot when the capture
+             condition changes, relative to how much it naturally varies
+             within a single condition -- the quantity most directly
+             relevant to whether cross-domain matching will be hard for a
+             typical enrolled subject. (Intra-dataset only.)
+  Table C  - Cross-Sensor Shift: a like-for-like comparison, since X-Palm
+             (scanner vs. smartphone) and MPDv2 (device h vs. device m) both
+             have a genuine sensor-change axis, while XJTU-UP's devices give
+             a second one -- lets you say "X-Palm's sensor-change shift is
+             X times larger than MPDv2's", not just "shift exists".
+             (Intra-dataset only.)
+  Table D  - Leave-One-Condition-Out Sensitivity: targeted diagnostic for
+             the two comparisons a reviewer is most likely to press on --
+             X-Palm's Scanner subset vs. CASIA-MS, and X-Palm's Smartphone
+             subset vs. XJTU-UP. We compute the baseline shift with all of
+             X-Palm's relevant conditions pooled, then recompute with each
+             condition removed in turn. A large drop when a single
+             condition is excluded means that one acquisition condition --
+             not the sensor/dataset comparison broadly -- is driving the
+             apparent shift (this is the check motivated by an earlier
+             finding that a single scanner illumination condition dominated
+             the dataset's hardest sub-domain pairs). (Cross-dataset by
+             construction -- this is a diagnostic FOR a Table A/C finding,
+             not an addition to the intra-dataset metrics above.)
+  Table E  - Hardest Sub-Domain Pairs Overall: the single worst-case pairs
+             pooled across every dataset's own sub-domains, ranked once by
+             MMD and reported consistently across all three metrics (the
+             original script's "Top 5" logic ranked each metric
+             independently, which could silently report three different
+             sets of pairs under one label -- fixed here). This is what
+             motivated Table D above. (Intra-dataset only.)
 
 Statistical fixes relative to a naive MMD/PAD/FID implementation, all
 important given that per-sub-domain sample sizes here are small (tens to a
@@ -86,6 +125,7 @@ from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics.pairwise import rbf_kernel, euclidean_distances
+from sklearn.metrics import calinski_harabasz_score, silhouette_score
 from scipy.linalg import sqrtm
 from tqdm import tqdm
 
@@ -193,6 +233,7 @@ def parse_casia_ms(data_root):
         records.append({
             "Dataset": "CASIA-MS", "SubDomain": f"Spectrum_{parts[2]}",
             "SensorTag": "MS-Sensor", "ConditionTag": f"Spectrum_{parts[2]}",
+            "ID": f"{parts[0]}_{parts[1]}",
             "Path": os.path.join(data_root, fname),
         })
     return records
@@ -208,12 +249,13 @@ def parse_mpd_data(data_root):
         parts = os.path.splitext(fname)[0].split("_")
         if len(parts) != 5:
             continue
-        _, session, device_id, _, _ = parts
+        subject, session, device_id, hand_side, _ = parts
         if device_id not in ("h", "m"):
             continue
         records.append({
             "Dataset": "MPDv2", "SubDomain": f"Device_{device_id}",
             "SensorTag": f"Device_{device_id}", "ConditionTag": f"Session_{session}",
+            "ID": f"{subject}_{hand_side}",
             "Path": os.path.join(data_root, fname),
         })
     return records
@@ -239,9 +281,15 @@ def parse_xjtu_domains(data_root):
                 for fname in sorted(os.listdir(id_dir)):
                     if os.path.splitext(fname)[1].lower() not in IMG_EXTS:
                         continue
+                    # NOTE: assumes id_folder naming (e.g. "L_01") is used
+                    # consistently for the same physical subject across every
+                    # device/condition subfolder. If your capture protocol
+                    # does not guarantee that, Table B2 below will undercount
+                    # or mis-pair identities for this dataset.
                     records.append({
                         "Dataset": "XJTU-UP", "SubDomain": f"{dev}_{condition}",
                         "SensorTag": f"Device_{dev}", "ConditionTag": f"Condition_{condition}",
+                        "ID": id_folder,
                         "Path": os.path.join(id_dir, fname),
                     })
     return records
@@ -271,6 +319,7 @@ def parse_xpalm(data_root):
                     records.append({
                         "Dataset": "X-Palm", "SubDomain": f"Scanner_{matched}",
                         "SensorTag": "Scanner", "ConditionTag": matched,
+                        "ID": subj,
                         "Path": os.path.join(subj_dir, fname),
                     })
                 else:
@@ -291,6 +340,7 @@ def parse_xpalm(data_root):
                     records.append({
                         "Dataset": "X-Palm", "SubDomain": f"Smartphone_{matched}",
                         "SensorTag": "Smartphone", "ConditionTag": matched,
+                        "ID": subj,
                         "Path": os.path.join(subj_dir, fname),
                     })
                 else:
@@ -463,6 +513,144 @@ def format_metric(x, digits=3):
 
 
 # ==========================================
+# Intra-dataset heterogeneity metrics (Table B / Table B2)
+# ==========================================
+def safe_cluster_scores(features, labels, random_state=RANDOM_STATE,
+                         silhouette_sample_cap=5000):
+    """Calinski-Harabasz and Silhouette scores for a dataset's sub-domain
+    grouping, computed ONCE over the whole dataset (all sub-domains
+    jointly) rather than by averaging pairwise comparisons. This avoids the
+    pairwise-mean's implicit bias toward datasets with more sub-domains
+    (more sub-domains -> more pairs -> more chances for the mean to include
+    an extreme pair) -- both indices are defined directly over an arbitrary
+    number of groups, so they aren't in the sub-domain count.
+
+    CH is unbounded (higher = more separated); Silhouette is bounded in
+    [-1, 1] and is comparable in scale across datasets regardless of how
+    many sub-domains each has, which the raw mean-pairwise metrics are not.
+    """
+    labels = np.asarray(labels)
+    unique_labels = np.unique(labels)
+    if len(unique_labels) < 2 or len(features) <= len(unique_labels):
+        return np.nan, np.nan
+
+    try:
+        ch = calinski_harabasz_score(features, labels)
+    except Exception:
+        ch = np.nan
+
+    try:
+        if len(features) > silhouette_sample_cap:
+            rng = np.random.default_rng(random_state)
+            idx = rng.choice(len(features), silhouette_sample_cap, replace=False)
+            sil = silhouette_score(features[idx], labels[idx])
+        else:
+            sil = silhouette_score(features, labels)
+    except Exception:
+        sil = np.nan
+
+    return ch, sil
+
+
+def per_id_domain_variability(df_meta, reduced, dataset, domain_col="SubDomain",
+                               min_domains=2, min_within_samples=2):
+    """Identity-level analog of the Calinski-Harabasz ratio in Table B, but
+    computed WITHIN each identity's own samples, with sub-domain as the
+    grouping factor, instead of across the whole dataset.
+
+    For identity i with samples spanning domains d in D_i:
+      - domain centroid  mu_{i,d} = mean of i's samples captured in d
+      - grand mean       mu_i     = mean of ALL of i's samples in this dataset
+      - MS_between = [sum_d n_{i,d} * ||mu_{i,d} - mu_i||^2] / (|D_i| - 1)
+      - MS_within  = [sum_d sum_{x in d} ||x - mu_{i,d}||^2] / (sum_d (n_{i,d}-1))
+                      (only over domains with >= min_within_samples)
+      - F_ratio    = MS_between / MS_within
+
+    F_ratio is this identity's own "domain-driven displacement" relative to
+    its own natural sample-to-sample noise within one condition -- directly
+    relevant to whether cross-domain matching will be hard for a *typical*
+    subject, which dataset-level heterogeneity (Table B) cannot tell you.
+    Requires the "ID" field added by the dataset parsers.
+    """
+    if "ID" not in df_meta.columns:
+        return pd.DataFrame(columns=["ID", "N_Domains", "MS_Between", "MS_Within", "F_Ratio"])
+
+    sub = df_meta[df_meta["Dataset"] == dataset]
+    results = []
+    for id_val, grp in sub.groupby("ID"):
+        domains = grp[domain_col].unique()
+        if len(domains) < min_domains:
+            continue
+
+        feats_by_domain = {}
+        for d in domains:
+            rows = grp.loc[grp[domain_col] == d, "_row"].values
+            feats_by_domain[d] = reduced[rows]
+
+        all_feats = np.vstack(list(feats_by_domain.values()))
+        grand_mean = all_feats.mean(axis=0)
+
+        ss_between, df_between = 0.0, len(domains) - 1
+        ss_within, n_within_df = 0.0, 0
+        for f in feats_by_domain.values():
+            centroid = f.mean(axis=0)
+            n_d = len(f)
+            ss_between += n_d * np.sum((centroid - grand_mean) ** 2)
+            if n_d >= min_within_samples:
+                ss_within += np.sum((f - centroid) ** 2)
+                n_within_df += (n_d - 1)
+
+        ms_between = ss_between / df_between if df_between > 0 else np.nan
+        ms_within = ss_within / n_within_df if n_within_df > 0 else np.nan
+        f_ratio = (ms_between / ms_within
+                   if (n_within_df > 0 and np.isfinite(ms_within) and ms_within > 0)
+                   else np.nan)
+
+        results.append({"ID": id_val, "N_Domains": len(domains),
+                         "MS_Between": ms_between, "MS_Within": ms_within,
+                         "F_Ratio": f_ratio})
+
+    return pd.DataFrame(results)
+
+
+# ==========================================
+# Leave-one-condition-out diagnostic (Table D)
+# ==========================================
+def leave_one_condition_out(df_meta, feats_for_fn, group_dataset, group_sensor_tag,
+                             other_dataset, condition_col="ConditionTag"):
+    """Baseline: pool ALL of `group_dataset`'s sub-domains under
+    `group_sensor_tag` (e.g. every X-Palm scanner illumination) against the
+    whole of `other_dataset`, then remove one condition at a time and
+    recompute. A large drop in a metric when a single condition is excluded
+    means that one acquisition condition -- not the sensor/dataset
+    comparison broadly -- is driving the apparent shift.
+    """
+    mask_group_all = (df_meta["Dataset"] == group_dataset) & (df_meta["SensorTag"] == group_sensor_tag)
+    mask_other = df_meta["Dataset"] == other_dataset
+    conditions = sorted(df_meta.loc[mask_group_all, condition_col].unique())
+
+    other_feats = feats_for_fn(mask_other)
+    baseline = compute_all_metrics(feats_for_fn(mask_group_all), other_feats)
+    rows = [{"Condition_Removed": "(none -- all conditions)", "N_Group": baseline["N_A"], **baseline}]
+
+    for c in conditions:
+        mask_c = mask_group_all & (df_meta[condition_col] != c)
+        feats_c = feats_for_fn(mask_c)
+        if len(feats_c) < MIN_SAMPLES_SHIFT:
+            continue
+        m = compute_all_metrics(feats_c, other_feats)
+        rows.append({"Condition_Removed": f"-{c}", "N_Group": m["N_A"], **m})
+
+    out = pd.DataFrame(rows)
+    base_mmd = out.loc[out["Condition_Removed"] == "(none -- all conditions)", "MMD"].values[0]
+    out["Delta_MMD_vs_Baseline"] = base_mmd - out["MMD"]
+    out.attrs["group_dataset"] = group_dataset
+    out.attrs["group_sensor_tag"] = group_sensor_tag
+    out.attrs["other_dataset"] = other_dataset
+    return out.sort_values("Delta_MMD_vs_Baseline", ascending=False, na_position="last")
+
+
+# ==========================================
 # Hook: linking domain shift to recognition performance
 # ==========================================
 def correlate_shift_with_performance(pairwise_shift_df, recognition_results_df):
@@ -543,8 +731,14 @@ def main():
     table_a.to_csv(os.path.join(OUTPUT_DIR, "tableA_between_dataset.csv"), index=False)
 
     # ---------------------------------------------------------
-    # TABLE B: Within-Dataset Heterogeneity (all sub-domain pairs, flat)
-    # + collect every pair record (tagged by dataset) for Table D
+    # TABLE B: Within-Dataset Heterogeneity -- mean AND dispersion over all
+    # own sub-domain pairs, plus dataset-level Calinski-Harabasz and
+    # Silhouette scores (computed once over all sub-domains jointly, so they
+    # don't share the pairwise mean's implicit bias toward datasets with
+    # more sub-domains). We deliberately do NOT pair-count-match across
+    # datasets: more sub-domains reflects richer condition coverage, which
+    # is a benchmark strength, not a statistical artifact to normalize away.
+    # + collect every pair record (tagged by dataset) for Table E
     # ---------------------------------------------------------
     rows_b, all_pair_records = [], []
     for ds in datasets:
@@ -564,24 +758,84 @@ def main():
                 pad_list.append(m["PAD"])
             if np.isfinite(m["FFD"]):
                 ffd_list.append(m["FFD"])
+
+        ch_index, sil_score = safe_cluster_scores(feats_for(df_meta["Dataset"] == ds),
+                                                    sub["SubDomain"].values)
+
         rows_b.append({
             "Dataset": ds, "N_SubDomains": len(subdomains), "Pairs_Evaluated": len(mmd_list),
             "Mean_MMD": format_metric(np.mean(mmd_list)) if mmd_list else "N/A",
+            "Std_MMD": format_metric(np.std(mmd_list)) if mmd_list else "N/A",
             "Mean_PAD": format_metric(np.mean(pad_list)) if pad_list else "N/A",
+            "Std_PAD": format_metric(np.std(pad_list)) if pad_list else "N/A",
             "Mean_FFD": format_metric(np.mean(ffd_list), 1) if ffd_list else "N/A",
+            "Std_FFD": format_metric(np.std(ffd_list), 1) if ffd_list else "N/A",
+            "Calinski_Harabasz": format_metric(ch_index, 1),
+            "Silhouette": format_metric(sil_score),
         })
     table_b = pd.DataFrame(rows_b)
     print("\n" + "=" * 100)
-    print("TABLE B: Within-Dataset Internal Heterogeneity (mean over all own sub-domain pairs)")
+    print("TABLE B: Within-Dataset Internal Heterogeneity "
+          "(pairwise mean +/- std, and whole-dataset cluster-separation indices)")
     print("=" * 100)
     print(table_b.to_markdown(index=False))
     table_b.to_csv(os.path.join(OUTPUT_DIR, "tableB_within_dataset.csv"), index=False)
+    print("Note: Calinski-Harabasz is unbounded (higher = more separated); Silhouette is "
+          "bounded in [-1, 1] and is the more directly cross-dataset-comparable of the two "
+          "since it does not scale with sub-domain count the way the pairwise means can.")
 
     pair_df = pd.DataFrame(all_pair_records)
     pair_df.to_csv(os.path.join(OUTPUT_DIR, "all_subdomain_pairs.csv"), index=False)
     print(f"\nSaved every sub-domain pair's raw MMD/PAD/FFD to "
           f"{os.path.join(OUTPUT_DIR, 'all_subdomain_pairs.csv')} "
           "(join against recognition performance for the causal analysis).")
+
+    # ---------------------------------------------------------
+    # TABLE B2: Per-Identity Cross-Domain Variability (intra-dataset only).
+    # Complements Table B: instead of "how separated are this dataset's
+    # conditions", this asks "how much does a typical enrolled subject's own
+    # embedding move between conditions, relative to their own natural
+    # within-condition noise" -- see per_id_domain_variability() docstring.
+    # ---------------------------------------------------------
+    rows_b2 = []
+    all_id_records = []
+    for ds in datasets:
+        id_df = per_id_domain_variability(df_meta, reduced, ds)
+        n_total_ids = df_meta.loc[df_meta["Dataset"] == ds, "ID"].nunique() if "ID" in df_meta.columns else 0
+        valid = id_df.dropna(subset=["F_Ratio"]) if not id_df.empty else id_df
+        if not id_df.empty:
+            id_df = id_df.copy()
+            id_df.insert(0, "Dataset", ds)
+            all_id_records.append(id_df)
+
+        rows_b2.append({
+            "Dataset": ds,
+            "N_IDs_Total": n_total_ids,
+            "N_IDs_Multi_Domain": len(id_df),
+            "N_IDs_With_Valid_Ratio": len(valid),
+            "Mean_MS_Between": format_metric(id_df["MS_Between"].mean()) if not id_df.empty else "N/A",
+            "Mean_MS_Within": format_metric(id_df["MS_Within"].mean()) if not id_df.empty else "N/A",
+            "Mean_F_Ratio": format_metric(valid["F_Ratio"].mean()) if not valid.empty else "N/A",
+            "Median_F_Ratio": format_metric(valid["F_Ratio"].median()) if not valid.empty else "N/A",
+            "Std_F_Ratio": format_metric(valid["F_Ratio"].std()) if not valid.empty else "N/A",
+        })
+    table_b2 = pd.DataFrame(rows_b2)
+    print("\n" + "=" * 100)
+    print("TABLE B2: Per-Identity Cross-Domain Variability "
+          "(within-identity, between-domain-scatter / within-domain-scatter F-ratio, "
+          "averaged over identities with samples in >=2 sub-domains)")
+    print("=" * 100)
+    print(table_b2.to_markdown(index=False))
+    table_b2.to_csv(os.path.join(OUTPUT_DIR, "tableB2_per_identity.csv"), index=False)
+    print("Note: mean F-ratio can be pulled up by a small number of identities with an "
+          "unusually small within-domain denominator -- the median is the more robust "
+          "summary; per-identity raw values are saved separately below.")
+
+    if all_id_records:
+        id_raw_df = pd.concat(all_id_records, ignore_index=True)
+        id_raw_df.to_csv(os.path.join(OUTPUT_DIR, "tableB2_per_id_raw.csv"), index=False)
+        print(f"Saved every identity's own F-ratio to "
+              f"{os.path.join(OUTPUT_DIR, 'tableB2_per_id_raw.csv')}.")
 
     # ---------------------------------------------------------
     # TABLE C: Cross-Sensor Shift (like-for-like across datasets that have
@@ -612,20 +866,54 @@ def main():
         print("No dataset had >=2 distinct SensorTag groups with enough samples.")
 
     # ---------------------------------------------------------
-    # TABLE D: Hardest sub-domain pairs, pooled across all datasets, ranked
-    # ONCE by MMD (fixes the independent-per-metric-sort bug)
+    # TABLE D: Leave-one-condition-out sensitivity for the two comparisons a
+    # reviewer is most likely to press on: X-Palm Scanner vs. CASIA-MS, and
+    # X-Palm Smartphone vs. XJTU-UP. Tests whether a single acquisition
+    # condition is driving the apparent shift rather than the sensor/dataset
+    # change broadly.
+    # ---------------------------------------------------------
+    loo_configs = [
+        ("X-Palm", "Scanner", "CASIA-MS", "TABLE D1: Leave-One-Out -- X-Palm Scanner vs. CASIA-MS"),
+        ("X-Palm", "Smartphone", "XJTU-UP", "TABLE D2: Leave-One-Out -- X-Palm Smartphone vs. XJTU-UP"),
+    ]
+    for group_ds, sensor_tag, other_ds, title in loo_configs:
+        if group_ds not in datasets or other_ds not in datasets:
+            print(f"\nSkipping {title}: one of the two datasets was not found.")
+            continue
+        loo_table = leave_one_condition_out(df_meta, feats_for, group_ds, sensor_tag, other_ds)
+        display = loo_table.copy()
+        for col in ("MMD", "MMD_p", "PAD", "FFD", "Delta_MMD_vs_Baseline"):
+            display[col] = display[col].map(lambda x: format_metric(x, 3))
+        print("\n" + "=" * 100)
+        print(title)
+        print("=" * 100)
+        print(display.to_markdown(index=False))
+        fname = f"tableD_loo_{group_ds}_{sensor_tag}_vs_{other_ds}.csv".replace(" ", "")
+        loo_table.to_csv(os.path.join(OUTPUT_DIR, fname), index=False)
+        top_condition = loo_table.iloc[0]
+        if top_condition["Condition_Removed"] != "(none -- all conditions)":
+            print(f"Largest single-condition contribution: removing "
+                  f"'{top_condition['Condition_Removed'].lstrip('-')}' drops MMD by "
+                  f"{format_metric(top_condition['Delta_MMD_vs_Baseline'], 3)} "
+                  f"relative to the all-conditions baseline.")
+
+    # ---------------------------------------------------------
+    # TABLE E: Hardest sub-domain pairs, pooled across all datasets' own
+    # sub-domains, ranked ONCE by MMD (fixes the independent-per-metric-sort
+    # bug in an earlier version of this table). This is what motivated the
+    # Table D leave-one-out check above.
     # ---------------------------------------------------------
     if not pair_df.empty:
         ranked = pair_df.sort_values("MMD", ascending=False, na_position="last")
-        table_d = ranked.head(TOP_K_HARDEST).copy()
+        table_e = ranked.head(TOP_K_HARDEST).copy()
         for col in ("MMD", "PAD", "FFD"):
-            table_d[col] = table_d[col].map(lambda x: format_metric(x))
+            table_e[col] = table_e[col].map(lambda x: format_metric(x))
         print("\n" + "=" * 100)
-        print(f"TABLE D: Top {TOP_K_HARDEST} Hardest Sub-Domain Pairs Overall (ranked once by MMD, "
+        print(f"TABLE E: Top {TOP_K_HARDEST} Hardest Sub-Domain Pairs Overall (ranked once by MMD, "
               "same pairs reported for PAD/FFD)")
         print("=" * 100)
-        print(table_d.to_markdown(index=False))
-        table_d.to_csv(os.path.join(OUTPUT_DIR, "tableD_hardest_pairs.csv"), index=False)
+        print(table_e.to_markdown(index=False))
+        table_e.to_csv(os.path.join(OUTPUT_DIR, "tableE_hardest_pairs.csv"), index=False)
 
     print("\nGuidance: to establish that this shift actually drives performance (not just that "
           "it exists), join all_subdomain_pairs.csv against your verification pipeline's "
