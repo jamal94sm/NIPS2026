@@ -75,7 +75,7 @@ METHODS = {
         "batch_size": 32, "num_epochs": 100, "lr": 1e-4, "weight_decay": 5e-4,
         "arc_s": 64.0, "m_l": 0.45, "m_u": 0.80, "l_a": 10.0, "u_a": 110.0,
         "lambda_g": 20.0,
-        "pretrained_weights": "/path/to/magface_checkpoint.pth",  # <-- set this
+        "pretrained_weights": "/home/pai-ng/Jamal/NIPS2026/face_models/checkpoints/magface_iresnet100.pth",  # <-- set this
         "freeze_ratio": 0.75,
     },
 
