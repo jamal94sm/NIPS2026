@@ -22,7 +22,7 @@ import torch
 #  GLOBAL / SHARED ACROSS ALL METHODS AND ALL 12 SETTINGS
 # ══════════════════════════════════════════════════════════════
 
-DATA_ROOT            = "/path/to/your/smartphone_data"   # <-- set to your data path
+DATA_ROOT            = "/home/pai-ng/Jamal/smartphone_data"   # <-- set to your data path
 SCANNER_SPECTRA    = {"green", "ir", "yellow", "pink", "white"}
 
 
