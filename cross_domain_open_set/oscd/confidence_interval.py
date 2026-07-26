@@ -44,6 +44,7 @@ import time
 import random
 import argparse
 from collections import defaultdict
+import copy 
 
 import numpy as np
 import pandas as pd
@@ -102,7 +103,11 @@ def train_compnet(train_samples, gallery_samples, probe_samples, num_classes,
             eer, rank1 = U.evaluate(baseline.embed, gallery_loader, probe_loader, C.DEVICE)
             if rank1 > best_rank1:
                 best_rank1 = rank1
-                best_state = baseline.state_dict()
+                # state_dict() aliases live parameter tensors -- optimizer.step()
+                # mutates them in place on later epochs, so without a deep copy
+                # this would silently end up holding the LAST epoch's weights
+                # instead of the best-Rank-1 epoch's.
+                best_state = copy.deepcopy(baseline.state_dict())
 
     if best_state is not None:
         baseline.load_state_dict(best_state)
