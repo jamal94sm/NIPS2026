@@ -132,6 +132,45 @@ def point_eer_rank1(gal_feats, gal_labels, prb_feats, prb_labels):
     return eer * 100.0, rank1, sim
 
 
+def identity_bootstrap_ci(sim, gal_labels, prb_labels, n_bootstrap=1000, ci=0.95, seed=0):
+    """Resamples TEST IDENTITIES (with replacement), not raw score pairs --
+    probe/gallery entries from the same identity are correlated, so
+    pair-level bootstrap would understate variance. `sim` is the raw
+    probe x gallery cosine similarity matrix (as returned by
+    point_eer_rank1's third value)."""
+    rng = np.random.default_rng(seed)
+    identities = np.array(sorted(set(gal_labels.tolist()) | set(prb_labels.tolist())))
+    gal_by_id = {i: np.where(gal_labels == i)[0] for i in identities}
+    prb_by_id = {i: np.where(prb_labels == i)[0] for i in identities}
+
+    eers, rank1s = [], []
+    for _ in range(n_bootstrap):
+        sampled = rng.choice(identities, size=len(identities), replace=True)
+        gal_idx = np.concatenate([gal_by_id[i] for i in sampled if len(gal_by_id[i])])
+        prb_idx = np.concatenate([prb_by_id[i] for i in sampled if len(prb_by_id[i])])
+        if len(gal_idx) == 0 or len(prb_idx) == 0:
+            continue
+        sub_sim = sim[np.ix_(prb_idx, gal_idx)]
+        sub_gal_labels = gal_labels[gal_idx]
+        sub_prb_labels = prb_labels[prb_idx]
+
+        rank1 = 100.0 * (sub_gal_labels[sub_sim.argmax(axis=1)] == sub_prb_labels).mean()
+        same = (sub_prb_labels[:, None] == sub_gal_labels[None, :])
+        scores = sub_sim.ravel()
+        labels = np.where(same, 1, -1).ravel()
+        eer, _ = compute_eer(np.column_stack([scores, labels]))
+
+        eers.append(eer * 100.0)
+        rank1s.append(rank1)
+
+    alpha = (1 - ci) / 2
+    eer_lo, eer_hi = np.percentile(eers, [alpha * 100, (1 - alpha) * 100])
+    r1_lo, r1_hi = np.percentile(rank1s, [alpha * 100, (1 - alpha) * 100])
+    return {"eer_ci_lo": eer_lo, "eer_ci_hi": eer_hi,
+            "rank1_ci_lo": r1_lo, "rank1_ci_hi": r1_hi,
+            "n_bootstrap_used": len(eers)}
+
+
 def save_best(state_dict_fn, path, epoch, eer, rank1):
     torch.save({"epoch": epoch, "eer": eer, "rank1": rank1, **state_dict_fn()}, path)
 
