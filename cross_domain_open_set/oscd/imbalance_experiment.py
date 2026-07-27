@@ -82,6 +82,62 @@ N_TRAIN_MODE_B_SP   = 30    # Experiment 1, Mode B: smartphone-only portion
 #  SHARED HELPERS
 # ══════════════════════════════════════════════════════════════
 
+
+def train_compnet_model(train_samples, gallery_samples, probe_samples, num_classes,
+                         init_tag, num_epochs=None, eval_every=None):
+    """Trains CompNet exactly as train_compnet() does below, but returns the
+    trained (best-Rank-1 checkpoint loaded) `baseline` object itself -- not
+    pre-extracted embeddings -- plus the gallery/probe loaders used for its
+    internal periodic checkpoint-selection eval. This lets callers extract
+    embeddings for additional/different gallery-probe configurations
+    afterward without retraining (see imbalance_experiment.py)."""
+    cfg = dict(C.METHODS[METHOD])
+    num_epochs = num_epochs or cfg["num_epochs"]
+    eval_every = eval_every or C.EVAL_EVERY
+
+    train_loader = D.make_loader(train_samples, METHOD, True, cfg["batch_size"], C.NUM_WORKERS)
+    gallery_loader = D.make_loader(gallery_samples, METHOD, False, cfg["batch_size"], C.NUM_WORKERS)
+    probe_loader = D.make_loader(probe_samples, METHOD, False, cfg["batch_size"], C.NUM_WORKERS)
+
+    baseline = M.REGISTRY[METHOD](num_classes, cfg, C.DEVICE)
+    get_or_create_init_state(baseline, num_classes, init_tag)     # same init across folds
+    optimizer, scheduler = baseline.build_optimizer()
+
+    best_rank1 = -1.0
+    best_state = None
+    for epoch in range(1, num_epochs + 1):
+        baseline.train_mode()
+        for batch in train_loader:
+            baseline.train_step(batch, optimizer)
+        scheduler.step()
+        if epoch % eval_every == 0 or epoch == num_epochs:
+            baseline.eval_mode()
+            eer, rank1 = U.evaluate(baseline.embed, gallery_loader, probe_loader, C.DEVICE)
+            if rank1 > best_rank1:
+                best_rank1 = rank1
+                best_state = copy.deepcopy(baseline.state_dict())
+
+    if best_state is not None:
+        baseline.load_state_dict(best_state)
+    baseline.eval_mode()
+    return baseline, gallery_loader, probe_loader
+
+
+def train_compnet(train_samples, gallery_samples, probe_samples, num_classes,
+                   init_tag, num_epochs=None, eval_every=None):
+    """Thin wrapper over train_compnet_model() preserving the original
+    return contract (embeddings, not the model) used by Phase 1 / Phase 2.
+    Returns (gal_feats, gal_labels, prb_feats, prb_labels) from the
+    best-Rank-1 checkpoint."""
+    baseline, gallery_loader, probe_loader = train_compnet_model(
+        train_samples, gallery_samples, probe_samples, num_classes,
+        init_tag, num_epochs=num_epochs, eval_every=eval_every)
+    baseline.eval_mode()
+    gal_feats, gal_labels = U.extract_embeddings(baseline.embed, gallery_loader, C.DEVICE)
+    prb_feats, prb_labels = U.extract_embeddings(baseline.embed, probe_loader, C.DEVICE)
+    return gal_feats, gal_labels, prb_feats, prb_labels
+
+
 def collect_pools():
     """Returns (persp_all, scanner_paths, dual_ids, smartphone_only_ids).
     persp_all: identity -> [smartphone/perspective image paths] (all conditions pooled).
