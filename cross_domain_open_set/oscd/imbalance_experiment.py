@@ -73,9 +73,9 @@ METHOD = "compnet"
 
 # ── Default identity-count targets (all adjustable via CLI) ─────────
 N_TEST_IDS          = 40    # held out from dual_ids, shared by both experiments
-N_TRAIN_MODE_A      = 120   # Experiment 1, Mode A: all-dual-domain training IDs
-N_TRAIN_MODE_B_DUAL = 90    # Experiment 1, Mode B: dual-domain portion
-N_TRAIN_MODE_B_SP   = 30    # Experiment 1, Mode B: smartphone-only portion
+N_TRAIN_MODE_A      = 110   # Experiment 1, Mode A: all-dual-domain training IDs
+N_TRAIN_MODE_B_DUAL = 70    # Experiment 1, Mode B: dual-domain portion
+N_TRAIN_MODE_B_SP   = 40    # Experiment 1, Mode B: smartphone-only portion
 
 
 # ══════════════════════════════════════════════════════════════
