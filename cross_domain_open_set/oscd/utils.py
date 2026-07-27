@@ -95,6 +95,43 @@ def evaluate(embed_fn, gallery_loader, probe_loader, device, out_dir=None, tag="
 #  CHECKPOINTING
 # ══════════════════════════════════════════════════════════════
 
+def get_or_create_init_state(baseline, num_classes, tag, cache_dir):
+    """Caches a method's initial (pre-training) weights on first use, keyed
+    by a caller-supplied tag + num_classes, and reloads them on subsequent
+    calls -- so repeated runs (across folds, ratios, or ad-hoc experiments)
+    all start from the SAME initial weights rather than a fresh random
+    init each time. `tag` should include the method name if more than one
+    method might share `cache_dir`. map_location="cpu" here is safe and
+    device-agnostic: load_state_dict() copies values into the model's
+    existing (already correctly-placed) parameter tensors regardless of
+    what device the loaded tensor started on."""
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, f"{tag}_nc{num_classes}.pth")
+    if os.path.exists(path):
+        baseline.load_state_dict(torch.load(path, map_location="cpu", weights_only=False))
+    else:
+        torch.save(baseline.state_dict(), path)
+
+
+def point_eer_rank1(gal_feats, gal_labels, prb_feats, prb_labels):
+    """Same metric definition as evaluate() above, vectorised (no I/O) --
+    useful when embeddings are already in memory (e.g. bootstrap
+    resampling, or comparing multiple gallery/probe configurations from
+    one trained model) and a fresh DataLoader pass isn't needed. Returns
+    (eer_pct, rank1_pct, sim) -- `sim` (the raw probe x gallery cosine
+    similarity matrix) is returned too since callers often need it again
+    (e.g. for bootstrap resampling)."""
+    gal_n = gal_feats / (np.linalg.norm(gal_feats, axis=1, keepdims=True) + 1e-8)
+    prb_n = prb_feats / (np.linalg.norm(prb_feats, axis=1, keepdims=True) + 1e-8)
+    sim = prb_n @ gal_n.T
+    rank1 = 100.0 * (gal_labels[sim.argmax(axis=1)] == prb_labels).mean()
+    same = (prb_labels[:, None] == gal_labels[None, :])
+    scores = sim.ravel()
+    labels = np.where(same, 1, -1).ravel()
+    eer, _ = compute_eer(np.column_stack([scores, labels]))
+    return eer * 100.0, rank1, sim
+
+
 def save_best(state_dict_fn, path, epoch, eer, rank1):
     torch.save({"epoch": epoch, "eer": eer, "rank1": rank1, **state_dict_fn()}, path)
 
