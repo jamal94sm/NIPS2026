@@ -63,7 +63,17 @@ We appreciate your suggestion. As described in Section 3.1, we evaluated TSCAN (
 We have used these baselines only in the closed-set cross-domain setting (not in the cross-dataset and open-set cross-domain settings) as these methods are originally presented and evaluated for closed-set scenarios.  We will include more DA and DG baselines in the appendix of the revised version.
 
 
+[2] He, Kaiming, et al. "Deep residual learning for image recognition." Proceedings of the IEEE conference on computer vision and pattern recognition. 2016.‏
 
+[3] Gretton, Arthur, et al. "A kernel two-sample test." The journal of machine learning research 13.1 (2012): 723-773.‏
+
+[4] Ben-David, Shai, et al. "A theory of learning from different domains." Machine learning 79.1 (2010): 151-175.‏
+
+[5] Heusel, Martin, et al. "Gans trained by a two time-scale update rule converge to a local nash equilibrium." Advances in neural information processing systems 30 (2017).‏
+
+[6] Bińkowski, Mikołaj, et al. "Demystifying mmd gans." arXiv preprint arXiv:1801.01401 (2018).‏
+
+[7] Rabin, Julien, et al. "Wasserstein barycenter and its application to texture mixing." International conference on scale space and variational methods in computer vision. Berlin, Heidelberg: Springer Berlin Heidelberg, 2011.‏
 
 
 
