@@ -72,10 +72,12 @@ import utils as U
 METHOD = "compnet"
 
 # ── Default identity-count targets (all adjustable via CLI) ─────────
-N_TEST_IDS          = 30    # held out from dual_ids, shared by both experiments
+N_TEST_IDS          = 40    # held out from dual_ids, shared by both experiments
 N_TRAIN_MODE_A      = 120   # Experiment 1, Mode A: all-dual-domain training IDs
 N_TRAIN_MODE_B_DUAL = 90    # Experiment 1, Mode B: dual-domain portion
-N_TRAIN_MODE_B_SP   = 40    # Experiment 1, Mode B: smartphone-only portion
+N_TRAIN_MODE_B_SP   = 30    # Experiment 1, Mode B: smartphone-only portion
+N_BOOTSTRAP          = 1000  # identity-level bootstrap iterations for both experiments
+CI_LEVEL             = 0.95
 
 
 # ══════════════════════════════════════════════════════════════
@@ -149,13 +151,71 @@ def sample_ids(pool, n, seed, tag=""):
     return sorted(shuffled[:k])
 
 
+def _match_total_ids(train_ids_a, train_ids_b_dual, train_ids_b_sp, seed):
+    """Enforce that Mode A and Mode B end up with the SAME total identity
+    count -- the actual design goal of Experiment 1 (any EER/Rank-1 gap
+    should be attributable to domain COMPOSITION, not classification-head
+    size / population size). Without this, independently clamping each
+    mode's own request against its own pool's availability can silently
+    leave the two modes with different totals (e.g. Mode A's single pool
+    runs out before Mode B's two pools do), reintroducing exactly the
+    confound this experiment is designed to control for.
+
+    Trims whichever mode ended up larger:
+      - Mode A: trimmed directly (single homogeneous pool).
+      - Mode B: trimmed from the DUAL portion FIRST, preserving the
+        smartphone-only count exactly, since that count is the actual
+        variable under test. Only trims the smartphone-only portion too
+        if the dual portion alone can't absorb the full reduction (rare
+        -- a loud warning is printed if this happens, since it means the
+        intended smartphone-only count silently changed).
+    """
+    n_a = len(train_ids_a)
+    n_b = len(train_ids_b_dual) + len(train_ids_b_sp)
+    if n_a == n_b:
+        return train_ids_a, train_ids_b_dual, train_ids_b_sp
+
+    rng = random.Random(seed)
+    if n_a > n_b:
+        excess = n_a - n_b
+        print(f"  [MATCH] Mode A ({n_a}) > Mode B ({n_b}) -- trimming {excess} "
+              f"identities from Mode A so both modes have the SAME total ID count.")
+        shuffled = train_ids_a[:]
+        rng.shuffle(shuffled)
+        train_ids_a = sorted(shuffled[excess:])
+    else:
+        excess = n_b - n_a
+        print(f"  [MATCH] Mode B ({n_b}) > Mode A ({n_a}) -- trimming {excess} "
+              f"identities from Mode B's DUAL portion (preserving its smartphone-only "
+              f"count exactly) so both modes have the SAME total ID count.")
+        if excess <= len(train_ids_b_dual):
+            shuffled = train_ids_b_dual[:]
+            rng.shuffle(shuffled)
+            train_ids_b_dual = sorted(shuffled[excess:])
+        else:
+            print(f"  [WARN] Mode B's dual portion ({len(train_ids_b_dual)}) alone can't "
+                  f"absorb the full excess ({excess}) -- also trimming Mode B's "
+                  f"smartphone-only portion, which changes the REQUESTED smartphone-only "
+                  f"count. Consider lowering --n-train-a or --n-train-b-dual/--n-train-b-sp.")
+            remaining_excess = excess - len(train_ids_b_dual)
+            train_ids_b_dual = []
+            shuffled_sp = train_ids_b_sp[:]
+            rng.shuffle(shuffled_sp)
+            train_ids_b_sp = sorted(shuffled_sp[remaining_excess:])
+
+    n_a_final = len(train_ids_a)
+    n_b_final = len(train_ids_b_dual) + len(train_ids_b_sp)
+    assert n_a_final == n_b_final, "internal error: ID-count matching failed"
+    return train_ids_a, train_ids_b_dual, train_ids_b_sp
+
+
 # ══════════════════════════════════════════════════════════════
 #  EXPERIMENT 1 -- imbalance effect on TRAINING
 # ══════════════════════════════════════════════════════════════
 
 def run_experiment1(n_test_ids=N_TEST_IDS, n_train_a=N_TRAIN_MODE_A,
                      n_train_b_dual=N_TRAIN_MODE_B_DUAL, n_train_b_sp=N_TRAIN_MODE_B_SP,
-                     seed=None, quick=False):
+                     seed=None, n_bootstrap=N_BOOTSTRAP, ci=CI_LEVEL, quick=False):
     seed = C.SEED if seed is None else seed
     print(f"\n{'='*70}\nEXPERIMENT 1 -- imbalance effect on TRAINING, CompNet\n{'='*70}")
 
@@ -172,14 +232,23 @@ def run_experiment1(n_test_ids=N_TEST_IDS, n_train_a=N_TRAIN_MODE_A,
 
     # Mode A: n_train_a identities, ALL dual-domain (both domains each)
     train_ids_a = sample_ids(remaining_dual, n_train_a, seed + 1, "Mode-A")
-    label_map_a = {ident: i for i, ident in enumerate(train_ids_a)}
-    train_samples_a = pooled_samples(train_ids_a, persp_all, scanner_paths, label_map_a,
-                                      domains=("smartphone", "scanner"))
 
     # Mode B: n_train_b_dual dual-domain (both domains) + n_train_b_sp
     # smartphone-only (smartphone domain only) -- mirrors the real imbalance
     train_ids_b_dual = sample_ids(remaining_dual, n_train_b_dual, seed + 2, "Mode-B-dual")
     train_ids_b_sp = sample_ids(smartphone_only_ids, n_train_b_sp, seed + 3, "Mode-B-smartphone-only")
+
+    # Enforce SAME total ID count in both modes (see _match_total_ids docstring
+    # -- without this, independent per-pool clamping can silently leave the
+    # two modes with different totals/head-sizes, reintroducing the exact
+    # confound this experiment exists to control for).
+    train_ids_a, train_ids_b_dual, train_ids_b_sp = _match_total_ids(
+        train_ids_a, train_ids_b_dual, train_ids_b_sp, seed + 4)
+
+    label_map_a = {ident: i for i, ident in enumerate(train_ids_a)}
+    train_samples_a = pooled_samples(train_ids_a, persp_all, scanner_paths, label_map_a,
+                                      domains=("smartphone", "scanner"))
+
     train_ids_b = sorted(train_ids_b_dual + train_ids_b_sp)
     label_map_b = {ident: i for i, ident in enumerate(train_ids_b)}
     train_samples_b = (
@@ -187,6 +256,9 @@ def run_experiment1(n_test_ids=N_TEST_IDS, n_train_a=N_TRAIN_MODE_A,
                         domains=("smartphone", "scanner"))
         + pooled_samples(train_ids_b_sp, persp_all, scanner_paths, label_map_b,
                           domains=("smartphone",)))
+
+    assert len(train_ids_a) == len(train_ids_b), \
+        f"Mode A ({len(train_ids_a)}) and Mode B ({len(train_ids_b)}) ID counts still differ"
 
     print(f"  Mode A (balanced)  : {len(train_ids_a)} IDs, all dual-domain, "
           f"{len(train_samples_a)} training images, {len(train_ids_a)}-way head")
@@ -209,19 +281,29 @@ def run_experiment1(n_test_ids=N_TEST_IDS, n_train_a=N_TRAIN_MODE_A,
             METHOD, train_samples, gallery, probe, len(train_ids),
             init_tag=f"exp1_{mode_name[5]}",
             num_epochs=1 if quick else None, eval_every=1 if quick else None)
-        eer, rank1, _ = U.point_eer_rank1(gal_feats, gal_labels, prb_feats, prb_labels)
-        print(f"    EER={eer:.3f}%  Rank1={rank1:.2f}%  ({(time.time()-t0)/60:.1f} min)")
+        eer, rank1, sim = U.point_eer_rank1(gal_feats, gal_labels, prb_feats, prb_labels)
+        ci_res = U.identity_bootstrap_ci(sim, gal_labels, prb_labels,
+                                          n_bootstrap=n_bootstrap, ci=ci, seed=seed)
+        print(f"    EER={eer:.3f}% [{ci_res['eer_ci_lo']:.3f}, {ci_res['eer_ci_hi']:.3f}]  "
+              f"Rank1={rank1:.2f}% [{ci_res['rank1_ci_lo']:.2f}, {ci_res['rank1_ci_hi']:.2f}]  "
+              f"({(time.time()-t0)/60:.1f} min)")
         rows.append({"mode": mode_name, "n_train_ids": len(train_ids),
                      "n_train_images": len(train_samples),
-                     "EER_pct": round(eer, 3), "Rank1_pct": round(rank1, 2)})
+                     "EER_pct": round(eer, 3),
+                     "EER_CI_lo": round(ci_res["eer_ci_lo"], 3),
+                     "EER_CI_hi": round(ci_res["eer_ci_hi"], 3),
+                     "Rank1_pct": round(rank1, 2),
+                     "Rank1_CI_lo": round(ci_res["rank1_ci_lo"], 2),
+                     "Rank1_CI_hi": round(ci_res["rank1_ci_hi"], 2)})
 
     df = pd.DataFrame(rows).set_index("mode")
     out_dir = C.BASE_RESULTS_DIR
     os.makedirs(out_dir, exist_ok=True)
     df.to_csv(os.path.join(out_dir, "imbalance_experiment1_training.csv"))
 
-    print(f"\n{'-'*70}\nEXPERIMENT 1 SUMMARY -- same test set, same #train-IDs (120), "
-          f"same head size (120-way)\n{'-'*70}")
+    print(f"\n{'-'*70}\nEXPERIMENT 1 SUMMARY -- same test set, same #train-IDs ({len(train_ids_a)}), "
+          f"same head size ({len(train_ids_a)}-way), bootstrap 95% CI "
+          f"(identity-level resampling, B={n_bootstrap})\n{'-'*70}")
     print(df.to_string())
     print(f"\nSaved: {out_dir}/imbalance_experiment1_training.csv")
     return df
@@ -231,7 +313,8 @@ def run_experiment1(n_test_ids=N_TEST_IDS, n_train_a=N_TRAIN_MODE_A,
 #  EXPERIMENT 2 -- imbalance effect on INFERENCE
 # ══════════════════════════════════════════════════════════════
 
-def run_experiment2(n_test_ids=N_TEST_IDS, seed=None, quick=False):
+def run_experiment2(n_test_ids=N_TEST_IDS, seed=None, n_bootstrap=N_BOOTSTRAP, ci=CI_LEVEL,
+                     quick=False):
     seed = C.SEED if seed is None else seed
     print(f"\n{'='*70}\nEXPERIMENT 2 -- imbalance effect on INFERENCE, CompNet\n{'='*70}")
 
@@ -293,18 +376,37 @@ def run_experiment2(n_test_ids=N_TEST_IDS, seed=None, quick=False):
     gal_feats_full, gal_labels_full = U.extract_embeddings(baseline.embed, gallery_loader, C.DEVICE)
     prb_feats, prb_labels = U.extract_embeddings(baseline.embed, probe_loader, C.DEVICE)
 
-    eer1, rank1_1, _ = U.point_eer_rank1(gal_feats_full, gal_labels_full, prb_feats, prb_labels)
-    eer2, rank1_2, _ = U.point_eer_rank1(gal_feats_full[keep_mask], gal_labels_full[keep_mask],
-                                          prb_feats, prb_labels)
+    eer1, rank1_1, sim1 = U.point_eer_rank1(gal_feats_full, gal_labels_full, prb_feats, prb_labels)
+    eer2, rank1_2, sim2 = U.point_eer_rank1(gal_feats_full[keep_mask], gal_labels_full[keep_mask],
+                                             prb_feats, prb_labels)
 
-    print(f"\n  Mode 1 (full gallery)              : EER={eer1:.3f}%  Rank1={rank1_1:.2f}%")
-    print(f"  Mode 2 (smartphone-only gallery)   : EER={eer2:.3f}%  Rank1={rank1_2:.2f}%")
+    ci1 = U.identity_bootstrap_ci(sim1, gal_labels_full, prb_labels,
+                                   n_bootstrap=n_bootstrap, ci=ci, seed=seed)
+    # Mode 2's CI is computed on its OWN (masked) gallery/sim -- its identity
+    # composition genuinely differs from Mode 1's (some identities may have
+    # zero gallery representation, see the [NOTE] above), so reusing Mode 1's
+    # CI here would be wrong, not just imprecise.
+    ci2 = U.identity_bootstrap_ci(sim2, gal_labels_full[keep_mask], prb_labels,
+                                   n_bootstrap=n_bootstrap, ci=ci, seed=seed)
+
+    print(f"\n  Mode 1 (full gallery)              : EER={eer1:.3f}% "
+          f"[{ci1['eer_ci_lo']:.3f}, {ci1['eer_ci_hi']:.3f}]  "
+          f"Rank1={rank1_1:.2f}% [{ci1['rank1_ci_lo']:.2f}, {ci1['rank1_ci_hi']:.2f}]")
+    print(f"  Mode 2 (smartphone-only gallery)   : EER={eer2:.3f}% "
+          f"[{ci2['eer_ci_lo']:.3f}, {ci2['eer_ci_hi']:.3f}]  "
+          f"Rank1={rank1_2:.2f}% [{ci2['rank1_ci_lo']:.2f}, {ci2['rank1_ci_hi']:.2f}]")
 
     df = pd.DataFrame([
         {"mode": "Mode 1 (full gallery, both domains)", "gallery_size": len(gallery_mode1),
-         "probe_size": len(probe_mode1), "EER_pct": round(eer1, 3), "Rank1_pct": round(rank1_1, 2)},
+         "probe_size": len(probe_mode1), "EER_pct": round(eer1, 3),
+         "EER_CI_lo": round(ci1["eer_ci_lo"], 3), "EER_CI_hi": round(ci1["eer_ci_hi"], 3),
+         "Rank1_pct": round(rank1_1, 2),
+         "Rank1_CI_lo": round(ci1["rank1_ci_lo"], 2), "Rank1_CI_hi": round(ci1["rank1_ci_hi"], 2)},
         {"mode": "Mode 2 (smartphone-only gallery)", "gallery_size": len(gallery_mode2),
-         "probe_size": len(probe_mode2), "EER_pct": round(eer2, 3), "Rank1_pct": round(rank1_2, 2)},
+         "probe_size": len(probe_mode2), "EER_pct": round(eer2, 3),
+         "EER_CI_lo": round(ci2["eer_ci_lo"], 3), "EER_CI_hi": round(ci2["eer_ci_hi"], 3),
+         "Rank1_pct": round(rank1_2, 2),
+         "Rank1_CI_lo": round(ci2["rank1_ci_lo"], 2), "Rank1_CI_hi": round(ci2["rank1_ci_hi"], 2)},
     ]).set_index("mode")
 
     out_dir = C.BASE_RESULTS_DIR
@@ -312,7 +414,7 @@ def run_experiment2(n_test_ids=N_TEST_IDS, seed=None, quick=False):
     df.to_csv(os.path.join(out_dir, "imbalance_experiment2_inference.csv"))
 
     print(f"\n{'-'*70}\nEXPERIMENT 2 SUMMARY -- ONE trained model, two gallery configurations, "
-          f"SAME probe\n{'-'*70}")
+          f"SAME probe, bootstrap 95% CI (identity-level resampling, B={n_bootstrap})\n{'-'*70}")
     print(df.to_string())
     print(f"\nSaved: {out_dir}/imbalance_experiment2_inference.csv")
     return df
@@ -330,6 +432,9 @@ def main():
     ap.add_argument("--n-train-a", type=int, default=N_TRAIN_MODE_A)
     ap.add_argument("--n-train-b-dual", type=int, default=N_TRAIN_MODE_B_DUAL)
     ap.add_argument("--n-train-b-sp", type=int, default=N_TRAIN_MODE_B_SP)
+    ap.add_argument("--n-bootstrap", type=int, default=N_BOOTSTRAP,
+                     help="identity-level bootstrap iterations for both experiments")
+    ap.add_argument("--ci", type=float, default=CI_LEVEL, help="confidence level")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--quick", action="store_true", help="smoke test: 1 epoch per run")
     args = ap.parse_args()
@@ -338,9 +443,11 @@ def main():
 
     if args.experiment in (None, 1):
         run_experiment1(args.n_test_ids, args.n_train_a, args.n_train_b_dual,
-                         args.n_train_b_sp, seed=args.seed, quick=args.quick)
+                         args.n_train_b_sp, seed=args.seed,
+                         n_bootstrap=args.n_bootstrap, ci=args.ci, quick=args.quick)
     if args.experiment in (None, 2):
-        run_experiment2(args.n_test_ids, seed=args.seed, quick=args.quick)
+        run_experiment2(args.n_test_ids, seed=args.seed,
+                         n_bootstrap=args.n_bootstrap, ci=args.ci, quick=args.quick)
 
 
 if __name__ == "__main__":
