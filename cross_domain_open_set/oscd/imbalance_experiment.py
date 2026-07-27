@@ -128,33 +128,26 @@ def build_test_split(test_ids, persp_all, scanner_paths, gallery_ratio, seed):
     return gallery, probe, label_map
 
 
-def _three_way_split(id2paths, label_map, gallery_frac, probe_frac, rng):
-    """Per-identity random 3-way split into (gallery, probe, discarded),
-    using gallery_frac/probe_frac of EACH identity's available images (not
-    a fixed count). Small-sample handling mirrors dataset.py's
-    _gallery_probe_split: an identity with only 1 image gets that same
-    image in both gallery and probe; identities with 2+ images always get
-    at least 1 in each, capped so gallery+probe never exceeds what's
-    available."""
-    gallery, probe = [], []
-    for ident, paths in id2paths.items():
-        paths = list(paths)
-        rng.shuffle(paths)
-        n = len(paths)
-        if n == 0:
-            continue
-        if n == 1:
-            gallery.append((paths[0], label_map[ident]))
-            probe.append((paths[0], label_map[ident]))
-            continue
-        n_gal = min(max(1, round(n * gallery_frac)), n - 1)
-        n_prb = min(max(1, round(n * probe_frac)), n - n_gal)
-        for p in paths[:n_gal]:
-            gallery.append((p, label_map[ident]))
-        for p in paths[n_gal:n_gal + n_prb]:
-            probe.append((p, label_map[ident]))
-        # remaining paths[n_gal + n_prb:] are deliberately discarded
-    return gallery, probe
+def _halve_per_identity(samples, frac, seed):
+    """Randomly keeps `frac` (e.g. 0.5) of EACH identity's own samples,
+    grouping first by label so every identity is subsampled
+    independently -- 'half samples of each ID', not a flat random
+    subsample of the whole list (which could, by chance, drop an
+    identity's entire gallery/probe representation if they only had a
+    few images to begin with). Every identity that had >=1 sample keeps
+    at least 1 (so 'all IDs' stays represented even at frac=0.5 with a
+    single-image identity)."""
+    rng = random.Random(seed)
+    by_label = defaultdict(list)
+    for p, l in samples:
+        by_label[l].append((p, l))
+    kept = []
+    for l, items in by_label.items():
+        items = items[:]
+        rng.shuffle(items)
+        n_keep = max(1, round(len(items) * frac))
+        kept.extend(items[:n_keep])
+    return kept
 
 
 def sample_test_ids(dual_ids, n_test_ids, seed):
@@ -345,6 +338,16 @@ def run_experiment1(n_test_ids=N_TEST_IDS, n_train_a=N_TRAIN_MODE_A,
 #  samples for gallery + 50% of the ORIGINAL full probe, with any
 #  gallery/probe overlap removed to avoid trivial self-match leakage)
 # ══════════════════════════════════════════════════════════════
+#  EXPERIMENT 2 -- imbalance effect on INFERENCE
+#  (fair version: build the ORIGINAL full 50/50 pooled-both-domain
+#  gallery/probe once; Mode 1's gallery and the SHARED probe (used by
+#  BOTH modes) are each an independent per-identity 50% subsample of
+#  that original gallery/probe; Mode 2's gallery is the smartphone-only
+#  subset of the original gallery, unchanged in size. Since Mode 1's
+#  gallery and the shared probe are both subsets of the original
+#  gallery/probe -- which are disjoint by construction -- there is no
+#  gallery/probe overlap to guard against here.)
+# ══════════════════════════════════════════════════════════════
 
 def run_experiment2(n_test_ids=N_TEST_IDS, seed=None, n_bootstrap=N_BOOTSTRAP, ci=CI_LEVEL,
                      quick=False):
@@ -356,6 +359,8 @@ def run_experiment2(n_test_ids=N_TEST_IDS, seed=None, n_bootstrap=N_BOOTSTRAP, c
     print(f"  test_ids: {len(test_ids)} (from dual_ids, SAME split as Experiment 1 "
           f"given the same seed)  remaining_dual: {len(remaining_dual)}")
 
+    # Train ONCE on "the rest of the data", as it actually exists -- no
+    # manipulation of domain composition here, unlike Experiment 1.
     train_ids = sorted(remaining_dual + smartphone_only_ids)
     label_map_train = {ident: i for i, ident in enumerate(train_ids)}
     train_samples = (
@@ -366,58 +371,42 @@ def run_experiment2(n_test_ids=N_TEST_IDS, seed=None, n_bootstrap=N_BOOTSTRAP, c
     print(f"  train: {len(train_ids)} IDs ({len(remaining_dual)} dual + "
           f"{len(smartphone_only_ids)} smartphone-only), {len(train_samples)} images")
 
-    # "Previous version": the original full 50/50 pooled-both-domain split.
-    # Kept only as the base pool Mode 2's probe is drawn from below -- not
-    # used directly as either mode's final gallery/probe anymore.
-    prev_gallery, prev_probe, test_label_map = build_test_split(
+    # Original full gallery/probe: standard 50/50 pooled-both-domain split
+    # -- the base BOTH modes are derived from below.
+    full_gallery, full_probe, test_label_map = build_test_split(
         test_ids, persp_all, scanner_paths, C.TEST_GALLERY_RATIO, seed)
-    print(f"  [previous version, reference only] gallery={len(prev_gallery)} "
-          f"probe={len(prev_probe)}")
+    print(f"  [full split, base for both modes] gallery={len(full_gallery)} "
+          f"probe={len(full_probe)}")
 
-    # Mode 1 (fair): 25% gallery + 25% probe of each test identity's FULL
-    # pool (both domains) -- half of each identity's total samples used
-    # overall, the other half discarded.
-    pooled = {ident: list(persp_all.get(ident, [])) + list(scanner_paths.get(ident, []))
-              for ident in test_ids}
-    rng1 = random.Random(seed + 100)
-    gallery_mode1, probe_mode1 = _three_way_split(pooled, test_label_map, 0.25, 0.25, rng1)
-    print(f"  Mode 1 (25% gallery + 25% probe, both domains): gallery={len(gallery_mode1)} "
-          f"probe={len(probe_mode1)}")
+    # SHARED probe: ONE per-identity 50% subsample of full_probe (all IDs
+    # kept), used as probe for BOTH Mode 1 and Mode 2 -- same samples, not
+    # just the same size -- so gallery composition is the only thing that
+    # differs between modes.
+    probe_shared = _halve_per_identity(full_probe, 0.5, seed + 300)
 
-    # Mode 2 (fair): gallery = ALL smartphone samples for every test identity
-    # (the realistic "everything available" smartphone-only enrollment --
-    # not just whatever fraction happened to land in a random split); probe
-    # = 50% random subsample of the PREVIOUS probe. Any of those probe
-    # candidates that are ALSO in Mode 2's gallery are removed first: an
-    # image appearing in both gallery and probe would let the model
-    # trivially self-match rather than genuinely recognize the identity.
-    gallery_mode2 = pooled_samples(test_ids, persp_all, scanner_paths, test_label_map,
-                                    domains=("smartphone",))
-    gallery_mode2_paths = {p for p, _ in gallery_mode2}
+    # Mode 1 gallery: independent per-identity 50% subsample of
+    # full_gallery (both domains, all IDs kept) -- sized to match Mode 2's
+    # gallery magnitude, since Mode 2's gallery is naturally about half of
+    # full_gallery's size (however much of it is smartphone-domain).
+    gallery_mode1 = _halve_per_identity(full_gallery, 0.5, seed + 100)
+    probe_mode1 = probe_shared
 
-    rng2 = random.Random(seed + 200)
-    prev_probe_shuffled = prev_probe[:]
-    rng2.shuffle(prev_probe_shuffled)
-    n_probe2 = max(1, round(len(prev_probe_shuffled) * 0.5))
-    probe_mode2_candidates = prev_probe_shuffled[:n_probe2]
-    leaked = [s for s in probe_mode2_candidates if s[0] in gallery_mode2_paths]
-    probe_mode2 = [s for s in probe_mode2_candidates if s[0] not in gallery_mode2_paths]
-    if leaked:
-        print(f"  [NOTE] Removed {len(leaked)} sample(s) from Mode 2's probe that were also "
-              f"present in Mode 2's all-smartphone gallery (would otherwise let the model "
-              f"trivially self-match instead of genuinely recognizing the identity).")
-    print(f"  Mode 2 (all-smartphone gallery, 50% of previous probe): "
-          f"gallery={len(gallery_mode2)} probe={len(probe_mode2)}")
+    # Mode 2 gallery: smartphone-only entries of the ORIGINAL full gallery
+    # (unchanged size/definition -- not further subsampled).
+    scanner_path_set = {p for paths in scanner_paths.values() for p in paths}
+    gallery_mode2 = [s for s in full_gallery if s[0] not in scanner_path_set]
+    probe_mode2 = probe_shared   # SAME samples as Mode 1's probe
+
+    print(f"  Mode 1 (50% of full gallery, both domains, all IDs): "
+          f"gallery={len(gallery_mode1)} probe={len(probe_mode1)}")
+    print(f"  Mode 2 (smartphone-only gallery, from full gallery): "
+          f"gallery={len(gallery_mode2)} probe={len(probe_mode2)}  (SAME probe as Mode 1)")
 
     print(f"\n  --- training (once) ---")
     t0 = time.time()
-    # Best-Rank-1 checkpoint tracked against Mode 1 (the smaller, "fair,
-    # matched" config) during training -- Mode 2's gallery is now large and
-    # not a subset of anything Mode 1 uses, so it can't double as the
-    # tracking target too.
     baseline, _, _ = M.train_baseline_model(
         METHOD, train_samples, gallery_mode1, probe_mode1, len(train_ids),
-        init_tag="exp2_shared_model_v2",
+        init_tag="exp2_shared_model_v3",
         num_epochs=1 if quick else None, eval_every=1 if quick else None)
     print(f"    done ({(time.time()-t0)/60:.1f} min)")
 
@@ -427,34 +416,34 @@ def run_experiment2(n_test_ids=N_TEST_IDS, seed=None, n_bootstrap=N_BOOTSTRAP, c
         loader = D.make_loader(samples, METHOD, False, cfg["batch_size"], C.NUM_WORKERS)
         return U.extract_embeddings(baseline.embed, loader, C.DEVICE)
 
+    # Probe is SHARED -- embed it once, reuse for both modes.
+    prb_feats, prb_labels = _embed(probe_shared)
     gal1_feats, gal1_labels = _embed(gallery_mode1)
-    prb1_feats, prb1_labels = _embed(probe_mode1)
     gal2_feats, gal2_labels = _embed(gallery_mode2)
-    prb2_feats, prb2_labels = _embed(probe_mode2)
 
-    eer1, rank1_1, sim1 = U.point_eer_rank1(gal1_feats, gal1_labels, prb1_feats, prb1_labels)
-    eer2, rank1_2, sim2 = U.point_eer_rank1(gal2_feats, gal2_labels, prb2_feats, prb2_labels)
+    eer1, rank1_1, sim1 = U.point_eer_rank1(gal1_feats, gal1_labels, prb_feats, prb_labels)
+    eer2, rank1_2, sim2 = U.point_eer_rank1(gal2_feats, gal2_labels, prb_feats, prb_labels)
 
-    ci1 = U.identity_bootstrap_ci(sim1, gal1_labels, prb1_labels,
+    ci1 = U.identity_bootstrap_ci(sim1, gal1_labels, prb_labels,
                                    n_bootstrap=n_bootstrap, ci=ci, seed=seed)
-    ci2 = U.identity_bootstrap_ci(sim2, gal2_labels, prb2_labels,
+    ci2 = U.identity_bootstrap_ci(sim2, gal2_labels, prb_labels,
                                    n_bootstrap=n_bootstrap, ci=ci, seed=seed)
 
-    print(f"\n  Mode 1 (25%/25% split)             : EER={eer1:.3f}% "
+    print(f"\n  Mode 1 (50% full gallery)          : EER={eer1:.3f}% "
           f"[{ci1['eer_ci_lo']:.3f}, {ci1['eer_ci_hi']:.3f}]  "
           f"Rank1={rank1_1:.2f}% [{ci1['rank1_ci_lo']:.2f}, {ci1['rank1_ci_hi']:.2f}]")
-    print(f"  Mode 2 (all-smartphone gallery)    : EER={eer2:.3f}% "
+    print(f"  Mode 2 (smartphone-only gallery)   : EER={eer2:.3f}% "
           f"[{ci2['eer_ci_lo']:.3f}, {ci2['eer_ci_hi']:.3f}]  "
           f"Rank1={rank1_2:.2f}% [{ci2['rank1_ci_lo']:.2f}, {ci2['rank1_ci_hi']:.2f}]")
 
     df = pd.DataFrame([
-        {"mode": "Mode 1 (25% gallery + 25% probe, both domains)",
+        {"mode": "Mode 1 (50% of full gallery, both domains)",
          "gallery_size": len(gallery_mode1), "probe_size": len(probe_mode1),
          "EER_pct": round(eer1, 3),
          "EER_CI_lo": round(ci1["eer_ci_lo"], 3), "EER_CI_hi": round(ci1["eer_ci_hi"], 3),
          "Rank1_pct": round(rank1_1, 2),
          "Rank1_CI_lo": round(ci1["rank1_ci_lo"], 2), "Rank1_CI_hi": round(ci1["rank1_ci_hi"], 2)},
-        {"mode": "Mode 2 (all-smartphone gallery, 50% of previous probe)",
+        {"mode": "Mode 2 (smartphone-only gallery)",
          "gallery_size": len(gallery_mode2), "probe_size": len(probe_mode2),
          "EER_pct": round(eer2, 3),
          "EER_CI_lo": round(ci2["eer_ci_lo"], 3), "EER_CI_hi": round(ci2["eer_ci_hi"], 3),
@@ -466,12 +455,12 @@ def run_experiment2(n_test_ids=N_TEST_IDS, seed=None, n_bootstrap=N_BOOTSTRAP, c
     os.makedirs(out_dir, exist_ok=True)
     df.to_csv(os.path.join(out_dir, "imbalance_experiment2_inference.csv"))
 
-    print(f"\n{'-'*70}\nEXPERIMENT 2 SUMMARY -- ONE trained model, two FAIR gallery/probe "
-          f"configurations, bootstrap 95% CI (identity-level resampling, B={n_bootstrap})\n{'-'*70}")
+    print(f"\n{'-'*70}\nEXPERIMENT 2 SUMMARY -- ONE trained model, two FAIR gallery "
+          f"configurations, SAME shared probe, bootstrap 95% CI "
+          f"(identity-level resampling, B={n_bootstrap})\n{'-'*70}")
     print(df.to_string())
     print(f"\nSaved: {out_dir}/imbalance_experiment2_inference.csv")
     return df
-
 
 
 def main():
