@@ -83,6 +83,18 @@ N_TRAIN_MODE_B_SP   = 30    # Experiment 1, Mode B: smartphone-only portion
 # ══════════════════════════════════════════════════════════════
 
 
+def point_eer_rank1(gal_feats, gal_labels, prb_feats, prb_labels):
+    """Same metric definition as utils.evaluate(), vectorised (no I/O)."""
+    gal_n = gal_feats / (np.linalg.norm(gal_feats, axis=1, keepdims=True) + 1e-8)
+    prb_n = prb_feats / (np.linalg.norm(prb_feats, axis=1, keepdims=True) + 1e-8)
+    sim = prb_n @ gal_n.T
+    rank1 = 100.0 * (gal_labels[sim.argmax(axis=1)] == prb_labels).mean()
+    same = (prb_labels[:, None] == gal_labels[None, :])
+    scores = sim.ravel()
+    labels = np.where(same, 1, -1).ravel()
+    eer, _ = U.compute_eer(np.column_stack([scores, labels]))
+    return eer * 100.0, rank1, sim
+
 def train_compnet_model(train_samples, gallery_samples, probe_samples, num_classes,
                          init_tag, num_epochs=None, eval_every=None):
     """Trains CompNet exactly as train_compnet() does below, but returns the
