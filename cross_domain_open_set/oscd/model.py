@@ -18,6 +18,8 @@ Architectures/losses are imported unchanged (module-level) from models/*.py
 unpacking) lives here, and it mirrors each original script's
 run_one_epoch / train_one_epoch exactly.
 """
+import os
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -557,3 +559,79 @@ REGISTRY = {
 if BaselineConvNeXt is not None:
     REGISTRY["convnext"] = BaselineConvNeXt
     REGISTRY["dino"] = BaselineDINO
+
+
+# ══════════════════════════════════════════════════════════════
+#  GENERIC TRAINING LOOP  (usable for ANY method in REGISTRY, not just
+#  CompNet -- shared by confidence_interval.py, imbalance_experiment.py,
+#  and any other ad-hoc experiment script that needs "train a baseline
+#  and get back its best-Rank-1 checkpoint")
+# ══════════════════════════════════════════════════════════════
+
+import config as C
+import dataset as D
+import utils as U
+
+
+def train_baseline_model(method_name, train_samples, gallery_samples, probe_samples,
+                          num_classes, init_tag, num_epochs=None, eval_every=None,
+                          device=None):
+    """Trains `method_name` (any key in REGISTRY) with its normal config.py
+    hyperparameters (only num_epochs/eval_every are overridable, e.g. for
+    --quick smoke testing), tracking the best-Rank-1 checkpoint via
+    periodic full evaluation. Returns the trained (best-Rank-1 checkpoint
+    loaded) `baseline` object itself -- not pre-extracted embeddings --
+    plus the gallery/probe loaders used for its internal eval, so callers
+    can extract embeddings for additional/different gallery-probe
+    configurations afterward without retraining."""
+    device = device or C.DEVICE
+    cfg = dict(C.METHODS[method_name])
+    num_epochs = num_epochs or cfg["num_epochs"]
+    eval_every = eval_every or C.EVAL_EVERY
+
+    train_loader = D.make_loader(train_samples, method_name, True, cfg["batch_size"], C.NUM_WORKERS)
+    gallery_loader = D.make_loader(gallery_samples, method_name, False, cfg["batch_size"], C.NUM_WORKERS)
+    probe_loader = D.make_loader(probe_samples, method_name, False, cfg["batch_size"], C.NUM_WORKERS)
+
+    baseline = REGISTRY[method_name](num_classes, cfg, device)
+    cache_dir = os.path.join(C.BASE_RESULTS_DIR, "init_weights_cache")
+    U.get_or_create_init_state(baseline, num_classes, f"{method_name}_{init_tag}", cache_dir)
+    optimizer, scheduler = baseline.build_optimizer()
+
+    best_rank1 = -1.0
+    best_state = None
+    for epoch in range(1, num_epochs + 1):
+        baseline.train_mode()
+        for batch in train_loader:
+            baseline.train_step(batch, optimizer)
+        scheduler.step()
+        if epoch % eval_every == 0 or epoch == num_epochs:
+            baseline.eval_mode()
+            eer, rank1 = U.evaluate(baseline.embed, gallery_loader, probe_loader, device)
+            if rank1 > best_rank1:
+                best_rank1 = rank1
+                # state_dict() aliases live parameter tensors -- optimizer.step()
+                # mutates them in place on later epochs, so without a deep copy
+                # this would silently end up holding the LAST epoch's weights
+                # instead of the best-Rank-1 epoch's.
+                best_state = copy.deepcopy(baseline.state_dict())
+
+    if best_state is not None:
+        baseline.load_state_dict(best_state)
+    baseline.eval_mode()
+    return baseline, gallery_loader, probe_loader
+
+
+def train_baseline(method_name, train_samples, gallery_samples, probe_samples,
+                    num_classes, init_tag, num_epochs=None, eval_every=None, device=None):
+    """Thin wrapper over train_baseline_model() returning embeddings
+    directly -- (gal_feats, gal_labels, prb_feats, prb_labels) from the
+    best-Rank-1 checkpoint -- for callers that only need one fixed
+    gallery/probe evaluation."""
+    device = device or C.DEVICE
+    baseline, gallery_loader, probe_loader = train_baseline_model(
+        method_name, train_samples, gallery_samples, probe_samples, num_classes,
+        init_tag, num_epochs=num_epochs, eval_every=eval_every, device=device)
+    gal_feats, gal_labels = U.extract_embeddings(baseline.embed, gallery_loader, device)
+    prb_feats, prb_labels = U.extract_embeddings(baseline.embed, probe_loader, device)
+    return gal_feats, gal_labels, prb_feats, prb_labels
