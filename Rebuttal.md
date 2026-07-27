@@ -34,17 +34,17 @@ The performance drop on the X-Palm dataset is due to significant domain shifts a
 *   Handwritten text directly occludes the biometric palm surface.
 *   Palm images of the Random domain are captured in uncontrolled conditions and may have two or more challenges (e.g., poor lighting, occlusion, and far distance) simultaneously, 
 
-We evaluate the distributional (domain) gap between capture conditions in X-Palm dataset and compare it to baseline datasets. For every image, we extract a deep embedding using a pretrained vision backbone. We report results using DINOv2 ViT-S/14 \cite{oquab2023} below; the full analysis was independently repeated using an ImageNet-supervised ResNet-50 \cite{he2016} as a cross-check, and the pattern of results was highly consistent across both backbones. For each dataset, we enumerate every pair of its own sub-domains (distinct acquisition sensors, illuminations, or environmental conditions) and compute five complementary distributional-shift metrics below between each pair, reporting the mean and standard deviation across all pairs. 
+We evaluate the distributional (domain) gap between capture conditions in X-Palm dataset and compare it to baseline datasets. For every image, we extract a deep embedding using a pretrained vision backbone. We report results using DINOv2 ViT-S/14 below; the full analysis was independently repeated using an ImageNet-supervised ResNet-50 [1] as a cross-check, and the pattern of results was highly consistent across both backbones. For each dataset, we enumerate every pair of its own sub-domains (distinct acquisition sensors, illuminations, or environmental conditions) and compute five complementary distributional-shift metrics below between each pair, reporting the mean and standard deviation across all pairs. 
 
-**Maximum Mean Discrepancy (MMD).** A kernel two-sample test statistic \cite{gretton2012} that measures the distance between the mean embeddings of two distributions in a reproducing kernel Hilbert space. We use an RBF kernel with a data-adaptive (median-heuristic) bandwidth and the unbiased estimator. MMD is non-negative, with 0 indicating no detectable distributional difference between the two sub-domains.
+**Maximum Mean Discrepancy (MMD).** A kernel two-sample test statistic [2] that measures the distance between the mean embeddings of two distributions in a reproducing kernel Hilbert space. We use an RBF kernel with a data-adaptive (median-heuristic) bandwidth and the unbiased estimator. MMD is non-negative, with 0 indicating no detectable distributional difference between the two sub-domains.
 
-**Proxy A-Distance (PAD).** PAD~\cite{bendavid2010} estimates domain divergence as $2(1-2\epsilon)$, where $\epsilon$ is the cross-validated generalization error of a linear classifier trained to distinguish samples drawn from the two sub-domains. PAD ranges from 0 (the two sub-domains are indistinguishable to the classifier) to 2 (perfectly separable).
+**Proxy A-Distance (PAD).** PAD [3] estimates domain divergence as $2(1-2\epsilon)$, where $\epsilon$ is the cross-validated generalization error of a linear classifier trained to distinguish samples drawn from the two sub-domains. PAD ranges from 0 (the two sub-domains are indistinguishable to the classifier) to 2 (perfectly separable).
 
-**Fréchet Feature Distance (FFD).** Fréchet Inception Distance~\cite{heusel2017} models each sub-domain's embeddings as a multivariate Gaussian. FFD is the closed-form Fréchet distance between the two Gaussians, combining a mean-shift term and a covariance-mismatch term into a single non-negative score.
+**Fréchet Feature Distance (FFD).** Fréchet Inception Distance [4] models each sub-domain's embeddings as a multivariate Gaussian. FFD is the closed-form Fréchet distance between the two Gaussians, combining a mean-shift term and a covariance-mismatch term into a single non-negative score.
 
-**Kernel Inception Distance (KID).** An MMD-based alternative to FFD~\cite{binkowski2018}, using a polynomial rather than an RBF kernel. FFD's Gaussian-covariance estimate requires substantially more samples per sub-domain than we have to be reliable, and is known to be biased upward at small sample sizes; KID's kernel-based estimator was designed specifically to avoid this bias.
+**Kernel Inception Distance (KID).** An MMD-based alternative to FFD [5], using a polynomial rather than an RBF kernel. FFD's Gaussian-covariance estimate requires substantially more samples per sub-domain than we have to be reliable, and is known to be biased upward at small sample sizes; KID's kernel-based estimator was designed specifically to avoid this bias.
 
-**Sliced Wasserstein Distance (SWD).** Approximates the Wasserstein distance between two distributions by averaging the closed-form 1-D Wasserstein distance over many random projections~\cite{rabin2011}. Unlike FFD, SWD makes no assumption that sub-domains are Gaussian-distributed. 
+**Sliced Wasserstein Distance (SWD).** Approximates the Wasserstein distance between two distributions by averaging the closed-form 1-D Wasserstein distance over many random projections [6]. Unlike FFD, SWD makes no assumption that sub-domains are Gaussian-distributed. 
 
 **Table 3: Within-dataset domain shift: mean $\pm$ standard deviation of each metric across all pairs of a dataset's own sub-domains (DINOv2 ViT-S/14 features).**
 
@@ -62,18 +62,19 @@ While XJTU-UP and CASIA-MS both score higher PAD than X-Palm.
 We appreciate your suggestion. As described in Section 3.1, we evaluated TSCAN (a Domain Adaptation method) and GIFT (a Domain Generalization method) specifically designed for the palmprint literature. Their cross-domain performances are reported in Tables 4 and 5, demonstrating that while they offer some resilience, the compound variability of X-Palm still causes significant performance degradation.
 We have used these baselines only in the closed-set cross-domain setting (not in the cross-dataset and open-set cross-domain settings) as these methods are originally presented and evaluated for closed-set scenarios.  We will include more DA and DG baselines in the appendix of the revised version.
 
+## 4. References
 
-[2] He, Kaiming, et al. "Deep residual learning for image recognition." Proceedings of the IEEE conference on computer vision and pattern recognition. 2016.‏
+[1] He, Kaiming, et al. "Deep residual learning for image recognition." Proceedings of the IEEE conference on computer vision and pattern recognition. 2016.‏
 
-[3] Gretton, Arthur, et al. "A kernel two-sample test." The journal of machine learning research 13.1 (2012): 723-773.‏
+[2] Gretton, Arthur, et al. "A kernel two-sample test." The journal of machine learning research 13.1 (2012): 723-773.‏
 
-[4] Ben-David, Shai, et al. "A theory of learning from different domains." Machine learning 79.1 (2010): 151-175.‏
+[3] Ben-David, Shai, et al. "A theory of learning from different domains." Machine learning 79.1 (2010): 151-175.‏
 
-[5] Heusel, Martin, et al. "Gans trained by a two time-scale update rule converge to a local nash equilibrium." Advances in neural information processing systems 30 (2017).‏
+[4] Heusel, Martin, et al. "Gans trained by a two time-scale update rule converge to a local nash equilibrium." Advances in neural information processing systems 30 (2017).‏
 
-[6] Bińkowski, Mikołaj, et al. "Demystifying mmd gans." arXiv preprint arXiv:1801.01401 (2018).‏
+[5] Bińkowski, Mikołaj, et al. "Demystifying mmd gans." arXiv preprint arXiv:1801.01401 (2018).‏
 
-[7] Rabin, Julien, et al. "Wasserstein barycenter and its application to texture mixing." International conference on scale space and variational methods in computer vision. Berlin, Heidelberg: Springer Berlin Heidelberg, 2011.‏
+[6] Rabin, Julien, et al. "Wasserstein barycenter and its application to texture mixing." International conference on scale space and variational methods in computer vision. Berlin, Heidelberg: Springer Berlin Heidelberg, 2011.‏
 
 
 
@@ -185,13 +186,13 @@ We appreciate this thoughtful comment that is really important in the assessment
 ### Image Quality Analysis
 To ensure the image quality comparison is fair despite the datasets' differing native sensor resolutions, every image is first resized to a fixed $112\times112$ evaluation size (the input resolution used by the recognition backbone in our experiments) before any metric is computed, so that reported differences reflect quality as seen by the recognizer. We employ the metrics below for image quality analysis:
 
-**Sharpness.** We use two complementary focus measures: the variance of the Laplacian \cite{pech2000}, which responds to the amount of high-frequency (edge) energy in an image, and the Tenengrad measure \cite{santos1997}, based on the squared gradient magnitude from a Sobel operator. Both decrease systematically as an image becomes blurrier.
+**Sharpness.** We use two complementary focus measures: the variance of the Laplacian [7], which responds to the amount of high-frequency (edge) energy in an image, and the Tenengrad measure [8], based on the squared gradient magnitude from a Sobel operator. Both decrease systematically as an image becomes blurrier.
 
-**Contrast and information content.** RMS contrast \cite{peli1990} is the standard deviation of pixel intensities, and Shannon entropy \cite{shannon1948} quantifies the information content of the intensity histogram; low-texture, low-detail images score lower on both.
+**Contrast and information content.** RMS contrast [9] is the standard deviation of pixel intensities, and Shannon entropy [10] quantifies the information content of the intensity histogram; low-texture, low-detail images score lower on both.
 
-**Noise proxy (Pseudo-PSNR).** Rather than requiring a pristine reference image, as in standard PSNR \cite{huynhthu2008}, we compare each image against its own Gaussian-blurred version; higher values indicate less high-frequency noise relative to the image's own low-frequency content.
+**Noise proxy (Pseudo-PSNR).** Rather than requiring a pristine reference image, as in standard PSNR [11], we compare each image against its own Gaussian-blurred version; higher values indicate less high-frequency noise relative to the image's own low-frequency content.
 
-**Gabor-based ridge energy.** Since one of typical palmprint recognition is based on Gabor-filter-based texture coding schemes such as PalmCode \cite{zhang2003}, we additionally compute the mean response magnitude of a multi-orientation Gabor filter bank applied to each image. 
+**Gabor-based ridge energy.** Since one of typical palmprint recognition is based on Gabor-filter-based texture coding schemes such as PalmCode [12], we additionally compute the mean response magnitude of a multi-orientation Gabor filter bank applied to each image. 
 
 **Table 3: Image quality metrics across datasets, computed at a fixed $112\times112$ evaluation resolution (mean $\pm$ standard deviation).**
 
@@ -233,3 +234,30 @@ In addition to the image-quality analysis, we assess the distributional (domain)
 X-Palm shows the largest mean pairwise MMD (0.373) and FFD (472.9), more than twice the next-highest dataset (XJTU-UP, 91.4). KID and SWD, included specifically to test whether FFD's small-sample bias or Gaussian assumption were driving this result, reproduce the identical ranking (KID: $379.8 > 119.5 > 23.6 > 4.6$; SWD: $1.77 > 1.19 > 0.85 > 0.28$, for X-Palm, CASIA-MS, XJTU-UP, and MPDv2 respectively). While XJTU-UP and CASIA-MS both score higher PAD than X-Palm.
  
 These results with results of image quality analysis and cross-dataset evaluation (Table 3 of the manuscript) elevate that the performance drop on X-Palm dataset is not attributable to lower image quality. X-Palm's scanner and smartphone subsets score higher than the other three datasets on most quality metrics and sub-domain distance measures. The performance drop on this dataset is because of the domain shifts incorporated by different real-world challenges and variations.
+
+
+## 5. References
+[1] He, Kaiming, et al. "Deep residual learning for image recognition." Proceedings of the IEEE conference on computer vision and pattern recognition. 2016.‏
+
+[2] Gretton, Arthur, et al. "A kernel two-sample test." The journal of machine learning research 13.1 (2012): 723-773.‏
+
+[3] Ben-David, Shai, et al. "A theory of learning from different domains." Machine learning 79.1 (2010): 151-175.‏
+
+[4] Heusel, Martin, et al. "Gans trained by a two time-scale update rule converge to a local nash equilibrium." Advances in neural information processing systems 30 (2017).‏
+
+[5] Bińkowski, Mikołaj, et al. "Demystifying mmd gans." arXiv preprint arXiv:1801.01401 (2018).‏
+
+[6] Rabin, Julien, et al. "Wasserstein barycenter and its application to texture mixing." International conference on scale space and variational methods in computer vision. Berlin, Heidelberg: Springer Berlin Heidelberg, 2011.‏
+
+[7] Pech-Pacheco, José Luis, et al. "Diatom autofocusing in brightfield microscopy: a comparative study." Proceedings 15th International Conference on Pattern Recognition. ICPR-2000. Vol. 3. IEEE, 2000.‏
+
+[8] Santos, Andrés, et al. "Evaluation of autofocus functions in molecular cytogenetic analysis." Journal of microscopy 188.3 (1997): 264-272.‏
+
+[9] Peli, Eli. "Contrast in complex images." Journal of the optical society of America A 7.10 (1990): 2032-2040.‏
+
+[10] Shannon, Claude Elwood. "A mathematical theory of communications." Bell system technical journal 27 (1948): 379-423.‏
+
+[11] Huynh-Thu, Quan, and Mohammed Ghanbari. "Scope of validity of PSNR in image/video quality assessment." Electronics letters 44.13 (2008): 800-801.‏
+
+[12] Zhang, David, et al. "Online palmprint identification." IEEE Transactions on pattern analysis and machine intelligence 25.9 (2003): 1041-1050.‏
+
