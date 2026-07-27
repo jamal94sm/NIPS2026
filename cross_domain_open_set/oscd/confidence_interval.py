@@ -40,11 +40,11 @@ Usage:
     python confidence_interval.py --phase 2          # phase 2 only
 """
 import os
+import copy
 import time
 import random
 import argparse
 from collections import defaultdict
-import copy 
 
 import numpy as np
 import pandas as pd
@@ -60,74 +60,34 @@ METHOD = "compnet"
 
 
 # ══════════════════════════════════════════════════════════════
-#  SHARED: train CompNet
+#  SHARED: train CompNet -- thin wrappers over model.py's generic,
+#  method-agnostic training loop (so this stays importable from ONE
+#  shared place -- model.py/utils.py -- rather than other scripts having
+#  to reach into this experiment script; see imbalance_experiment.py)
 # ══════════════════════════════════════════════════════════════
 
-def get_or_create_init_state(baseline, num_classes, tag):
-    cache_dir = os.path.join(C.BASE_RESULTS_DIR, "ci_init_weights")
-    os.makedirs(cache_dir, exist_ok=True)
-    path = os.path.join(cache_dir, f"{METHOD}_{tag}_nc{num_classes}.pth")
-    if os.path.exists(path):
-        baseline.load_state_dict(torch.load(path, map_location=C.DEVICE, weights_only=False))
-    else:
-        torch.save(baseline.state_dict(), path)
+def train_compnet_model(train_samples, gallery_samples, probe_samples, num_classes,
+                         init_tag, num_epochs=None, eval_every=None):
+    """CompNet-specific wrapper over model.train_baseline_model()."""
+    return M.train_baseline_model("compnet", train_samples, gallery_samples, probe_samples,
+                                   num_classes, init_tag, num_epochs=num_epochs,
+                                   eval_every=eval_every)
 
 
 def train_compnet(train_samples, gallery_samples, probe_samples, num_classes,
                    init_tag, num_epochs=None, eval_every=None):
-    """Trains a fresh CompNet with its normal config.py hyperparameters
-    (only num_epochs/eval_every are overridable, for --quick smoke testing).
-    Returns (gal_feats, gal_labels, prb_feats, prb_labels) from the
-    best-Rank-1 checkpoint."""
-    cfg = dict(C.METHODS[METHOD])
-    num_epochs = num_epochs or cfg["num_epochs"]
-    eval_every = eval_every or C.EVAL_EVERY
-
-    train_loader = D.make_loader(train_samples, METHOD, True, cfg["batch_size"], C.NUM_WORKERS)
-    gallery_loader = D.make_loader(gallery_samples, METHOD, False, cfg["batch_size"], C.NUM_WORKERS)
-    probe_loader = D.make_loader(probe_samples, METHOD, False, cfg["batch_size"], C.NUM_WORKERS)
-
-    baseline = M.REGISTRY[METHOD](num_classes, cfg, C.DEVICE)
-    get_or_create_init_state(baseline, num_classes, init_tag)     # same init across folds
-    optimizer, scheduler = baseline.build_optimizer()
-
-    best_rank1 = -1.0
-    best_state = None
-    for epoch in range(1, num_epochs + 1):
-        baseline.train_mode()
-        for batch in train_loader:
-            baseline.train_step(batch, optimizer)
-        scheduler.step()
-        if epoch % eval_every == 0 or epoch == num_epochs:
-            baseline.eval_mode()
-            eer, rank1 = U.evaluate(baseline.embed, gallery_loader, probe_loader, C.DEVICE)
-            if rank1 > best_rank1:
-                best_rank1 = rank1
-                # state_dict() aliases live parameter tensors -- optimizer.step()
-                # mutates them in place on later epochs, so without a deep copy
-                # this would silently end up holding the LAST epoch's weights
-                # instead of the best-Rank-1 epoch's.
-                best_state = copy.deepcopy(baseline.state_dict())
-
-    if best_state is not None:
-        baseline.load_state_dict(best_state)
-    baseline.eval_mode()
-    gal_feats, gal_labels = U.extract_embeddings(baseline.embed, gallery_loader, C.DEVICE)
-    prb_feats, prb_labels = U.extract_embeddings(baseline.embed, probe_loader, C.DEVICE)
-    return gal_feats, gal_labels, prb_feats, prb_labels
+    """CompNet-specific wrapper over model.train_baseline(). Returns
+    (gal_feats, gal_labels, prb_feats, prb_labels) from the best-Rank-1
+    checkpoint."""
+    return M.train_baseline("compnet", train_samples, gallery_samples, probe_samples,
+                             num_classes, init_tag, num_epochs=num_epochs,
+                             eval_every=eval_every)
 
 
-def point_eer_rank1(gal_feats, gal_labels, prb_feats, prb_labels):
-    """Same metric definition as utils.evaluate(), vectorised (no I/O)."""
-    gal_n = gal_feats / (np.linalg.norm(gal_feats, axis=1, keepdims=True) + 1e-8)
-    prb_n = prb_feats / (np.linalg.norm(prb_feats, axis=1, keepdims=True) + 1e-8)
-    sim = prb_n @ gal_n.T
-    rank1 = 100.0 * (gal_labels[sim.argmax(axis=1)] == prb_labels).mean()
-    same = (prb_labels[:, None] == gal_labels[None, :])
-    scores = sim.ravel()
-    labels = np.where(same, 1, -1).ravel()
-    eer, _ = U.compute_eer(np.column_stack([scores, labels]))
-    return eer * 100.0, rank1, sim
+# point_eer_rank1 now lives in utils.py (shared, method-agnostic) --
+# re-exported here so existing `from confidence_interval import
+# point_eer_rank1` call sites elsewhere keep working unchanged.
+point_eer_rank1 = U.point_eer_rank1
 
 
 def _eval_setting_or_skip(s, gallery_samples, probe_samples, num_classes):
