@@ -66,6 +66,7 @@ import pandas as pd
 import config as C
 import dataset as D
 from dataset import _gallery_probe_split
+import model as M
 import utils as U
 
 METHOD = "compnet"
@@ -80,74 +81,6 @@ N_TRAIN_MODE_B_SP   = 30    # Experiment 1, Mode B: smartphone-only portion
 # ══════════════════════════════════════════════════════════════
 #  SHARED HELPERS
 # ══════════════════════════════════════════════════════════════
-
-
-def point_eer_rank1(gal_feats, gal_labels, prb_feats, prb_labels):
-    """Same metric definition as utils.evaluate(), vectorised (no I/O)."""
-    gal_n = gal_feats / (np.linalg.norm(gal_feats, axis=1, keepdims=True) + 1e-8)
-    prb_n = prb_feats / (np.linalg.norm(prb_feats, axis=1, keepdims=True) + 1e-8)
-    sim = prb_n @ gal_n.T
-    rank1 = 100.0 * (gal_labels[sim.argmax(axis=1)] == prb_labels).mean()
-    same = (prb_labels[:, None] == gal_labels[None, :])
-    scores = sim.ravel()
-    labels = np.where(same, 1, -1).ravel()
-    eer, _ = U.compute_eer(np.column_stack([scores, labels]))
-    return eer * 100.0, rank1, sim
-
-def train_compnet_model(train_samples, gallery_samples, probe_samples, num_classes,
-                         init_tag, num_epochs=None, eval_every=None):
-    """Trains CompNet exactly as train_compnet() does below, but returns the
-    trained (best-Rank-1 checkpoint loaded) `baseline` object itself -- not
-    pre-extracted embeddings -- plus the gallery/probe loaders used for its
-    internal periodic checkpoint-selection eval. This lets callers extract
-    embeddings for additional/different gallery-probe configurations
-    afterward without retraining (see imbalance_experiment.py)."""
-    cfg = dict(C.METHODS[METHOD])
-    num_epochs = num_epochs or cfg["num_epochs"]
-    eval_every = eval_every or C.EVAL_EVERY
-
-    train_loader = D.make_loader(train_samples, METHOD, True, cfg["batch_size"], C.NUM_WORKERS)
-    gallery_loader = D.make_loader(gallery_samples, METHOD, False, cfg["batch_size"], C.NUM_WORKERS)
-    probe_loader = D.make_loader(probe_samples, METHOD, False, cfg["batch_size"], C.NUM_WORKERS)
-
-    baseline = M.REGISTRY[METHOD](num_classes, cfg, C.DEVICE)
-    get_or_create_init_state(baseline, num_classes, init_tag)     # same init across folds
-    optimizer, scheduler = baseline.build_optimizer()
-
-    best_rank1 = -1.0
-    best_state = None
-    for epoch in range(1, num_epochs + 1):
-        baseline.train_mode()
-        for batch in train_loader:
-            baseline.train_step(batch, optimizer)
-        scheduler.step()
-        if epoch % eval_every == 0 or epoch == num_epochs:
-            baseline.eval_mode()
-            eer, rank1 = U.evaluate(baseline.embed, gallery_loader, probe_loader, C.DEVICE)
-            if rank1 > best_rank1:
-                best_rank1 = rank1
-                best_state = copy.deepcopy(baseline.state_dict())
-
-    if best_state is not None:
-        baseline.load_state_dict(best_state)
-    baseline.eval_mode()
-    return baseline, gallery_loader, probe_loader
-
-
-def train_compnet(train_samples, gallery_samples, probe_samples, num_classes,
-                   init_tag, num_epochs=None, eval_every=None):
-    """Thin wrapper over train_compnet_model() preserving the original
-    return contract (embeddings, not the model) used by Phase 1 / Phase 2.
-    Returns (gal_feats, gal_labels, prb_feats, prb_labels) from the
-    best-Rank-1 checkpoint."""
-    baseline, gallery_loader, probe_loader = train_compnet_model(
-        train_samples, gallery_samples, probe_samples, num_classes,
-        init_tag, num_epochs=num_epochs, eval_every=eval_every)
-    baseline.eval_mode()
-    gal_feats, gal_labels = U.extract_embeddings(baseline.embed, gallery_loader, C.DEVICE)
-    prb_feats, prb_labels = U.extract_embeddings(baseline.embed, probe_loader, C.DEVICE)
-    return gal_feats, gal_labels, prb_feats, prb_labels
-
 
 def collect_pools():
     """Returns (persp_all, scanner_paths, dual_ids, smartphone_only_ids).
@@ -272,11 +205,11 @@ def run_experiment1(n_test_ids=N_TEST_IDS, n_train_a=N_TRAIN_MODE_A,
     ]:
         print(f"\n  --- {mode_name} ---")
         t0 = time.time()
-        gal_feats, gal_labels, prb_feats, prb_labels = train_compnet(
-            train_samples, gallery, probe, len(train_ids),
+        gal_feats, gal_labels, prb_feats, prb_labels = M.train_baseline(
+            METHOD, train_samples, gallery, probe, len(train_ids),
             init_tag=f"exp1_{mode_name[5]}",
             num_epochs=1 if quick else None, eval_every=1 if quick else None)
-        eer, rank1, _ = point_eer_rank1(gal_feats, gal_labels, prb_feats, prb_labels)
+        eer, rank1, _ = U.point_eer_rank1(gal_feats, gal_labels, prb_feats, prb_labels)
         print(f"    EER={eer:.3f}%  Rank1={rank1:.2f}%  ({(time.time()-t0)/60:.1f} min)")
         rows.append({"mode": mode_name, "n_train_ids": len(train_ids),
                      "n_train_images": len(train_samples),
@@ -346,8 +279,8 @@ def run_experiment2(n_test_ids=N_TEST_IDS, seed=None, quick=False):
 
     print(f"\n  --- training (once) ---")
     t0 = time.time()
-    baseline, _, _ = train_compnet_model(
-        train_samples, gallery_mode1, probe_mode1, len(train_ids),
+    baseline, _, _ = M.train_baseline_model(
+        METHOD, train_samples, gallery_mode1, probe_mode1, len(train_ids),
         init_tag="exp2_shared_model",
         num_epochs=1 if quick else None, eval_every=1 if quick else None)
     print(f"    done ({(time.time()-t0)/60:.1f} min)")
@@ -360,9 +293,9 @@ def run_experiment2(n_test_ids=N_TEST_IDS, seed=None, quick=False):
     gal_feats_full, gal_labels_full = U.extract_embeddings(baseline.embed, gallery_loader, C.DEVICE)
     prb_feats, prb_labels = U.extract_embeddings(baseline.embed, probe_loader, C.DEVICE)
 
-    eer1, rank1_1, _ = point_eer_rank1(gal_feats_full, gal_labels_full, prb_feats, prb_labels)
-    eer2, rank1_2, _ = point_eer_rank1(gal_feats_full[keep_mask], gal_labels_full[keep_mask],
-                                        prb_feats, prb_labels)
+    eer1, rank1_1, _ = U.point_eer_rank1(gal_feats_full, gal_labels_full, prb_feats, prb_labels)
+    eer2, rank1_2, _ = U.point_eer_rank1(gal_feats_full[keep_mask], gal_labels_full[keep_mask],
+                                          prb_feats, prb_labels)
 
     print(f"\n  Mode 1 (full gallery)              : EER={eer1:.3f}%  Rank1={rank1_1:.2f}%")
     print(f"  Mode 2 (smartphone-only gallery)   : EER={eer2:.3f}%  Rank1={rank1_2:.2f}%")
