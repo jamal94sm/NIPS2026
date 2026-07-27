@@ -66,7 +66,6 @@ import pandas as pd
 import config as C
 import dataset as D
 from dataset import _gallery_probe_split
-from confidence_interval import train_compnet, train_compnet_model, point_eer_rank1
 import utils as U
 
 METHOD = "compnet"
