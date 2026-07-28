@@ -1,3 +1,29 @@
+## Response to AC
+
+We thank the AC for the constructive meta-review and for highlighting the three priority areas. Below we summarize how each was addressed across our responses to the three reviewers.
+
+### 1. Exact Details of the Released Dataset
+
+- **Reviewer #2 (Point 1 – Dataset Limitations):** We provided a direct scale comparison table against CASIA-MS, XJTU-UP, and MPD-v2 (hands, images, devices, age range, paired scanner–smartphone availability), and explained the IRB-approved constraints (fixed scanner location, private indoor collection sites) that shaped recruitment and demographic composition. We reported concrete diversity figures (40.78% female, 11 self-reported ethnic groups) and explicitly limited our fairness/generalization claims accordingly.
+- **Reviewer #2 (Point 2 – Ethical/Privacy Documentation):** We detailed the access-control mechanism: encrypted institutional storage, mandatory EULA prohibiting re-identification or commercial use, and time-limited secure download links.
+- **Reviewer #2 (Point 5 – What Users Receive):** We itemized the full release package — raw images, extracted RoIs, keypoint coordinates, anonymized metadata (age group, ethnicity group, gender, device model), official data splits, and supporting files (`LICENSE_EULA.md`, `CITATION.cff`, Croissant metadata, manifests) — contrasting this with prior datasets that release only raw images or only RoIs.
+- **Reviewer #3 (Point 1):** Reused and cross-referenced the fuller dataset-detail answer given to Reviewer #2 due to space constraints, avoiding duplication while ensuring the same information is accessible.
+
+### 2. Statistical Robustness of Results
+
+- **Reviewer #1 / #3 (Imbalance Effects):** We introduced two controlled experiments with identity-level bootstrap 95% CIs ($B=1000$): a training-time imbalance test (Mode A vs. Mode B) and an inference-time gallery-composition test (Mode 1 vs. Mode 2), showing that Rank-1 accuracy is far more sensitive to acquisition imbalance than EER, with non-overlapping CIs supporting the effect's significance.
+- **Reviewer #1 / #3 (Domain Shift Quantification):** We reported five complementary distributional-shift metrics (MMD, PAD, FFD, KID, SWD) as mean ± std across all sub-domain pairs per dataset, cross-checked with two different embedding backbones (DINOv2, ResNet-50) to confirm the ranking is not an artifact of a single feature space or metric's small-sample bias.
+- **Reviewer #2 (Point 3 – Test Set Size Effects):** This was the most direct treatment of statistical robustness: we compared 3-fold vs. 5-fold cross-validation and ratio=0.5 vs. ratio=0.8 bootstrap CIs across all 12 test domains, showing consistent widening of variance/CI as the held-out identity set shrinks. We committed to releasing the exact fold/split files as an official benchmark protocol so future comparisons use identical identity assignments rather than ad hoc splits.
+
+### 3. Annotation Quality
+
+- **Reviewer #2 (Point 4) / Reviewer #3 (Point 3 – RoI Extraction Pipeline):** We described the custom annotation tool with live-preview quality control, the keypoint-based RoI definition process, and the exclusion criteria for low-quality images (blur, occlusion). We reported a repeatability check (10 images re-annotated over 10 iterations by the sole annotator) showing high spatial consistency, and noted that RoI extraction was performed manually specifically to eliminate automated-extraction error as a confound in benchmarking.
+
+
+
+
+
+
 ### reviewer #1
 
 
