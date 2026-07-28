@@ -112,7 +112,7 @@ Below, we address each concern point-by-point and describe the manuscript change
 
 We appreciate the reviewer's advice and thank them for raising these points. We acknowledge the limitations of the current version of the X-Palm dataset, including its scale and imbalanced acquisition.
 
-Scaling up participant recruitment further is challenging due to the time-consuming curation process and privacy considerations. We note that most existing datasets, such as CASIA-MS and XJTU-UP, are of comparable scale. Additionally, our scanner was installed locally and could not be relocated, which geographically constrained participant recruitment and led to imbalanced acquisition across domains. Within these constraints, we made deliberate efforts to recruit a diverse group of participants, and the resulting demographic distribution broadly reflects that of the local community. However, because participant demographics remain imbalanced, we chose not to define or split domains based on race, gender, or other demographic attributes.
+Scaling up participant recruitment further is challenging due to the time-consuming curation process and privacy considerations. We note that most existing datasets, such as CASIA-MS and XJTU-UP, are of comparable scale. Additionally, our scanner was installed locally and could not be relocated, which geographically constrained participant recruitment and led to imbalanced acquisition devices (smartphone vs scanner) and races. Within these constraints, we made deliberate efforts to recruit a diverse group of participants, and the resulting demographic distribution broadly reflects that of the local community. However, because participant demographics remain imbalanced, we chose not to define or split domains based on race, gender, or other demographic attributes.
 
 Regarding privacy risks and gated-access reproducibility, we have stored the anonymized dataset in our secured institutional repository to protect participant privacy. Reproducibility is nonetheless ensured: our experiments are fully reproducible using the open-source code we provide, and access to X-Palm and the other datasets can be requested through the standard access procedure. 
 
@@ -165,7 +165,7 @@ Quality control details will be provided in Appendix A.5. We use a custom-built 
 
 To evaluate the annotation consistency of the only annotator (the author) over time, we repeated the annotation of 10 palm images for 10 iterations. The extracted RoIs demonstrated high spatial consistency over iterations.  
 
-We manually performed RoI-extraction to provide reliable data for benchmarking, eliminating the effect of ROI extraction errors. We also enrich the X-Palm dataset with paired raw images and ground-truth extracted ROIs that can be used for development of the automatic ROI extraction pipelines. Notably, X-Palm dataset is the first dataset that provides paired raw palm images and ground-truth RoIs along with other useful metadata.  
+We manually performed RoI extraction to provide reliable data for benchmarking, eliminating the effect of ROI extraction errors. We also enrich the X-Palm dataset with paired raw images and ground-truth extracted ROIs that can be used for development of the automatic ROI extraction pipelines. Notably, X-Palm dataset is the first dataset that provides paired raw palm images and ground-truth RoIs along with other useful metadata.  
 
 >**5: What users receive?**
 
@@ -184,19 +184,21 @@ Unlike previous palmprint datasets that provide only raw palm images (e.g., CASI
 
 
 
-############################ reviewer #3
+### reviewer #3
 
 We sincerely thank the reviewer for the detailed and thoughtful feedback. Below, we respond to each identified concern with clarification, justification, and planned improvements to strengthen the final version.
 
 >**1. Dataset Limitation**
 
-We thank the reviewer for recognizing the novelty of our paired design. We fully acknowledge the scale limitation in Section 4, and need to mention the distribution skewness towards younger adults and Chinese participants. We outline our plans to extend the dataset in future rounds of the data collection to scale the dataset and achieve greater demographic diversity in future releases.
+We thank the reviewer for recognizing the novelty of our paired design. We acknowledge the limitations of the current version of the X-Palm dataset, including its scale and imbalanced acquisition.
+
+Scaling up participant recruitment further is challenging due to the time-consuming curation process and privacy considerations. We note that most existing datasets, such as CASIA-MS and XJTU-UP, are of comparable scale. Additionally, our scanner was installed locally and could not be relocated, which geographically constrained participant recruitment and led to imbalanced acquisition across devices (smartphone vs scanner) and ethnic groups. Within these constraints, we made deliberate efforts to recruit a diverse group of participants, and the resulting demographic distribution broadly reflects that of the local community. However, because participant demographics remain imbalanced, we chose not to define or split domains based on race, gender, or other demographic attributes.
 
 >**2. Imbalance Effect on Training and Evaluation**
 
 To assess the effect of the scanner/smartphone acquisition imbalance in our dataset, we conducted two controlled experiments. 
 
-**Training-time imbalance** (Table 1) compares two training populations of identical size evaluated on the same held-out test set: Mode A trains exclusively on dual-domain identities, while Mode B replaces a third of them with smartphone-only identities, mirroring the dataset's natural imbalance. Although the imbalanced training set in Mode B has resulted in lower EER compared to Model A, **the Rank-1 accuracy has increased.**  
+**Training-time imbalance** (Table 1) compares two training populations of identical size evaluated on the same held-out test set: Mode A trains exclusively on dual-domain identities, while Mode B replaces a third of them with smartphone-only identities, mirroring the dataset's natural imbalance. Although the imbalanced training set in Mode B has resulted in lower EER compared to Model A, the Rank-1 accuracy has increased.  
 
 **Inference-time imbalance** (Table 2) instead fixes the trained model and probe set, varying only gallery composition: a mixed-domain gallery (Mode 1) versus a smartphone-only gallery (Mode 2) of comparable size. Although EER values remain close for these modes with highly overlapping CIs, Rank-1 collapses by 19 points with entirely disjoint confidence intervals (Mode 1: [65.52, 80.25] vs. Mode 2: [47.00, 61.44]). A smartphone-only enrollment policy substantially degrades top-1 identification accuracy even though genuine/impostor score separability, as measured by EER, is largely unaffected.
 
@@ -220,10 +222,10 @@ However, to provide more reliable analysis about the effect of acquisition imbal
 
 >**3. RoI Extraction Pipeline**
 
-Quality control details will be provided in Appendix A.5. We use a custom-built annotation tool (Figure 5) where an operator (the author) marks five specific anatomical keypoints that unambiguously determine the palm RoI. All annotations are performed by the first author, and the tool provides a live visual preview of the extracted square ROI, allowing immediate quality control. Low quality images (e.g., blurry and full palm occlusion) are discarded to guarantee the overall quality if the dataset. 
+Quality control details will be provided in Appendix A.5. We use a custom-built annotation tool (Figure 5) where an operator (the author) marks five specific anatomical key points that unambiguously determine the palm RoI. All annotations are performed by the first author, and the tool provides a live visual preview of the extracted square ROI, allowing immediate quality control. Low-quality images (e.g., blurry and full palm occlusion) are discarded to guarantee the overall quality if the dataset. 
 To evaluate the annotation consistency of the only annotator (the author) over time, we repeated the annotation of 10 palm images for 10 iterations. The extracted RoIs demonstrated high spatial consistency over iterations.  
 
-We manually performed RoI-extraction to provide reliable data for benchmarking, eliminating the effect of ROI extraction errors. We also enrich the X-Palm dataset with paired raw images and ground-truth extracted ROIs that can be used for development of the automatic ROI extraction pipelines. Notably, X-Palm dataset is the first dataset that provides paired raw palm images and ground-truth RoIs along with other useful metadata.  
+We manually performed RoI extraction to provide reliable data for benchmarking, eliminating the effect of ROI extraction errors. We also enrich the X-Palm dataset with paired raw images and ground-truth extracted ROIs that can be used for development of the automatic ROI extraction pipelines. Notably, X-Palm dataset is the first dataset that provides paired raw palm images and ground-truth RoIs along with other useful metadata.  
 
 >**4. Low Quality Images or Significant Domain Shifts?**
 
