@@ -81,8 +81,8 @@ We have used these baselines only in the closed-set cross-domain setting (not in
 
 
 
-#################################### reviewer #2 
-
+### reviewer #2 
+We thank the reviewer for taking the time to write such a detailed review and for analyzing the paper in-depth. 
 
 ## 1. Dataset Limitations
 We appreciate your advice. Although, we explicitly state that the primary limitation of the current version of X-Palm is its restricted scale, we need to update Section 4 to explicitly list dataset scale, demographic imbalance, hardware imbalance, and biometric privacy risks.
