@@ -69,7 +69,7 @@ from dataset import _gallery_probe_split
 import model as M
 import utils as U
 
-METHOD = "compnet"
+METHOD = "dino"
 
 # ── Default identity-count targets (all adjustable via CLI) ─────────
 N_TEST_IDS          = 40    # held out from dual_ids, shared by both experiments
