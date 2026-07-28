@@ -19,7 +19,7 @@ $$
 $$
 
 
-
+**Table 2: Computational complexity comparison of baselines using various metrics**
 | Model | Params | GFLOPs | Low-end Latency (ms/img) | Low-end Speed (img/s) | Flagship Latency (ms/img) | Flagship Speed (img/s) | Train (ms/batch) | Inference (ms/100) |
 |---|---|---|---|---|---|---|---|---|
 | CompNet | 3.27M | 0.735 | 14.70 | 68.0 | 1.47 | 680.3 | 324.45 | 331.91 |
@@ -63,7 +63,7 @@ We evaluate the distributional (domain) gap between capture conditions in X-Palm
 
 **Sliced Wasserstein Distance (SWD).** Approximates the Wasserstein distance between two distributions by averaging the closed-form 1-D Wasserstein distance over many random projections [6]. Unlike FFD, SWD makes no assumption that sub-domains are Gaussian-distributed. 
 
-**Table 3: Within-dataset domain shift: mean $\pm$ standard deviation of each metric across all pairs of a dataset's own sub-domains (DINOv2 ViT-S/14 features).**
+**Table 2: Within-dataset domain shift: mean $\pm$ standard deviation of each metric across all pairs of a dataset's own sub-domains (DINOv2 ViT-S/14 features).**
 
 | **Dataset** | **# Sub-Dom.** | **Pairs** | **MMD ($\uparrow$)** | **PAD ($\uparrow$)** | **FFD ($\uparrow$)** | **KID ($\uparrow$)** | **SWD ($\uparrow$)** |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -77,11 +77,12 @@ While XJTU-UP and CASIA-MS both score higher PAD than X-Palm.
 
 >**3: Distribution Analysis between Source and Target Domains**
 
-In the previous section, we analyzed domain shifts of the X-palm's sub-domains and compared to baseline datasets. We also further analyze the distribution characteristics between the source and target domain using quantitative feature-space distribution analysis (e.g., t-SNE visualizations) in the revised version.
+In the previous section, we analyzed domain shifts among the X-palm's sub-domains and compared to baseline datasets. We also further analyze the distribution characteristics between the source and target domain using quantitative feature-space distribution analysis (e.g., t-SNE visualizations) and include the results in the revised version.
 
 >**4: Domain Generalization and Domain Adaptation Methods**
 
-We appreciate your suggestion. As described in Section 3.1, we evaluated TSCAN (a Domain Adaptation method) and GIFT (a Domain Generalization method) specifically designed for the palmprint literature. Their cross-domain performances are reported in Tables 4 and 5, demonstrating that while they offer some resilience, the compound variability of X-Palm still causes significant performance degradation.
+We appreciate your suggestion. Our contribution is not developing a new method to decrease the domain gap between source and target domains, but novel benchmarking and domain-shift analysis frameworks, evaluating existing methods under these settings. We hope these findings will inspire future work on methods designed for this challenge.
+As described in Section 3.1, we evaluated TSCAN (a Domain Adaptation method) and GIFT (a Domain Generalization method) specifically designed for the palmprint literature. Their cross-domain performances are reported in Tables 4 and 5 of the manuscript, demonstrating that while they offer some resilience, the compound variability of X-Palm still causes significant performance degradation.
 We have used these baselines only in the closed-set cross-domain setting (not in the cross-dataset and open-set cross-domain settings) as these methods are originally presented and evaluated for closed-set scenarios.  We will include more DA and DG baselines in the appendix of the revised version.
 
 >**5: References**
