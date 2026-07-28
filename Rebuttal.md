@@ -160,7 +160,8 @@ We thank the reviewer for this invaluable comment. We employ Cross-Validation (C
 | Roll & Pitch | 30.61 [21.20, 40.32] | 21.05 [15.79, 34.74] | 23.68 [12.49, 38.50] | 39.47 [26.32, 63.16] |
 
 >**4: ROI Extraction Pipeline**
-Quality control details will be provided in Appendix A.5. We use a custom-built annotation tool (Figure 5) where an operator (the author) marks five specific anatomical keypoints that unambiguously determine the palm RoI. All annotations are performed by the first author, and the tool provides a live visual preview of the extracted square ROI, allowing immediate quality control. Low-quality images (e.g., blurry and full palm occlusion) are discarded to guarantee the overall quality if the dataset. 
+
+Quality control details will be provided in Appendix A.5. We use a custom-built annotation tool (Figure 5) where an operator (the author) marks anatomical keypoints that unambiguously determine the palm RoI. All annotations are performed by the first author, and the tool provides a live visual preview of the extracted square ROI, allowing immediate quality control. Low-quality images (e.g., blurry and full palm occlusion) are discarded to guarantee the overall quality if the dataset. 
 
 To evaluate the annotation consistency of the only annotator (the author) over time, we repeated the annotation of 10 palm images for 10 iterations. The extracted RoIs demonstrated high spatial consistency over iterations.  
 
@@ -169,6 +170,17 @@ We manually performed RoI-extraction to provide reliable data for benchmarking, 
 >**5: What users receive?**
 
 Unlike previous palmprint datasets that provide only raw palm images (e.g., CASIA-MS, MPD-v2) or only extracted RoIs (e.g., XJTU-UP), we provide the raw palm images, extracted ROIs, the keypoint coordinates, and anonymized metadata including age group, ethnicity group, gender, and smartphone model used for image capturing, and the official split files used for experiments (to enable reproducibility), upon request under the strict EULA to prevent misuse.
+
+## Package Contents
+
+- `LICENSE_EULA.md`: non-commercial research EULA for approved users.
+- `CITATION.cff`: machine-readable citation metadata.
+- `xpalm_croissant.json`: machine-readable Croissant metadata for ML dataset discovery and responsible AI documentation.
+- `data_split.json`: official splits of the datasets in all experiments for reproducibility. 
+- `metadata/file_manifest.csv`: file-level metadata for all released images.
+- `metadata/participant_metadata.csv`: anonymous subject-level coverage metadata.
+- `metadata/data_dictionary.csv`: descriptions of metadata fields.
+- `data/`: restricted-access image data, organized by modality (scanner/smartphone) and processing stage (raw images / extracted RoIs), and also key point coordinates for RoI extraction.
 
 
 
