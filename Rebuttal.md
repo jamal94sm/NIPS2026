@@ -106,14 +106,20 @@ We have used these baselines only in the closed-set cross-domain setting (not in
 
 ### reviewer #2 
 We thank the reviewer for taking the time to write such a detailed review and for analyzing the paper in-depth. 
+Below, we address each concern point-by-point and describe the manuscript changes we will make in the camera-ready version.
 
 >**1: Dataset Limitations**
 
-We appreciate your advice. Although, we explicitly state that the primary limitation of the current version of X-Palm is its restricted scale, we need to update Section 4 to explicitly list dataset scale, demographic imbalance, hardware imbalance, and biometric privacy risks.
+We appreciate the reviewer's advice and thank them for raising these points. We acknowledge the limitations of the current version of the X-Palm dataset, including its scale and imbalanced acquisition.
 
->**2: Ethical/Privacy Documentation**
+Scaling up participant recruitment further is challenging due to the time-consuming curation process and privacy considerations. We note that most existing datasets, such as CASIA-MS and XJTU-UP, are of comparable scale. Additionally, our scanner was installed locally and could not be relocated, which geographically constrained participant recruitment and led to imbalanced acquisition across domains. Within these constraints, we made deliberate efforts to recruit a diverse group of participants, and the resulting demographic distribution broadly reflects that of the local community. However, because participant demographics remain imbalanced, we chose not to define or split domains based on race, gender, or other demographic attributes.
 
-To safeguard participant privacy and mitigate re-identification risk, the raw data is stored on a access-controlled and encrypted in our institutional repository. Access is strictly gated: prospective researchers must digitally sign an End User License Agreement (EULA) that explicitly prohibits any re-identification attempts or commercial exploitation before receiving a secure, time-limited download link.
+Regarding privacy risks and gated-access reproducibility, we have stored the anonymized dataset in our secured institutional repository to protect participant privacy. Reproducibility is nonetheless ensured: our experiments are fully reproducible using the open-source code we provide, and access to X-Palm and the other datasets can be requested through the standard access procedure. 
+
+
+>**2: Ethical/Privacy Documentations needs to be more directly verifiable**
+
+To safeguard participant privacy and mitigate re-identification risk, the raw data is stored on an access-controlled and encrypted in our institutional repository. Access is strictly gated: prospective researchers must digitally sign an End User License Agreement (EULA) that explicitly prohibits any re-identification attempts or commercial exploitation before receiving a secure, time-limited download link.
 
 >**3: Effect of test set size on performance confidence in open-set cross-domain setting**
 
@@ -154,7 +160,7 @@ We thank the reviewer for this invaluable comment. We employ Cross-Validation (C
 | Roll & Pitch | 30.61 [21.20, 40.32] | 21.05 [15.79, 34.74] | 23.68 [12.49, 38.50] | 39.47 [26.32, 63.16] |
 
 >**4: ROI Extraction Pipeline**
-Quality control details will be provided in Appendix A.5. We use a custom-built annotation tool (Figure 5) where an operator (the author) marks five specific anatomical keypoints that unambiguously determine the palm RoI. All annotations are performed by the first author, and the tool provides a live visual preview of the extracted square ROI, allowing immediate quality control. Low quality images (e.g., blurry and full palm occlusion) are discarded to guarantee the overall quality if the dataset. 
+Quality control details will be provided in Appendix A.5. We use a custom-built annotation tool (Figure 5) where an operator (the author) marks five specific anatomical keypoints that unambiguously determine the palm RoI. All annotations are performed by the first author, and the tool provides a live visual preview of the extracted square ROI, allowing immediate quality control. Low-quality images (e.g., blurry and full palm occlusion) are discarded to guarantee the overall quality if the dataset. 
 
 To evaluate the annotation consistency of the only annotator (the author) over time, we repeated the annotation of 10 palm images for 10 iterations. The extracted RoIs demonstrated high spatial consistency over iterations.  
 
