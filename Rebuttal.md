@@ -10,7 +10,7 @@ We appreciate this suggestion. We actually have included computational complexit
 
 In the table below, we extend the Table 2 (Computational Complexity) by including the required time for training (per 32-sample batch) and inference (per 100 samples) for all baselines. 
 
-| Model | Params | GFLOPs | Low-end Latency (ms/img) | Low-end Speed (img/s) | Flagship Latency (ms/img) | Flagship Speed (img/s) | Train (ms/batch) | Inferrence (ms/100) |
+| Model | Params | GFLOPs | Low-end Latency (ms/img) | Low-end Speed (img/s) | Flagship Latency (ms/img) | Flagship Speed (img/s) | Train (ms/batch) | Inference (ms/100) |
 |---|---|---|---|---|---|---|---|---|
 | CompNet | 3.27M | 0.735 | 14.70 | 68.0 | 1.47 | 680.3 | 324.45 | 331.91 |
 | PPNet | 3.53M | 0.735 | 14.70 | 68.0 | 1.47 | 680.3 | 321.61 | 358.69 |
