@@ -171,8 +171,7 @@ We manually performed RoI-extraction to provide reliable data for benchmarking, 
 
 Unlike previous palmprint datasets that provide only raw palm images (e.g., CASIA-MS, MPD-v2) or only extracted RoIs (e.g., XJTU-UP), we provide the raw palm images, extracted ROIs, the keypoint coordinates, and anonymized metadata including age group, ethnicity group, gender, and smartphone model used for image capturing, and the official split files used for experiments (to enable reproducibility), upon request under the strict EULA to prevent misuse.
 
-## Package Contents
-
+**Package Contents:**
 - `LICENSE_EULA.md`: non-commercial research EULA for approved users.
 - `CITATION.cff`: machine-readable citation metadata.
 - `xpalm_croissant.json`: machine-readable Croissant metadata for ML dataset discovery and responsible AI documentation.
