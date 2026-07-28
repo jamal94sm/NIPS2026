@@ -25,7 +25,7 @@ In the table below, we have extended the Table 2 (Computational Complexity) by i
 | ArcFace-iResNet100 | 65.12M | 12.098 | 789.49 | 4602.49 |
 | MagFace-iResNet100 | 65.16M | 12.117 | 893.15 | 4800.20 |
 
-## 2. Including more experimental analysis on performance drop reasons
+>**2: Including more experimental analysis on performance drop reasons**
 We thank the reviewer for this suggestion. We analyze the specific causes of performance degradation in Section 3.3. However, we need to include a comprehensive analysis in the appendix to provide more details. We also further analyze the distribution characteristics between the source and target domain using quantitative feature-space distribution analysis (e.g., t-SNE visualizations) in the revised version. 
 
 The performance drop on the X-Palm dataset is due to significant domain shifts among sub-domains of this dataset. Specifically:
@@ -59,11 +59,11 @@ We evaluate the distributional (domain) gap between capture conditions in X-Palm
 X-Palm shows the largest mean pairwise MMD (0.373) and FFD (472.9), more than twice the next-highest dataset (XJTU-UP, 91.4). KID and SWD, included specifically to test whether FFD's small-sample bias or Gaussian assumption were driving this result, reproduce the identical ranking (KID: $379.8 > 119.5 > 23.6 > 4.6$; SWD: $1.77 > 1.19 > 0.85 > 0.28$, for X-Palm, CASIA-MS, XJTU-UP, and MPDv2 respectively).
 While XJTU-UP and CASIA-MS both score higher PAD than X-Palm.
 
-## 3. Domain Generalization and Domain Adaptation Methods
+>**3: Domain Generalization and Domain Adaptation Methods**
 We appreciate your suggestion. As described in Section 3.1, we evaluated TSCAN (a Domain Adaptation method) and GIFT (a Domain Generalization method) specifically designed for the palmprint literature. Their cross-domain performances are reported in Tables 4 and 5, demonstrating that while they offer some resilience, the compound variability of X-Palm still causes significant performance degradation.
 We have used these baselines only in the closed-set cross-domain setting (not in the cross-dataset and open-set cross-domain settings) as these methods are originally presented and evaluated for closed-set scenarios.  We will include more DA and DG baselines in the appendix of the revised version.
 
-## 4. References
+>**4: References**
 
 [1] He, Kaiming, et al. "Deep residual learning for image recognition." Proceedings of the IEEE conference on computer vision and pattern recognition. 2016.‏
 
@@ -85,13 +85,13 @@ We have used these baselines only in the closed-set cross-domain setting (not in
 ### reviewer #2 
 We thank the reviewer for taking the time to write such a detailed review and for analyzing the paper in-depth. 
 
-## 1. Dataset Limitations
+>**1: Dataset Limitations**
 We appreciate your advice. Although, we explicitly state that the primary limitation of the current version of X-Palm is its restricted scale, we need to update Section 4 to explicitly list dataset scale, demographic imbalance, hardware imbalance, and biometric privacy risks.
 
-## 2. Ethical/Privacy Documentation
+>**2: Ethical/Privacy Documentation**
 To safeguard participant privacy and mitigate re-identification risk, the raw data is stored on a access-controlled and encrypted in our institutional repository. Access is strictly gated: prospective researchers must digitally sign an End User License Agreement (EULA) that explicitly prohibits any re-identification attempts or commercial exploitation before receiving a secure, time-limited download link.
 
-## 3. Effect of test set size on performance confidence in open-set cross-domain setting
+>**3: Effect of test set size on performance confidence in open-set cross-domain setting**
 We thank the reviewer for this invaluable comment. We employ Cross-Validation (CV) and Confidence-Interval (CI) for this evaluation. Both CV and CI results show the same underlying pattern when the effective train/test ratio shrinks the test partition: comparing 3-fold (test $\approx 33\%$ per fold) to 5-fold (test $= 20\%$ per fold), the standard deviation increases for both EER and Rank-1 across the 12 test domains; correspondingly, comparing the ratio=0.5 bootstrap to ratio=0.8, the mean 95% CI half-width widens for both EER and Rank-1. This consistent direction across two independent evaluation protocols confirms that uncertainty scales with the size of the held-out identity set. We will include both CV and CI results in the revised manuscript and release the exact fold partitions as a fixed, official identity split, so that future work can make comparisons under identical train/test identity assignments rather than ad hoc re-splits. We include the same analysis for all baselines, also for the cross-dataset and closed-set cross-domain setting in the appendix section of the revised version.
 
 **Table 1: CompNet performance stability under 3-fold vs. 5-fold identity-disjoint cross-validation, all 12 test domains.**
@@ -128,14 +128,14 @@ We thank the reviewer for this invaluable comment. We employ Cross-Validation (C
 | FO & SF | 9.47 [ 5.35, 15.56] | 70.53 [65.26, 83.16] | 9.53 [ 2.22, 20.52] | 84.21 [73.68, 97.37] |
 | Roll & Pitch | 30.61 [21.20, 40.32] | 21.05 [15.79, 34.74] | 23.68 [12.49, 38.50] | 39.47 [26.32, 63.16] |
 
-## 4. ROI Extraction Pipeline
+>**4: ROI Extraction Pipeline**
 Quality control details will be provided in Appendix A.5. We use a custom-built annotation tool (Figure 5) where an operator (the author) marks five specific anatomical keypoints that unambiguously determine the palm RoI. All annotations are performed by the first author, and the tool provides a live visual preview of the extracted square ROI, allowing immediate quality control. Low quality images (e.g., blurry and full palm occlusion) are discarded to guarantee the overall quality if the dataset. 
 
 To evaluate the annotation consistency of the only annotator (the author) over time, we repeated the annotation of 10 palm images for 10 iterations. The extracted RoIs demonstrated high spatial consistency over iterations.  
 
 We manually performed RoI-extraction to provide reliable data for benchmarking, eliminating the effect of ROI extraction errors. We also enrich the X-Palm dataset with paired raw images and ground-truth extracted ROIs that can be used for development of the automatic ROI extraction pipelines. Notably, X-Palm dataset is the first dataset that provides paired raw palm images and ground-truth RoIs along with other useful metadata.  
 
-## 5. What users receive?
+>**5: What users receive?**
 Unlike previous palmprint datasets that provide only raw palm images (e.g., CASIA-MS, MPD-v2) or only extracted RoIs (e.g., XJTU-UP), we provide the raw palm images, extracted ROIs, the keypoint coordinates, and anonymized metadata including age group, ethnicity group, gender, and smartphone model used for image capturing, and the official split files used for experiments (to enable reproducibility), upon request under the strict EULA to prevent misuse.
 
 
@@ -143,19 +143,19 @@ Unlike previous palmprint datasets that provide only raw palm images (e.g., CASI
 
 ############################ reviewer #3
 
-We thank the reviewer for the detailed feedback. Below we respond to each concern.
+We sincerely thank the reviewer for the detailed and thoughtful feedback. Below, we respond to each identified concern with clarification, justification, and planned improvements to strengthen the final version.
 
-## 1. Dataset Limitation
-We acknowledge the scale limitation and the skew toward younger adults and Chinese participants noted in Section 4. Future data collection rounds will target greater demographic diversity.
+>**1. Dataset Limitation**
+We thank the reviewer for recognizing the novelty of our paired design. We fully acknowledge the scale limitation in Section 4, and need to mention the distribution skewness towards younger adults and Chinese participants. We outline our plans to extend the dataset in future rounds of the data collection to scale the dataset and achieve greater demographic diversity in future releases.
 
-## 2. Imbalance Effect on Training and Evaluation
-We ran two controlled experiments to isolate the effect of scanner/smartphone acquisition imbalance.
+>**2. Imbalance Effect on Training and Evaluation**
+To assess the effect of the scanner/smartphone acquisition imbalance in our dataset, we conducted two controlled experiments. 
 
-**Training-time imbalance** (Table 1): two equal-size training sets evaluated on the same test set — Mode A (all dual-domain) vs. Mode B (a third replaced with smartphone-only identities, matching the dataset's natural imbalance). Mode B has slightly higher EER but higher Rank-1 than Mode A.
+**Training-time imbalance** (Table 1) compares two training populations of identical size evaluated on the same held-out test set: Mode A trains exclusively on dual-domain identities, while Mode B replaces a third of them with smartphone-only identities, mirroring the dataset's natural imbalance. Although the imbalanced training set in Mode B has resulted in lower EER compared to Model A, **the Rank-1 accuracy has increased.**  
 
-**Inference-time imbalance** (Table 2): same trained model and probe set, only gallery composition varies — Mode 1 (mixed-domain gallery) vs. Mode 2 (smartphone-only gallery). EER is similar with overlapping CIs, but Rank-1 drops 19 points with fully disjoint CIs (Mode 1: [65.52, 80.25] vs. Mode 2: [47.00, 61.44]). So a smartphone-only gallery hurts top-1 identification substantially even though EER (score separability) is largely unaffected.
+**Inference-time imbalance** (Table 2) instead fixes the trained model and probe set, varying only gallery composition: a mixed-domain gallery (Mode 1) versus a smartphone-only gallery (Mode 2) of comparable size. Although EER values remain close for these modes with highly overlapping CIs, Rank-1 collapses by 19 points with entirely disjoint confidence intervals (Mode 1: [65.52, 80.25] vs. Mode 2: [47.00, 61.44]). A smartphone-only enrollment policy substantially degrades top-1 identification accuracy even though genuine/impostor score separability, as measured by EER, is largely unaffected.
 
-We will add further experiments with additional baselines and imbalance ratios in the appendix.
+However, to provide more reliable analysis about the effect of acquisition imbalance, we need to conduct more experiments with different baselines and various imbalance degree. We include the detailed analysis in the appendix of the revised version. 
 
 **Table 1: Effect of scanner/smartphone domain imbalance on training. 95% CI from identity-level bootstrap resampling ($B=1000$).**
 
@@ -164,6 +164,7 @@ We will add further experiments with additional baselines and imbalance ratios i
 | Mode A (balanced: all dual-domain) | 28.50 [25.41, 31.30] | 79.19 [76.42, 86.77] |
 | Mode B (imbalanced: dual + smartphone-only) | 29.50 [26.03, 32.74] | 81.71 [79.19, 88.67] |
 
+
 **Table 2: Effect of scanner/smartphone domain imbalance on inference. 95% CI from identity-level bootstrap resampling ($B=1000$).**
 
 | **Mode** | **EER (%)** | **Rank-1 (%)** |
@@ -171,19 +172,26 @@ We will add further experiments with additional baselines and imbalance ratios i
 | Mode 1 (mixed-domain gallery) | 28.79 [25.93, 31.68] | 69.62 [65.52, 80.25] |
 | Mode 2 (smartphone-only gallery) | 28.60 [25.13, 32.18] | 50.63 [47.00, 61.44] |
 
-## 3. RoI Extraction Pipeline
-Quality-control details will appear in Appendix A.5. Annotation uses a custom tool (Figure 5) where the first author marks five anatomical keypoints defining the palm RoI, with a live preview enabling immediate QC; low-quality images (blurry, occluded) are discarded. A repeatability check — re-annotating 10 images over 10 iterations — showed high spatial consistency. RoIs were extracted manually to provide error-free benchmarking data. X-Palm additionally provides paired raw images and ground-truth RoIs plus metadata, which we believe makes it the first such dataset to do so, supporting future automatic RoI-extraction research.
 
-## 4. Low Quality Images or Significant Domain Shifts?
-We thank the reviewer for this important question and address it with two analyses: image quality and domain shift, across CASIA-MS, MPDv2, XJTU-UP, and both X-Palm subsets (scanner, smartphone).
+>**3. RoI Extraction Pipeline**
+Quality control details will be provided in Appendix A.5. We use a custom-built annotation tool (Figure 5) where an operator (the author) marks five specific anatomical keypoints that unambiguously determine the palm RoI. All annotations are performed by the first author, and the tool provides a live visual preview of the extracted square ROI, allowing immediate quality control. Low quality images (e.g., blurry and full palm occlusion) are discarded to guarantee the overall quality if the dataset. 
+To evaluate the annotation consistency of the only annotator (the author) over time, we repeated the annotation of 10 palm images for 10 iterations. The extracted RoIs demonstrated high spatial consistency over iterations.  
+
+We manually performed RoI-extraction to provide reliable data for benchmarking, eliminating the effect of ROI extraction errors. We also enrich the X-Palm dataset with paired raw images and ground-truth extracted ROIs that can be used for development of the automatic ROI extraction pipelines. Notably, X-Palm dataset is the first dataset that provides paired raw palm images and ground-truth RoIs along with other useful metadata.  
+
+>**4. Low Quality Images or Significant Domain Shifts?**
+We appreciate this thoughtful comment that is really important in the assessment process of such datasets. To address the question of whether the reported cross-domain performance differences on X-Palm are attributable to lower image quality rather than a genuine domain gap, we conduct two experiments for image quality analysis and domain shift analysis. We quantify image quality and domain gaps across all four benchmark datasets, CASIA-MS, MPDv2, XJTU-UP, and both subsets of X-Palm (scanner and smartphone). 
 
 ### Image Quality Analysis
-All images are resized to $112\times112$ (the recognizer's input size) before computing metrics, so comparisons reflect quality as the recognizer sees it. Metrics used:
+To ensure the image quality comparison is fair despite the datasets' differing native sensor resolutions, every image is first resized to a fixed $112\times112$ evaluation size (the input resolution used by the recognition backbone in our experiments) before any metric is computed, so that reported differences reflect quality as seen by the recognizer. We employ the metrics below for image quality analysis:
 
-- **Sharpness**: Laplacian variance [7] and Tenengrad [8] (Sobel-gradient-based), both lower for blurrier images.
-- **Contrast/information**: RMS contrast [9] (intensity std. dev.) and Shannon entropy [10] (histogram information content); both lower for low-detail images.
-- **Noise proxy (Pseudo-PSNR)**: compares each image to its own Gaussian-blurred version rather than requiring a pristine reference as in standard PSNR [11]; higher means less relative high-frequency noise.
-- **Gabor-based ridge energy**: mean response of a multi-orientation Gabor filter bank, relevant since palmprint recognition often relies on Gabor-based texture coding (e.g., PalmCode [12]).
+**Sharpness.** We use two complementary focus measures: the variance of the Laplacian [7], which responds to the amount of high-frequency (edge) energy in an image, and the Tenengrad measure [8], based on the squared gradient magnitude from a Sobel operator. Both decrease systematically as an image becomes blurrier.
+
+**Contrast and information content.** RMS contrast [9] is the standard deviation of pixel intensities, and Shannon entropy [10] quantifies the information content of the intensity histogram; low-texture, low-detail images score lower on both.
+
+**Noise proxy (Pseudo-PSNR).** Rather than requiring a pristine reference image, as in standard PSNR [11], we compare each image against its own Gaussian-blurred version; higher values indicate less high-frequency noise relative to the image's own low-frequency content.
+
+**Gabor-based ridge energy.** Since one of typical palmprint recognition is based on Gabor-filter-based texture coding schemes such as PalmCode [12], we additionally compute the mean response magnitude of a multi-orientation Gabor filter bank applied to each image. 
 
 **Table 3: Image quality metrics across datasets, computed at a fixed $112\times112$ evaluation resolution (mean $\pm$ standard deviation).**
 
@@ -196,18 +204,22 @@ All images are resized to $112\times112$ (the recognizer's input size) before co
 | Pseudo-PSNR ($\uparrow$) | $44.59 \pm 3.19$ | $42.26 \pm 2.16$ | $49.81 \pm 2.36$ | $47.37 \pm 4.28$ | $39.75 \pm 3.52$ |
 | Ridge Energy ($\uparrow$) | $2.66 \pm 0.29$ | $1.87 \pm 0.25$ | $1.36 \pm 0.22$ | $1.89 \pm 0.61$ | $2.30 \pm 0.35$ |
 
-**Scanner vs. CASIA-MS:** Scanner subset scores higher on most metrics (Laplacian 18.93 vs. 7.71; Tenengrad 572.80 vs. 182.28; RMS contrast 11.00 vs. 9.18; entropy 5.16 vs. 5.09; ridge energy 1.89 vs. 1.36); CASIA-MS only wins on Pseudo-PSNR (49.81 vs. 47.37). So the scanner subset is not lower quality than CASIA-MS — it's sharper and richer in ridge texture.
+**X-Palm (Scanner) vs. CASIA-MS:** The scanner subset scores higher than CASIA-MS on most of metrics, including sharpness/texture measure: Laplacian variance ($18.93$ vs. $7.71$), Tenengrad ($572.80$ vs. $182.28$), RMS contrast ($11.00$ vs. $9.18$), entropy ($5.16$ vs. $5.09$), and Gabor ridge energy ($1.89$ vs. $1.36$). CASIA-MS scores better on Pseudo-PSNR ($49.81$ vs. $47.37$). Taken together, the descriptive evidence does not support the scanner subset being lower quality than CASIA-MS; it is sharper and richer in ridge texture.
 
-**Smartphone vs. XJTU-UP/MPDv2:** Smartphone subset scores higher on Laplacian variance, Tenengrad, RMS contrast, entropy (both comparisons), and ridge energy vs. MPDv2. Against XJTU-UP, ridge energy is lower (2.30 vs. 2.66), meaning XJTU-UP retains clearer palm-line structure despite lower generic sharpness/contrast scores. Overall, the smartphone subset is not lower quality by conventional standards.
+**X-Palm (Smartphone) vs. XJTU-UP and MPDv2:** The smartphone subset scores higher than both XJTU-UP and MPDv2 on Laplacian variance, Tenengrad, RMS contrast, entropy, and higher than MPDv2 on Gabor ridge energy as well. Against XJTU-UP specifically, Gabor ridge energy is lower for the smartphone subset ($2.30$ vs. $2.66$), meaning that despite scoring higher on every generic sharpness/contrast, XJTU-UP retains clearer palm-line structure in the feature space the recognizer actually uses. In aggregate, the smartphone subset is not lower quality than XJTU-UP or MPDv2 by conventional image quality standards.
 
-### Domain Shift Analysis
-As a complementary explanation, we measure distributional gaps between capture conditions using deep embeddings (DINOv2 ViT-S/14 \cite{oquab2023} below; results were highly consistent when repeated with ImageNet-supervised ResNet-50 \cite{he2016}). For each dataset, we compute distributional-shift metrics between every pair of its own sub-domains (sensors/illumination/conditions), reporting mean ± std across pairs:
-
-- **MMD** \cite{gretton2012}: kernel two-sample test distance between mean embeddings (RBF kernel, median-heuristic bandwidth); 0 = no detectable difference.
-- **PAD** \cite{bendavid2010}: $2(1-2\epsilon)$ where $\epsilon$ is a linear classifier's error distinguishing the two sub-domains; ranges 0 (indistinguishable) to 2 (perfectly separable).
-- **FFD** \cite{heusel2017}: Fréchet distance between Gaussian fits of each sub-domain's embeddings (mean-shift + covariance-mismatch terms).
-- **KID** \cite{binkowski2018}: MMD-based alternative to FFD using a polynomial kernel; avoids FFD's upward bias at small sample sizes.
-- **SWD** \cite{rabin2011}: averages closed-form 1-D Wasserstein distance over many random projections; unlike FFD, assumes no Gaussianity.
+### Domain Shift Analysis 
+In addition to the image-quality analysis, we assess the distributional (domain) gap between capture conditions as a complementary explanation. For every image, we extract a deep embedding using a pretrained vision backbone. We report results using DINOv2 ViT-S/14 below; the full analysis was independently repeated using an ImageNet-supervised ResNet-50 [1] as a cross-check, and the pattern of results was highly consistent across both backbones. For each dataset, we enumerate every pair of its own sub-domains (distinct acquisition sensors, illuminations, or environmental conditions) and compute five distributional-shift metrics below between each pair, reporting the mean and standard deviation across all pairs. 
+ 
+**Maximum Mean Discrepancy (MMD).** A kernel two-sample test statistic [2] that measures the distance between the mean embeddings of two distributions in a reproducing kernel Hilbert space. We use an RBF kernel with a data-adaptive (median-heuristic) bandwidth and the unbiased estimator. MMD is non-negative, with 0 indicating no detectable distributional difference between the two sub-domains.
+ 
+**Proxy A-Distance (PAD).** PAD [3] estimates domain divergence as $2(1-2\epsilon)$, where $\epsilon$ is the cross-validated generalization error of a linear classifier trained to distinguish samples drawn from the two sub-domains. PAD ranges from 0 (the two sub-domains are indistinguishable to the classifier) to 2 (perfectly separable).
+ 
+**Fréchet Feature Distance (FFD).** Fréchet Inception Distance [4] models each sub-domain's embeddings as a multivariate Gaussian. FFD is the closed-form Fréchet distance between the two Gaussians, combining a mean-shift term and a covariance-mismatch term into a single non-negative score.
+ 
+**Kernel Inception Distance (KID).** An MMD-based alternative to FFD [5], using a polynomial rather than an RBF kernel. FFD's Gaussian-covariance estimate requires substantially more samples per sub-domain than we have to be reliable, and is known to be biased upward at small sample sizes; KID's kernel-based estimator was designed specifically to avoid this bias.
+ 
+**Sliced Wasserstein Distance (SWD).** Approximates the Wasserstein distance between two distributions by averaging the closed-form 1-D Wasserstein distance over many random projections [6]. Unlike FFD, SWD makes no assumption that sub-domains are Gaussian-distributed. 
 
 **Table 4: Within-dataset domain shift: mean $\pm$ standard deviation of each metric across all pairs of a dataset's own sub-domains (DINOv2 ViT-S/14 features).**
 
@@ -218,9 +230,9 @@ As a complementary explanation, we measure distributional gaps between capture c
 | X-Palm   | 17 | 136 | $0.373 \pm 0.268$ | $1.796 \pm 0.299$ | $472.9 \pm 380.9$ | $379.8 \pm 371.1$ | $1.765 \pm 0.956$ |
 | XJTU-UP  | 4  | 6   | $0.151 \pm 0.053$ | $1.958 \pm 0.055$ | $91.4 \pm 31.6$   | $23.6 \pm 8.5$    | $0.847 \pm 0.164$ |
 
-X-Palm has the largest mean pairwise MMD (0.373) and FFD (472.9), over twice the next-highest (XJTU-UP: 91.4). KID and SWD — included to check whether FFD's small-sample bias or Gaussian assumption drove this — reproduce the same ranking (KID: 379.8 > 119.5 > 23.6 > 4.6; SWD: 1.77 > 1.19 > 0.85 > 0.28, for X-Palm, CASIA-MS, XJTU-UP, MPDv2 respectively), though XJTU-UP and CASIA-MS both score higher on PAD than X-Palm.
-
-**Conclusion:** Together with the image quality results and cross-dataset evaluation (Table 3), these results show X-Palm's performance drop is not attributable to lower image quality — its scanner and smartphone subsets score higher than the other datasets on most quality and sub-domain-distance metrics. The drop instead reflects genuine domain shift from real-world acquisition variation.
+X-Palm shows the largest mean pairwise MMD (0.373) and FFD (472.9), more than twice the next-highest dataset (XJTU-UP, 91.4). KID and SWD, included specifically to test whether FFD's small-sample bias or Gaussian assumption were driving this result, reproduce the identical ranking (KID: $379.8 > 119.5 > 23.6 > 4.6$; SWD: $1.77 > 1.19 > 0.85 > 0.28$, for X-Palm, CASIA-MS, XJTU-UP, and MPDv2 respectively). While XJTU-UP and CASIA-MS both score higher PAD than X-Palm.
+ 
+Together with results of image quality analysis and cross-dataset evaluation (Table 3 of the manuscript), these results show that the performance drop on X-Palm dataset is not attributable to lower image quality. X-Palm's scanner and smartphone subsets score higher than the other three datasets on most quality metrics and sub-domain distance measures. The performance drop on this dataset is because of the domain shifts incorporated by different real-world challenges and variations.
 
 ## 5. References
 [1] He, Kaiming, et al. "Deep residual learning for image recognition." CVPR. 2016.
