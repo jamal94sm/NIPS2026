@@ -61,6 +61,7 @@ X-Palm shows the largest mean pairwise MMD (0.373) and FFD (472.9), more than tw
 While XJTU-UP and CASIA-MS both score higher PAD than X-Palm.
 
 >**3: Distribution Analysis between Source and Target Domains**
+
 In the previous section, we analyzed domain shifts of the X-palm's sub-domains and compared to baseline datasets. We also further analyze the distribution characteristics between the source and target domain using quantitative feature-space distribution analysis (e.g., t-SNE visualizations) in the revised version.
 
 >**4: Domain Generalization and Domain Adaptation Methods**
