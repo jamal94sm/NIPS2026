@@ -42,7 +42,7 @@ We will conduct an additional benchmark on two physical Android smartphones repr
 
 >**2: Including more experimental analysis on performance drop reasons**
 
-We thank the reviewer for this suggestion. We analyze the specific causes of performance degradation in Section 3.3. However, we will include a comprehensive analysis in the appendix to provide more details. 
+We thank the reviewer for this suggestion. We analyze the specific causes of performance degradation in Section 3.3. We will include a comprehensive analysis in the appendix to provide more details. 
 
 The performance drop on the X-Palm dataset is due to significant domain shifts among sub-domains of this dataset. Specifically:
 *   Cross-setting domain shift between scanner and smartphone settings significantly degrades the performance as the palm images are capture in totally different conditions (sensor, lighting, etc). 
