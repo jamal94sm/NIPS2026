@@ -4,7 +4,7 @@
 We thank the reviewer for taking the time to write such a detailed review and for analyzing the paper in-depth. 
 Below, we address each concern point-by-point and describe the manuscript changes we will make in the camera-ready version.
 
->**1: Including more metrics
+>**1: Including more metrics**
 
 We appreciate this suggestion. We actually have included computational complexity metrics in the manuscript. Table 2 details both the Parameter count and the inference cost (in GFLOPs) for an input resolution of $112 \times 112$ across all 12 evaluated baseline models. 
 
