@@ -69,8 +69,8 @@ We evaluate the distributional (domain) gap between capture conditions in X-Palm
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | CASIA-MS | 6  | 15  | $0.181 \pm 0.081$ | $1.841 \pm 0.204$ | $210.4 \pm 117.7$ | $119.5 \pm 105.9$ | $1.188 \pm 0.377$ |
 | MPDv2    | 2  | 1   | $0.010 \pm 0.000$ | $1.201 \pm 0.000$ | $14.2 \pm 0.0$    | $4.6 \pm 0.0$     | $0.284 \pm 0.000$ |
-| X-Palm   | 17 | 136 | $0.373 \pm 0.268$ | $1.796 \pm 0.299$ | $472.9 \pm 380.9$ | $379.8 \pm 371.1$ | $1.765 \pm 0.956$ |
-| XJTU-UP  | 4  | 6   | $0.151 \pm 0.053$ | $1.958 \pm 0.055$ | $91.4 \pm 31.6$   | $23.6 \pm 8.5$    | $0.847 \pm 0.164$ |
+| X-Palm   | 17 | 136 | $\mathbf{0.373 \pm 0.268}$ | $1.796 \pm 0.299$ | $\mathbf{472.9 \pm 380.9}$ | $\mathbf{379.8 \pm 371.1}$ | $\mathbf{1.765 \pm 0.956}$ |
+| XJTU-UP  | 4  | 6   | $0.151 \pm 0.053$ | $\mathbf{1.958 \pm 0.055}$ | $91.4 \pm 31.6$   | $23.6 \pm 8.5$    | $0.847 \pm 0.164$ |
 
 X-Palm shows the largest mean pairwise MMD (0.373) and FFD (472.9), more than twice the next-highest dataset (XJTU-UP, 91.4). KID and SWD, included specifically to test whether FFD's small-sample bias or Gaussian assumption were driving this result, reproduce the identical ranking (KID: $379.8 > 119.5 > 23.6 > 4.6$; SWD: $1.77 > 1.19 > 0.85 > 0.28$, for X-Palm, CASIA-MS, XJTU-UP, and MPDv2 respectively).
 While XJTU-UP and CASIA-MS both score higher PAD than X-Palm.
