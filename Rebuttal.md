@@ -8,7 +8,17 @@ Below, we address each concern point-by-point and describe the manuscript change
 
 We appreciate this suggestion. We actually have included computational complexity metrics in the manuscript. Table 2 details both the Parameter count and the inference cost (in GFLOPs) for an input resolution of $112 \times 112$ across all 12 evaluated baseline models. 
 
-In the table below, we extend the Table 2 (Computational Complexity) by including the required time for training (per 32-sample batch) and inference (per 100 samples) for all baselines. 
+In the table below, we extend the Table 2 (Computational Complexity) by including the required time for training (per 32-sample batch) and inference (per 100 samples) for all baselines using NVIDIA RTX A6000(48GB). As an initial hardware-normalized analysis, we consider a low-end-class compute scenario with an assumed sustained throughput of 50 GFLOP/s and a flagship-class scenario with 500 GFLOP/s. We estimate the compute-only inference latency and throughput from the reported GFLOPs using
+
+$$
+t_{\mathrm{est}} = \frac{\mathrm{GFLOPs/image}}{\mathrm{effective\ throughput\ (GFLOP/s)}} \times 1000 \quad \mathrm{ms/image},
+$$
+
+$$
+\mathrm{Throughput}_{\mathrm{est}} = \frac{\mathrm{effective\ throughput\ (GFLOP/s)}}{\mathrm{GFLOPs/image}} \quad \mathrm{images/s}.
+$$
+
+
 
 | Model | Params | GFLOPs | Low-end Latency (ms/img) | Low-end Speed (img/s) | Flagship Latency (ms/img) | Flagship Speed (img/s) | Train (ms/batch) | Inference (ms/100) |
 |---|---|---|---|---|---|---|---|---|
@@ -24,6 +34,11 @@ In the table below, we extend the Table 2 (Computational Complexity) by includin
 | DINOv2-S/14 | 22.06M | 1.398 | 27.96 | 35.8 | 2.80 | 357.7 | 238.64 | 1257.60 |
 | ArcFace-iResNet100 | 65.12M | 12.098 | 241.96 | 4.1 | 24.20 | 41.3 | 789.49 | 4602.49 |
 | MagFace-iResNet100 | 65.16M | 12.117 | 242.34 | 4.1 | 24.23 | 41.3 | 893.15 | 4800.20 |
+
+
+The normalized estimates show that lightweight palmprint-specific models, such as CompNet, PPNet, and PalmBridge, require substantially less computation than the larger ArcFace- and MagFace-based models. However, GFLOPs alone cannot accurately predict actual smartphone latency because mobile performance also depends on the processor architecture, memory bandwidth, inference runtime, numerical precision, operator implementation, hardware delegate, and thermal conditions.
+We will conduct an additional benchmark on two physical Android smartphones representing a budget/low-end device and a recent flagship device. We will update the rebuttal with the measured latency and recognition throughput once these experiments are completed during the rebuttal period.
+
 
 >**2: Including more experimental analysis on performance drop reasons**
 
