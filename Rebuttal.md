@@ -110,11 +110,25 @@ Below, we address each concern point-by-point and describe the manuscript change
 
 >**1: Dataset Limitations**
 
-We appreciate the reviewer's advice and thank them for raising these points. We acknowledge the limitations of the current version of the X-Palm dataset, including its scale and imbalanced acquisition.
+We appreciate the reviewer's advice and thank them for raising these points. We acknowledge the limitations of the current version of the X-Palm dataset, including its scale and imbalanced acquisition. We note that most existing datasets, such as CASIA-MS and XJTU-UP, are of comparable scale. 
 
-Scaling up participant recruitment further is challenging due to the time-consuming curation process and privacy considerations. We note that most existing datasets, such as CASIA-MS and XJTU-UP, are of comparable scale. Additionally, our scanner was installed locally and could not be relocated, which geographically constrained participant recruitment and led to imbalanced acquisition devices (smartphone vs scanner) and races. Within these constraints, we made deliberate efforts to recruit a diverse group of participants, and the resulting demographic distribution broadly reflects that of the local community. However, because participant demographics remain imbalanced, we chose not to define or split domains based on race, gender, or other demographic attributes.
+| Dataset | Hands | Images | Devices | Age range | Paired scanner–smartphone data |
+|---|---:|---:|---:|---:|:---:|
+| CASIA-MS | 200 | 7,200 | 1 | 20–63 | No |
+| XJTU-UP | 200 | 8,000 | 2 | 19–35 | No |
+| MPD-v2 | 400 | 16,000 | 2 | 20–50 | No |
+| **X-Palm** | **206** | **6,006** | **80+** | **18–76** | **Yes** |
+
+Scaling up participant recruitment is challenging due to the time-consuming curation process, privacy considerations, and IRB ethical constraints. Under our IRB-approved protocol, biometric acquisition was restricted to approved private indoor locations to protect participant privacy and prevent observation by unauthorized individuals.
+
+The custom multispectral scanner was also installed at a fixed institutional location and could not be relocated. These requirements geographically constrained recruitment and contributed to the demographic imbalance and imbalance between the paired and smartphone-only subsets. Within these constraints, we made deliberate efforts to recruit a diverse group of participants, and the resulting demographic distribution broadly reflects that of the local community. However, because participant demographics remain imbalanced, we chose not to define or split domains based on race, gender, or other demographic attributes.
+X-Palm includes 40.78% female participants and 11 self-reported ethnic groups. Nevertheless, we acknowledge that the resulting demographic distribution remains imbalanced, particularly toward younger participants and demographic groups that were more accessible at the approved collection locations. We therefore do not claim that the current release establishes demographic fairness or population-level robustness.
+
+The main contribution of X-Palm is not the population scale, but its **cross-domain design**. It captures the same participant data under controlled multispectral enrollment and unconstrained, participant-driven smartphone authentication, while incorporating variations in device, illumination, pose, perspective, distance, background, occlusion, and palm-surface condition. This enables systematic study of the practical deployment gap between controlled enrollment and smartphone authentication, which is not directly supported by existing datasets of comparable identity scale.
 
 Regarding privacy risks and gated-access reproducibility, we have stored the anonymized dataset in our secured institutional repository to protect participant privacy. Reproducibility is nonetheless ensured: our experiments are fully reproducible using the open-source code we provide, and access to X-Palm and the other datasets can be requested through the standard access procedure. 
+
+We will revise the limitation section to explicitly acknowledge the limited identity count, the acquisition and demographic imbalance, and the resulting limits on fairness and generalization claims.
 
 
 >**2: Ethical/Privacy Documentations needs to be more directly verifiable**
@@ -190,7 +204,7 @@ We thank the reviewer for the detailed and helpful feedback. Below we respond to
 
 >**1. Dataset Limitation**
 
-We thank the reviewer for recognizing the novelty of our paired design. We acknowledge the current dataset's limited scale and imbalanced acquisition. Further recruitment is constrained by the time-consuming curation process, privacy considerations, and ethical constraints; we tried to collect data at least at the scale of most existing datasets (CASIA-MS, XJTU-UP). Our scanner was fixed in place and could not be relocated, geographically constraining recruitment and causing imbalance across devices (smartphone vs. scanner) and ethnic groups. We recruited as diverse a group as these constraints allowed, and demographics broadly reflect the local community; since they remain imbalanced, we did not split domains by race, gender, or other demographic attributes.
+We thank the reviewer for recognizing the novelty of our paired design. We acknowledge the current dataset's limited scale and imbalanced acquisition. Further recruitment is constrained by the time-consuming curation process, privacy considerations, and ethical constraints; we tried to collect data at least at the scale of most existing datasets (CASIA-MS, XJTU-UP). Our scanner was fixed in place and could not be relocated, geographically constraining recruitment and causing imbalance across devices (smartphone vs. scanner) and ethnic groups. We recruited as diverse a group as these constraints allowed, and demographics broadly reflect the local community; since they remain imbalanced, we did not split domains by race, gender, or other demographic attributes. (we could not provide more details due to limited space, please check "Dataset Limitations" of our answer for the reviewer XTTj for more details)
 
 >**2. Imbalance Effect on Training and Evaluation**
 
@@ -198,7 +212,7 @@ We ran two controlled experiments to assess the effect of scanner/smartphone acq
 
 **Training-time imbalance** (Table 1): equal-size training sets on the same test set, Mode A (all dual-domain) vs. Mode B (a third replaced with smartphone-only identities). Mode B has higher EER and lower Rank-1 due to the imbalanced training set. 
 
-**Table 1: Effect of domain imbalance on training. 95% CI from identity-level bootstrap resampling.**
+**Table 1: Effect of domain imbalance on training. with 95% CI**
 
 | **Mode** | **EER (%)** | **Rank-1 (%)** |
 | :--- | :--- | :--- |
@@ -206,20 +220,20 @@ We ran two controlled experiments to assess the effect of scanner/smartphone acq
 | Mode B (imbalanced: dual + smartphone-only) | 17.90 [15.34, 21.06] | 79.87 [78.47, 87.94] |
 
 
-**Inference-time imbalance** (Table 2): same trained model/probe set, only gallery composition varies: Mode 1 (mixed-domain gallery) vs. Mode 2 (smartphone-only gallery). EER is similar with overlapping CIs, but Rank-1 drops 19 points with disjoint CIs (Mode 1: [65.52, 80.25] vs. Mode 2: [47.00, 61.44]), a smartphone-only gallery hurts top-1 ID substantially though EER separability is largely unaffected.
+**Inference-time imbalance** (Table 2): same trained model/probe set, only gallery composition varies: Mode 1 (mixed-domain gallery) vs. Mode 2 (smartphone-only gallery). EERs are close with overlapping CIs, but Rank-1 drops 19 points with disjoint CIs (Mode 1: [77.04, 88.18] vs. Mode 2: [62.70, 76.58]), a smartphone-only gallery hurts Rank-1 though EER separability is largely unaffected.
 
-**Table 2: Effect of domain imbalance on inference. 95% CI from identity-level bootstrap resampling.**
+**Table 2: Effect of domain imbalance on inference. with 95% CI.**
 
 | **Mode** | **EER (%)** | **Rank-1 (%)** |
 | :--- | :--- | :--- |
-| Mode 1 (mixed-domain gallery) | 28.79 [25.93, 31.68] | 69.62 [65.52, 80.25] |
-| Mode 2 (smartphone-only gallery) | 28.60 [25.13, 32.18] | 50.63 [47.00, 61.44] |
+| Mode 1 (mixed-domain gallery) | 17.0 [14.248, 19.856] | 78.80 [77.04, 88.18] |
+| Mode 2 (smartphone-only gallery) | 16.51 [13.509, 19.409] | 63.29 [62.70, 76.58] |
 
 We will add further baselines and imbalance ratios in the appendix.
 
 >**3. RoI Extraction Pipeline**
 
-Quality-control details will appear in Appendix A.5. Annotation uses a custom tool (Figure 5) where the first author (the only annotator) marks five anatomical key points defining the palm RoI, with a live preview enabling immediate QC; low-quality images (blurry, occluded) are discarded. A repeatability check, re-annotating 10 images over 10 iterations, showed high spatial consistency. RoIs were extracted manually to eliminate extraction-error effects on benchmarking. X-Palm also provides paired raw images and ground-truth RoIs plus metadata, to our knowledge the first dataset to do so, supporting future automatic RoI-extraction research.
+Quality-control details will appear in Appendix A.5. Annotation uses a custom tool with a live preview (please see Figure 5) enabling immediate QC; low-quality images (blurry, occluded) are discarded. A repeatability check, re-annotating 10 images over 10 iterations, showed high spatial consistency. RoIs were extracted manually to eliminate extraction-error effects on benchmarking. X-Palm also provides paired raw images and ground-truth RoIs plus metadata, to our knowledge the first dataset to do so, supporting future automatic RoI-extraction research.
 
 >**4. Low Quality Images or Significant Domain Shifts?**
 
