@@ -27,7 +27,7 @@ In the table below, we extend the Table 2 (Computational Complexity) by includin
 
 >**2: Including more experimental analysis on performance drop reasons**
 
-We thank the reviewer for this suggestion. We analyze the specific causes of performance degradation in Section 3.3. However, we need to include a comprehensive analysis in the appendix to provide more details. We also further analyze the distribution characteristics between the source and target domain using quantitative feature-space distribution analysis (e.g., t-SNE visualizations) in the revised version. 
+We thank the reviewer for this suggestion. We analyze the specific causes of performance degradation in Section 3.3. However, we will include a comprehensive analysis in the appendix to provide more details. 
 
 The performance drop on the X-Palm dataset is due to significant domain shifts among sub-domains of this dataset. Specifically:
 *   Cross-setting domain shift between scanner and smartphone settings significantly degrades the performance as the palm images are capture in totally different conditions (sensor, lighting, etc). 
@@ -60,12 +60,15 @@ We evaluate the distributional (domain) gap between capture conditions in X-Palm
 X-Palm shows the largest mean pairwise MMD (0.373) and FFD (472.9), more than twice the next-highest dataset (XJTU-UP, 91.4). KID and SWD, included specifically to test whether FFD's small-sample bias or Gaussian assumption were driving this result, reproduce the identical ranking (KID: $379.8 > 119.5 > 23.6 > 4.6$; SWD: $1.77 > 1.19 > 0.85 > 0.28$, for X-Palm, CASIA-MS, XJTU-UP, and MPDv2 respectively).
 While XJTU-UP and CASIA-MS both score higher PAD than X-Palm.
 
->**3: Domain Generalization and Domain Adaptation Methods**
+>**3: Distribution Analysis between Source and Target Domains**
+In the previous section, we analyzed domain shifts of the X-palm's sub-domains and compared to baseline datasets. We also further analyze the distribution characteristics between the source and target domain using quantitative feature-space distribution analysis (e.g., t-SNE visualizations) in the revised version.
+
+>**4: Domain Generalization and Domain Adaptation Methods**
 
 We appreciate your suggestion. As described in Section 3.1, we evaluated TSCAN (a Domain Adaptation method) and GIFT (a Domain Generalization method) specifically designed for the palmprint literature. Their cross-domain performances are reported in Tables 4 and 5, demonstrating that while they offer some resilience, the compound variability of X-Palm still causes significant performance degradation.
 We have used these baselines only in the closed-set cross-domain setting (not in the cross-dataset and open-set cross-domain settings) as these methods are originally presented and evaluated for closed-set scenarios.  We will include more DA and DG baselines in the appendix of the revised version.
 
->**4: References**
+>**5: References**
 
 [1] He, Kaiming, et al. "Deep residual learning for image recognition." Proceedings of the IEEE conference on computer vision and pattern recognition. 2016.‏
 
