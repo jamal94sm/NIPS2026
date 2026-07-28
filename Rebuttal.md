@@ -10,20 +10,20 @@ We appreciate this suggestion. We actually have included computational complexit
 
 In the table below, we extend the Table 2 (Computational Complexity) by including the required time for training (per 32-sample batch) and inference (per 100 samples) for all baselines. 
 
-| **Model** | **Params** | **GFLOPs** | **Train (ms/batch)** | **Infer (ms/100)** |
-| :--- | :--- | :--- | :--- | :--- |
-| CompNet | 3.27M | 0.735 | 324.45 | 331.91 |
-| PPNet | 3.53M | 0.735 | 321.61 | 358.69 |
-| CCNet | 20.57M | 2.131 | 781.44 | 1722.66 |
-| CO3Net | 20.57M | 2.131 | 831.50 | 1563.01 |
-| SF2Net | 13.08M | 2.655 | 796.28 | 687.42 |
-| PalmBridge | 3.53M | 0.735 | 318.31 | 412.11 |
-| TSCAN | 11.31M | 0.486 | 89.75 | 604.96 |
-| GIFT | 11.24M | 0.486 | 76.80 | 647.60 |
-| ConvNeXtV2-T | 27.87M | 1.067 | 607.95 | 1818.77 |
-| DINOv2-S/14 | 22.06M | 1.398 | 238.64 | 1257.60 |
-| ArcFace-iResNet100 | 65.12M | 12.098 | 789.49 | 4602.49 |
-| MagFace-iResNet100 | 65.16M | 12.117 | 893.15 | 4800.20 |
+| Model | Params | GFLOPs | Low-end Latency (ms/img) | Low-end Speed (img/s) | Flagship Latency (ms/img) | Flagship Speed (img/s) | Train (ms/batch) | Infer (ms/100) |
+|---|---|---|---|---|---|---|---|---|
+| CompNet | 3.27M | 0.735 | 14.70 | 68.0 | 1.47 | 680.3 | 324.45 | 331.91 |
+| PPNet | 3.53M | 0.735 | 14.70 | 68.0 | 1.47 | 680.3 | 321.61 | 358.69 |
+| CCNet | 20.57M | 2.131 | 42.62 | 23.5 | 4.26 | 234.6 | 781.44 | 1722.66 |
+| CO3Net | 20.57M | 2.131 | 42.62 | 23.5 | 4.26 | 234.6 | 831.50 | 1563.01 |
+| SF2Net | 13.08M | 2.655 | 53.10 | 18.8 | 5.31 | 188.3 | 796.28 | 687.42 |
+| PalmBridge | 3.53M | 0.735 | 14.70 | 68.0 | 1.47 | 680.3 | 318.31 | 412.11 |
+| TSCAN | 11.31M | 0.486 | 9.72 | 102.9 | 0.97 | 1028.8 | 89.75 | 604.96 |
+| GIFT | 11.24M | 0.486 | 9.72 | 102.9 | 0.97 | 1028.8 | 76.80 | 647.60 |
+| ConvNeXtV2-T | 27.87M | 1.067 | 21.34 | 46.9 | 2.13 | 468.6 | 607.95 | 1818.77 |
+| DINOv2-S/14 | 22.06M | 1.398 | 27.96 | 35.8 | 2.80 | 357.7 | 238.64 | 1257.60 |
+| ArcFace-iResNet100 | 65.12M | 12.098 | 241.96 | 4.1 | 24.20 | 41.3 | 789.49 | 4602.49 |
+| MagFace-iResNet100 | 65.16M | 12.117 | 242.34 | 4.1 | 24.23 | 41.3 | 893.15 | 4800.20 |
 
 >**2: Including more experimental analysis on performance drop reasons**
 
