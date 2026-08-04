@@ -1,23 +1,27 @@
 ## Response to AC
 
-We thank the AC for the constructive meta-review and for highlighting the three priority areas. Below we summarize how each was addressed across our responses to the three reviewers.
+We thank the AC for the constructive meta-review and for highlighting the three primary concerns. 
+
+Our paper began with initial ratings of (**iRUH**: 4, **SSe8**: 4, **XTTj**: 4). The discussion period was instrumental in clarifying our work's contributions, and we are very grateful that all three reviewers explicitly confirmed that our responses addressed their concerns and raised their scores to accept (**iRUH**: 5, **SSe8**: 5, **XTTj**: 5). 
+
+Below we summarize how each concern was addressed across our responses to the reviewers.
+
 
 ### 1. Exact Details of the Released Dataset
 
-- **Reviewer #2 (Point 1 – Dataset Limitations):** We provided a direct scale comparison table against CASIA-MS, XJTU-UP, and MPD-v2 (hands, images, devices, age range, paired scanner–smartphone availability), and explained the IRB-approved constraints (fixed scanner location, private indoor collection sites) that shaped recruitment and demographic composition. We reported concrete diversity figures (40.78% female, 11 self-reported ethnic groups) and explicitly limited our fairness/generalization claims accordingly.
-- **Reviewer #2 (Point 2 – Ethical/Privacy Documentation):** We detailed the access-control mechanism: encrypted institutional storage, mandatory EULA prohibiting re-identification or commercial use, and time-limited secure download links.
-- **Reviewer #2 (Point 5 – What Users Receive):** We itemized the full release package — raw images, extracted RoIs, keypoint coordinates, anonymized metadata (age group, ethnicity group, gender, device model), official data splits, and supporting files (`LICENSE_EULA.md`, `CITATION.cff`, Croissant metadata, manifests) — contrasting this with prior datasets that release only raw images or only RoIs.
-- **Reviewer #3 (Point 1):** Reused and cross-referenced the fuller dataset-detail answer given to Reviewer #2 due to space constraints, avoiding duplication while ensuring the same information is accessible.
+- **Reviewers XTTj and SSe8 (Dataset Limitations):** We provided a scale comparison table against CASIA-MS, XJTU-UP, and MPD-v2, and explained challenges including the time-consuming curation process, privacy considerations, and the IRB-approved constraints (fixed scanner location, private indoor collection sites) that shaped recruitment and demographic composition. 
+- **Reviewer XTTj (What Users Receive):** We itemized the full release package — raw images, extracted RoIs, keypoint coordinates, anonymized metadata (age group, ethnicity group, gender, device model), official data splits, and supporting files (`LICENSE_EULA.md`, `CITATION.cff`, Croissant metadata, manifests) — contrasting this with prior datasets that release only raw images or only RoIs.
 
 ### 2. Statistical Robustness of Results
 
-- **Reviewer #1 / #3 (Imbalance Effects):** We introduced two controlled experiments with identity-level bootstrap 95% CIs ($B=1000$): a training-time imbalance test (Mode A vs. Mode B) and an inference-time gallery-composition test (Mode 1 vs. Mode 2), showing that Rank-1 accuracy is far more sensitive to acquisition imbalance than EER, with non-overlapping CIs supporting the effect's significance.
-- **Reviewer #1 / #3 (Domain Shift Quantification):** We reported five complementary distributional-shift metrics (MMD, PAD, FFD, KID, SWD) as mean ± std across all sub-domain pairs per dataset, cross-checked with two different embedding backbones (DINOv2, ResNet-50) to confirm the ranking is not an artifact of a single feature space or metric's small-sample bias.
-- **Reviewer #2 (Point 3 – Test Set Size Effects):** This was the most direct treatment of statistical robustness: we compared 3-fold vs. 5-fold cross-validation and ratio=0.5 vs. ratio=0.8 bootstrap CIs across all 12 test domains, showing consistent widening of variance/CI as the held-out identity set shrinks. We committed to releasing the exact fold/split files as an official benchmark protocol so future comparisons use identical identity assignments rather than ad hoc splits.
+- **Reviewer SSe8 (Imbalance Effects):** We introduced two controlled experiments with identity-level bootstrap 95% CIs ($B=1000$): a training-time imbalance test and an inference-time gallery-composition test, showing that Rank-1 accuracy is far more sensitive to acquisition imbalance than EER, with non-overlapping CIs supporting the effect's significance.
+- **Reviewers SSe8 and iRUH (Domain Shift Quantification):** We reported five complementary distributional-shift metrics across all sub-domain pairs per dataset, cross-checked with two different embedding backbones (DINOv2, ResNet-50) to confirm the ranking is not an artifact of a single feature space or metric's small-sample bias. These metrics demonstrate that the domain shift across X-palm's sub-domains is significantly greater than that observed in existing baseline datasets. 
+- **Reviewer SSe8 (Image Quality Analysis):** We reported six distinct metrics to assess image quality across X-palm and the baseline datasets. Our results demonstrate that X-palm images not only match the quality of existing datasets, but outperform them across the majority of the reported metrics.
+- **Reviewer XTTj (Test Set Size Effects):** This was the most direct treatment of statistical robustness: we compared 3-fold vs. 5-fold cross-validation and train-test ratio=0.5 vs. ratio=0.8 bootstrap CIs across all 12 test domains, showing consistent widening of variance/CI as the held-out identity set shrinks. We will provide this analysis for the rest of experiments in the revised manuscript. 
 
 ### 3. Annotation Quality
 
-- **Reviewer #2 (Point 4) / Reviewer #3 (Point 3 – RoI Extraction Pipeline):** We described the custom annotation tool with live-preview quality control, the keypoint-based RoI definition process, and the exclusion criteria for low-quality images (blur, occlusion). We reported a repeatability check (10 images re-annotated over 10 iterations by the sole annotator) showing high spatial consistency, and noted that RoI extraction was performed manually specifically to eliminate automated-extraction error as a confound in benchmarking.
+- **Reviewers XTTj and SSe8 (RoI Extraction Pipeline and Annotation Quality):** We described the custom annotation tool with live-preview quality control, the key point-based RoI definition process, and the exclusion criteria for low-quality images (blur, occlusion). We reported a repeatability check (10 images re-annotated over 10 iterations by the sole annotator) showing high spatial consistency, and noted that RoI extraction was performed manually specifically to eliminate automated-extraction error as a confound in benchmarking.
 
 
 
@@ -41,16 +45,16 @@ Across all reviews, a clear consensus emerged that our detailed clarifications r
 1. **Dataset Details & Release Package:** Full transparency on the exact contents, access procedure, and ethical safeguards of the released dataset (response to Reviewer **SSe8**).
 2. **Statistical Robustness:** Additional cross-validation and bootstrap confidence-interval analyses across all baselines and test domains, confirming the reliability of our reported results (response to Reviewer **SSe8**).
 3. **Annotation Quality:** Evidence of high annotation consistency for our manually extracted RoIs, and our commitment to release the extraction tool and raw/RoI image pairs (response to Reviewers **SSe8** and **XTTj**).
-4. **Domain Shift Analysis & Future Methods:** Quantitative confirmation, across five distributional-shift metrics and two embedding backbones, that the performance drop on X-Palm reflects genuine domain shift rather than image quality. Reviewer **iRUH** additionally encouraged us to propose new methods for this challenge in future work, which we are already pursuing in the current phase of our project.
+4. **Domain Shift Analysis & Image Quality Analysis** Quantitative confirmation, across five distributional-shift metrics and , that the performance drop on X-Palm reflects genuine domain shift rather than image quality. Reviewer **iRUH** additionally encouraged us to propose new methods for this challenge in future work, which we are already pursuing in the current phase of our project.
 
-For full transparency, we also note that Reviewer **SSe8**'s upgraded rating reflects the resolution of technical concerns specifically, and does not extend to the ethics/privacy-related review conducted separately by other reviewers. As agreed, we will explicitly discuss the demographic distribution as a limitation in the final manuscript.
-
-We are fully committed to incorporating all this feedback to deliver the highest quality manuscript.
+We are fully committed to incorporating all this feedback to deliver the highest quality manuscript. We appreciate the reviewers to help us in improving the paper. 
 
 Thank you again for your time and productive guidance!
 
 Sincerely, 
 The Authors
+
+
 
 
 
