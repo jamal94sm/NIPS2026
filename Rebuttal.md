@@ -24,6 +24,39 @@ We thank the AC for the constructive meta-review and for highlighting the three 
 
 
 
+**Author Final Remarks:**
+
+Dear Reviewers, AC and SAC,
+
+Thank you for the reviewing effort and invaluable feedback on our submission. To assist in the assessment, we would like to provide a factual summary of the author-reviewer interactions, which may help provide a quick tour of the discussion status and facilitate a comprehensive evaluation.
+
+Our paper began with initial ratings of [**iRUH**: 4, **SSe8**: 4, **XTTj**: 4]. The discussion period was instrumental in clarifying our work's contributions, and we are very grateful that all three reviewers explicitly confirmed that our responses addressed their concerns and raised their scores to accept (5):
+
+- Reviewer **iRUH** concluded: *"I am very grateful to the author for the detailed response, which has addressed my concerns. I think this is a valuable dataset and benchmark that can contribute to the advancement of palmprint recognition."*
+- Reviewer **XTTj** confirmed: *"Thank you for the comprehensive response. It fully addresses my doubts. The proposed dataset and benchmark are impressive and will undoubtedly benefit the research community."*
+- Reviewer **SSe8** confirmed: *"These responses have clarified most of my concerns... Following detailed rebuttal, I am upgrading my rating to 'accept'."*
+
+Across all reviews, a clear consensus emerged that our detailed clarifications resolved the reviewers' outstanding technical concerns. The discussions also enabled us to clarify key aspects and our plans for the final version:
+
+1. **Dataset Details & Release Package:** Full transparency on the exact contents, access procedure, and ethical safeguards of the released dataset (response to Reviewer **SSe8**).
+2. **Statistical Robustness:** Additional cross-validation and bootstrap confidence-interval analyses across all baselines and test domains, confirming the reliability of our reported results (response to Reviewer **SSe8**).
+3. **Annotation Quality:** Evidence of high annotation consistency for our manually extracted RoIs, and our commitment to release the extraction tool and raw/RoI image pairs (response to Reviewers **SSe8** and **XTTj**).
+4. **Domain Shift Analysis & Future Methods:** Quantitative confirmation, across five distributional-shift metrics and two embedding backbones, that the performance drop on X-Palm reflects genuine domain shift rather than image quality. Reviewer **iRUH** additionally encouraged us to propose new methods for this challenge in future work, which we are already pursuing in the current phase of our project.
+
+For full transparency, we also note that Reviewer **SSe8**'s upgraded rating reflects the resolution of technical concerns specifically, and does not extend to the ethics/privacy-related review conducted separately by other reviewers. As agreed, we will explicitly discuss the demographic distribution as a limitation in the final manuscript.
+
+We are fully committed to incorporating all this feedback to deliver the highest quality manuscript.
+
+Thank you again for your time and productive guidance!
+
+Sincerely, The Authors
+
+
+
+
+
+
+
 ### reviewer #1
 
 
