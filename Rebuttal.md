@@ -49,7 +49,8 @@ We are fully committed to incorporating all this feedback to deliver the highest
 
 Thank you again for your time and productive guidance!
 
-Sincerely, The Authors
+Sincerely, 
+The Authors
 
 
 
